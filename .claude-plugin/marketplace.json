@@ -1,0 +1,13 @@
+{
+  "name": "argus-desk",
+  "owner": {
+    "name": "EvanSpangler"
+  },
+  "plugins": [
+    {
+      "name": "argus-desk",
+      "source": "./",
+      "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics."
+    }
+  ]
+}

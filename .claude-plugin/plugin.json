@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {

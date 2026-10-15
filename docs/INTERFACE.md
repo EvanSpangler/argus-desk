@@ -1,6 +1,9 @@
 # The desk interface: design
 
-Status: DRAFT for the operator's decision, 2026-10-15. Nothing here is built. The 0.7.0 pane (four panes,
+Status: BUILT in 0.8.0, 2026-10-15 (three panes; Send at the operator's discretion, the overrule logged as today, no reason
+required; provenance marks, no grades). Standing rule from the operator: every navigation key and action is visible
+and labelled on screen, drawn as the engine draws a hotkey button (`z: zoom`); arrows, and Esc, Enter and Space
+where their meaning is plain, are the only unlabelled keys. The 0.7.0 pane (four panes,
 rows, filters) is the scaffolding this replaces; its Wall and Tickets parts survive, its Ticket and Decide
 views do not.
 
@@ -97,8 +100,10 @@ Three panes, the engine's own, switched by its tab bar or 1 to 3 from inside any
 - **3 Wall**: every agent live, one row each; Enter tails one (what 0.7.0 built).
 
 Every pane: the second line reads `keys off: ctrl+x then tab, or click the pane` until it holds the
-keyboard, then the keys of that pane. Tab and the arrows walk the rows, Enter acts on the row under the ring.
-`f` finds (type, Enter narrows to matching nodes shown with their ancestors), `c` clears.
+keyboard. Every key that does something is drawn as a labelled button on the pane (`z: zoom`, `u: up`); the
+action rows ARE the key list, and nothing works that is not drawn. Tab and the arrows walk the rows, Enter
+acts on the row under the ring. `f: find` puts the cursor in the field (type, Enter narrows to matching nodes
+shown with their ancestors), `c: clear` empties it.
 
 Review pane keys:
 
@@ -113,10 +118,9 @@ n      next draft waiting    o  the ticket in Tickets
 s      Send, pending   v  Send, solved   m  Modify (a line for the drafter)   d  Deny (why)
 ```
 
-Send with anything open under ISSUES asks for one line first: `overruling 1 objection, 1 hold: why`. Enter
-sends, Esc keeps the draft. The line is recorded on the decision and in the audit, naming each issue
-overruled. With ISSUES empty, `s` sends at once. (Today a HOLD is advice and a Send with it open is recorded
-as an overrule with no reason; this makes the reason part of the press.)
+Send is the operator's call whatever ISSUES holds: a Send with issues open is recorded as an overrule naming
+them, as today, and no reason is asked (decided 2026-10-15). The Send button's label says how many are open
+(`s: Send, pending (2 open)`) so the press is informed.
 
 Breadcrumb line, always first: `#147802  draft a21f140c  > REPLY > sentence 4` with the draft's state and age.
 
@@ -165,13 +169,12 @@ Wall pane: as 0.7.0.
 Not changed: the gate, the grant, the record, the agents, the checks. The desk's rules stay where they are;
 the interface shows their output with its reasons.
 
-## 6. Build order, once the design is agreed
+## 6. Build order (done in 0.8.0, in this order)
 
 1. `desk.py tree` and `/desk show` with tests. The model proves itself as text before any pane draws it.
 2. The Review pane on the tree: expand, zoom, up, follow, find, the decisions moved there.
-3. The overrule line on Send.
-4. Tickets pane: row expansion, re-read.
-5. Retire the 0.7.0 Ticket and Decide panes.
+3. Tickets pane: row expansion, re-read.
+4. Retire the 0.7.0 Ticket and Decide panes.
 
 ## 7. Bars
 
@@ -179,7 +182,7 @@ the interface shows their output with its reasons.
   audit` or the transcript.
 - Every ISSUES child zooms to the sentence or node it is about; none is a bare string.
 - `/desk show` and the pane agree (same JSON, one test renders both).
-- Sends with open issues carry a reason; `desk stats` counts them.
+- Sends with open issues are counted as overrules in `desk stats`, with the issues named.
 - Time from the draft filed to the decision, and the share decided as filed, are read from the ledger as
   before; the interface is judged on whether the second rises and the first falls.
 

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { DeskItem, DeskView, QueueRow, Trace, WallAgent } from '../types'
+import type { DeskItem, DeskView, QueueRow, Trace, TreeNode, TreeResult, WallAgent } from '../types'
 
 // argus-desk: the review desk and the investigation it reviews.
 //   1. the queue     a timer searches the open set and pulls one ticket at a time.
@@ -13,10 +13,12 @@ import type { DeskItem, DeskView, QueueRow, Trace, WallAgent } from '../types'
 //   5. the gate      an outward call passes only by spending a grant on the exact text, with the status chosen.
 // State and checks live in checks/desk.py (stdlib Python), one process per call; the mod is the binding.
 
-const PANES = { wall: 'desk-wall', queue: 'desk-queue', ticket: 'desk-ticket', decide: 'desk-decide' } as const
+const PANES = { review: 'desk-review', tickets: 'desk-tickets', wall: 'desk-wall' } as const
 type View = keyof typeof PANES
-const VIEWS: View[] = ['wall', 'queue', 'ticket', 'decide']
-const TITLES: Record<View, string> = { wall: 'Wall', queue: 'Queue', ticket: 'Ticket', decide: 'Decide' }
+const VIEWS: View[] = ['review', 'tickets', 'wall']
+const TITLES: Record<View, string> = { review: 'Review', tickets: 'Tickets', wall: 'Wall' }
+/** Old names still typed by habit or by the model. */
+const ALIASES: Record<string, View> = { decide: 'review', queue: 'tickets', ticket: 'tickets' }
 const viewOf = (requestId: string): View | undefined => VIEWS.find(v => PANES[v] === requestId)
 /** The element the focus ring holds in each pane, from ui.focus: what a hotkey acts on (p pulls the ticket under the ring). */
 const ring = new Map<string, string>()
@@ -224,9 +226,16 @@ async function refresh($: any, o: Opts, notice?: string): Promise<DeskItem[]> {
   const q = await desk($, o, ['queue'])
   const queue = ((q.rows as QueueRow[] | undefined) ?? []).filter(x => x.state !== 'done' && x.state !== 'gone')
   const v = await read($, view)
-  const ticket = v.ticket ?? items[0]?.ticket ?? queue[0]?.ticket
+  const selected = v.selected && items.some(i => i.md5 === v.selected) ? v.selected : items[0]?.md5
+  const ticket = v.ticket ?? items.find(i => i.md5 === selected)?.ticket ?? queue[0]?.ticket
   const trace = ticket ? ((await desk($, o, ['trace', '--ticket', ticket])) as unknown as Trace) : undefined
-  await update($, view, x => ({ ...x, items, queue, ticket, trace: trace?.ok ? trace : x.trace, notice: notice ?? (r.ok ? undefined : String(r.reason)) }))
+  const tree = selected ? await loadTree($, o, selected) : undefined
+  await update($, view, x => ({
+    ...x, items, queue, ticket, selected, trace: trace?.ok ? trace : x.trace, notice: notice ?? (r.ok ? undefined : String(r.reason)),
+    tree: tree ?? undefined,
+    // a different draft starts from the default view of its tree
+    ...(tree?.md5 && tree.md5 !== x.tree?.md5 ? { expanded: DEFAULT_OPEN, zoom: [], bodies: {}, last: undefined } : {}),
+  }))
   try {
     const open = queue.filter(x => x.state !== 'skipped').length
     $.ui.status(items.length ? `desk: ${items.length} waiting` : active.size ? `desk: ${active.size} agents on ${new Set([...active.values()].map(a => a.ticket)).size} ticket(s)` : open ? `desk: ${open} open` : undefined)
@@ -680,7 +689,7 @@ export const register: Register = (on, options) => {
   const o = opts(options as Record<string, unknown>)
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'desk', description: 'The review desk: the Wall, Queue, Ticket and Decide panes; /desk wall|queue|ticket N|decide opens one, /desk run N, trace N, poll, pull N, pause, resume, stats, audit, verify', argumentHint: '[wall | queue | ticket N | decide | run N | trace N | poll | pull N | pause | resume | stats]' })
+    await $.command.register({ name: 'desk', description: 'The review desk: the Review, Tickets and Wall panes; /desk review|tickets|wall opens one, /desk show [md5 | N] [node] prints the proof tree, /desk run N, trace N, poll, pull N, pause, resume, stats, audit, verify', argumentHint: '[review | tickets | wall | show | run N | trace N | poll | pull N | pause | resume | stats]' })
     await $.tool.register({
       name: TOOL,
       description:
@@ -801,8 +810,8 @@ export const register: Register = (on, options) => {
     if (/^trace\s+#?\d+$/.test(args)) {
       const t = args.replace(/^trace\s+#?/, '')
       const tr = (await desk($, o, ['trace', '--ticket', t])) as unknown as Trace
-      await update($, view, v => ({ ...v, ticket: t, trace: tr.ok ? tr : v.trace }))
-      await openView($, 'ticket')
+      await update($, view, v => ({ ...v, ticket: t, trace: tr.ok ? tr : v.trace, open: [...new Set([...(v.open ?? []), t])] }))
+      await openView($, 'tickets')
       return { text: tr.ok ? traceText(tr) : `no trace for #${t}` }
     }
     if (/^pull\s+#?\d+$/.test(args)) {
@@ -830,18 +839,27 @@ export const register: Register = (on, options) => {
       if (args === 'resume') startPolling($, o)
       return { text: args === 'pause' ? 'Polling paused; /desk resume to start it again.' : 'Polling on.' }
     }
-    if (/^(wall|queue|decide)$/.test(args) || /^ticket(\s+#?\d+)?$/.test(args)) {
-      const which = args.split(/\s+/)[0] as View
+    if (/^show(\s|$)/.test(args)) {
+      const [, what, node] = args.split(/\s+/)
+      const v = await read($, view)
+      const sel = what && /^[0-9a-f]{32}$/.test(what) ? ['--md5', what] : what ? ['--ticket', what.replace(/^#/, '')] : v.selected ? ['--md5', v.selected] : undefined
+      if (!sel) return { text: 'Nothing selected: /desk show <md5> or /desk show <ticket>.' }
+      const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'tree', ...sel, '--text', ...(node ? ['--node', node] : [])], { timeoutMs: 60_000 })
+      return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${(r.stderr || r.stdout).slice(0, 300)}` }
+    }
+    if (/^(review|tickets|wall|decide|queue)$/.test(args) || /^ticket(\s+#?\d+)?$/.test(args)) {
+      const word = args.split(/\s+/)[0]
+      const which = (ALIASES[word] ?? word) as View
       const t = args.replace(/^ticket\s+#?/, '')
-      await update($, view, v => ({ ...v, tail: undefined, ...(which === 'ticket' && /^\d+$/.test(t) ? { ticket: t } : {}) }))
+      await update($, view, v => ({ ...v, tail: undefined, ...(word === 'ticket' && /^\d+$/.test(t) ? { ticket: t, open: [...new Set([...(v.open ?? []), t])] } : {}) }))
       await refresh($, o)
       await openAll($)
       await openView($, which)
-      return { text: `Desk: ${TITLES[which]}. The pane takes the keys after ctrl+x then tab, or a click; its second line names them. 1 to 4 switch views, Tab and the arrows walk the rows, Enter opens one, f finds.` }
+      return { text: `Desk: ${TITLES[which]}. The pane takes the keys after ctrl+x then tab, or a click; every key is drawn as a button on it. 1 to 3 switch panes, Tab and the arrows walk the rows, Enter opens one, f finds.` }
     }
     const items = await refresh($, o)
     await openAll($)
-    await openView($, 'decide')
+    await openView($, 'review')
     return { text: `${items.length ? `${items.length} draft(s) waiting at the desk.` : 'Nothing waiting at the desk.'}${pending.size ? ` ${pending.size} run(s) start now.` : ''}` }
   })
 
@@ -1035,35 +1053,90 @@ export const register: Register = (on, options) => {
 // not hold the keyboard the line says so and how to take it. The engine scrolls the body and keeps the ring in view, so the
 // pane keeps no scroll of its own.
 
-const LEGEND: Record<View, string> = {
-  wall: 'enter: tail the agent   b: back   f: find   1 to 4: views',
-  queue: 'enter: open the ticket   p: pull the ticket under the ring   f: find   1 to 4: views',
-  ticket: 't a e r l g: fold a section   enter on a draft: decide it   n: next ticket   f: find   1 to 4: views',
-  decide: 's: send   v: send, solved   m: modify   d: deny   o: the ticket   n: next draft   f: find   1 to 4: views',
+// ---- the panes: Review (the proof tree behind the selected draft), Tickets (the queue; a row opens to its thread, run
+// and drafts) and Wall (every agent live). Panes of the engine's own, so its tab bar switches them and 1 to 3 do the same
+// from inside any pane. The operator's rule: every key that does something is drawn as a labelled button (`z: zoom`);
+// nothing works that is not on screen. Arrows, Tab, Enter and Esc are the engine's: they walk the rows and act on one.
+
+const KEYS_OFF = 'keys off: press ctrl+x then tab, or click the pane, to take the keys'
+const DEFAULT_OPEN = ['issues', 'reply']
+
+const nodeKey = (id: string) => `n:${id}`
+const idOf = (key: string | undefined): string | undefined => (key && key.startsWith('n:') ? key.slice(2) : undefined)
+
+function findNode(n: TreeNode | undefined, id: string): TreeNode | undefined {
+  if (!n) return undefined
+  if (n.id === id) return n
+  for (const c of n.children) {
+    const hit = findNode(c, id)
+    if (hit) return hit
+  }
+  return undefined
 }
-const KEYS_OFF = 'keys off: press ctrl+x then tab, or click the pane, to take the keys; then 1 to 4 switch views'
+function pathTo(n: TreeNode | undefined, id: string, acc: string[] = []): string[] | undefined {
+  if (!n) return undefined
+  if (n.id === id) return [...acc, id]
+  for (const c of n.children) {
+    const p = pathTo(c, id, [...acc, n.id])
+    if (p) return p
+  }
+  return undefined
+}
+const descendants = (n: TreeNode): string[] => [n.id, ...n.children.flatMap(descendants)]
+const matches = (n: TreeNode, f: string): boolean => n.label.toLowerCase().includes(f) || (n.body ?? '').toLowerCase().includes(f)
+const hasMatch = (n: TreeNode, f: string): boolean => matches(n, f) || n.children.some(c => hasMatch(c, f))
 
-type Line = { key: string; text: string; color?: string; dim?: boolean; press?: () => void }
+async function loadTree($: any, o: Opts, md5: string, node?: string): Promise<TreeResult> {
+  return (await desk($, o, ['tree', '--md5', md5, '--status', o.sendStatus, '--via', `${o.writeProxy}/${o.updateEndpoint}`, ...(node ? ['--node', node] : [])])) as unknown as TreeResult
+}
 
-async function showTicket($: any, o: Opts, ticket: string): Promise<void> {
-  await update($, view, x => ({ ...x, ticket, tail: undefined }))
+/** Make one draft the Review's: selected, its tree loaded, the pane opened. */
+async function selectDraft($: any, o: Opts, md5: string, open = true): Promise<void> {
+  const v = await read($, view)
+  const item = v.items.find(i => i.md5 === md5)
+  await update($, view, x => ({ ...x, selected: md5, ticket: item?.ticket ?? x.ticket, mode: 'list' }))
   await refresh($, o)
-  await openView($, 'ticket')
+  if (open) await openView($, 'review')
 }
+
+/** Expand the path down to a node, leave any zoom, and put the ring on it. */
+async function reveal($: any, target: string, requestId?: string): Promise<void> {
+  const v = await read($, view)
+  const path = pathTo(v.tree?.tree, target)
+  if (!path) return
+  await update($, view, x => ({ ...x, zoom: [], expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), ...path])], last: target }))
+  if (requestId) await $.ui.focus({ requestId, key: nodeKey(target) }).catch(() => undefined)
+}
+
+async function toggleNode($: any, o: Opts, n: TreeNode): Promise<void> {
+  const v = await read($, view)
+  if (n.body_file && !n.body && !v.bodies?.[n.id] && v.tree?.md5) {
+    const r = await loadTree($, o, v.tree.md5, n.id)
+    const body = r.ok ? String(r.tree?.body ?? '') : `not loaded: ${String(r.reason ?? '')}`
+    await update($, view, x => ({ ...x, bodies: { ...(x.bodies ?? {}), [n.id]: body } }))
+  }
+  await update($, view, x => {
+    const ex = new Set(x.expanded ?? DEFAULT_OPEN)
+    if (ex.has(n.id)) ex.delete(n.id)
+    else ex.add(n.id)
+    return { ...x, expanded: [...ex], last: n.id }
+  })
+}
+
+/** The node an action acts on: the one under the focus ring, else the row last pressed. */
+const acted = (v: DeskView, requestId: string): string | undefined => idOf(ring.get(requestId)) ?? v.last
 
 async function drawPane($: any, o: Opts, e: any, which: View) {
   const { Box, Text, Button, Input } = $.ui.resolve(e) as any
   const v = await read($, view)
   const width = Math.max(40, e.props.bodyColumns ?? 80)
   const focused = e.props.isFocused === true
-  const f = (v.filter?.[which] ?? '').trim()
+  const f = (v.filter?.[which] ?? '').trim().toLowerCase()
   const cut = (t: string, n = width - 4) => t.replace(/\s+/g, ' ').slice(0, n)
   const ago = (t: number) => `${Math.max(0, Math.round((Date.now() - t) / 60000))}m`
-  const when = (ts?: number) => (ts ? new Date(ts * 1000).toISOString().slice(0, 16).replace('T', ' ') : '')
-  const match = (...parts: Array<string | undefined>) => !f || parts.some(p => p && p.toLowerCase().includes(f.toLowerCase()))
+  const match = (...parts: Array<string | undefined>) => !f || parts.some(p => p && p.toLowerCase().includes(f))
   const setFilter = (text: string) => void update($, view, x => ({ ...x, filter: { ...(x.filter ?? {}), [which]: text.trim() } }))
-  const sel = v.items.find(i => i.md5 === v.selected) ?? v.items.find(i => i.ticket === v.ticket) ?? v.items[0]
-  const t = v.trace && v.trace.ok && v.trace.run?.ticket === v.ticket ? v.trace : undefined
+  const sel = v.items.find(i => i.md5 === v.selected) ?? v.items[0]
   let first = true
   const focusFirst = () => { if (!first) return {}; first = false; return { autoFocus: true as const } }
 
@@ -1075,23 +1148,112 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
       <Text dimColor>  {v.items.length} waiting, {active.size} agents, poll {v.poll}{v.notice ? `  (${v.notice})` : ''}</Text>
     </Box>
   )
-  const legend = focused ? <Text key="legend" dimColor>{LEGEND[which]}</Text> : <Text key="legend" color="yellow">{KEYS_OFF}</Text>
+  const keysOff = focused ? null : <Text key="keys-off" color="yellow">{KEYS_OFF}</Text>
   const finder = (
     <Box key="finder">
       <Button key="find" plain hotkey="f" onPress={(p: any) => void $.ui.focus({ requestId: p.requestId, key: 'filter' }).catch(() => undefined)}>find</Button>
       <Text dimColor> </Text>
-      <Input key="filter" placeholder="type, then Enter, to narrow the rows" value={f} submitLabel="narrow" onSubmit={(txt: string) => setFilter(txt)} />
+      <Input key="filter" placeholder="type, then Enter, to narrow the rows" value={v.filter?.[which] ?? ''} submitLabel="narrow" onSubmit={(txt: string) => setFilter(txt)} />
       {f ? <Button key="clear" plain hotkey="c" onPress={() => setFilter('')}>clear</Button> : null}
     </Box>
   )
-
   const body: any[] = []
-  const line = (l: Line) => {
-    if (l.press) body.push(<Button key={l.key} plain dimColor={l.dim} {...focusFirst()} onPress={l.press}>{l.color ? <Text color={l.color}>{l.text}</Text> : l.text}</Button>)
-    else body.push(<Text key={l.key} color={l.color} dimColor={l.dim}>{l.text}</Text>)
-  }
+  const text = (key: string, t: string, color?: string, dim?: boolean) => body.push(<Text key={key} color={color} dimColor={dim}>{t}</Text>)
+  const row = (key: string, t: string, press: () => void, color?: string, dim?: boolean) =>
+    body.push(<Button key={key} plain dimColor={dim} {...focusFirst()} onPress={press}>{color ? <Text color={color}>{t}</Text> : t}</Button>)
 
-  if (which === 'wall') {
+  if (which === 'review') {
+    const tree = v.tree?.ok ? v.tree.tree : undefined
+    const zoom = v.zoom ?? []
+    const zoomId = zoom[zoom.length - 1]
+    const expanded = new Set(v.expanded ?? DEFAULT_OPEN)
+    if (!sel) {
+      text('r0', `No draft at the desk. The drafter files one with ${TOOL}; its proof shows here, and nothing posts without a Send.`, undefined, true)
+    } else if (!tree) {
+      // the draft is still the operator's to decide when its tree did not build: the text and the checks at filing stand in
+      text('r0', `The proof tree did not build: ${String(v.tree?.reason ?? 'desk.py gave no tree')}. The draft and its checks at filing:`, 'yellow')
+      text('r1', `#${sel.ticket} draft ${sel.md5.slice(0, 8)} ${sel.checks.verdict === 'hold' ? `HOLD ${sel.checks.hits.join(',')}` : 'clear'} | thread: ${sel.checks.thread?.status === 'captured' ? `${sel.checks.thread.messages} of ${sel.checks.thread.console_count} comments recorded` : 'NOT captured'} | claims: ${sel.checks.claims ? `${sel.checks.claims.credited} of ${sel.checks.claims.checkable} receipted` : 'n/a'}${sel.checks.warnings.length ? ` | ${sel.checks.warnings.join(', ')}` : ''}`, undefined, true)
+      for (const [n, l] of sel.text.split('\n').entries()) text(`dl-${n}`, l || ' ')
+    } else {
+      const crumbs = [tree.label, ...zoom.map(id => cut(findNode(tree, id)?.label ?? id, 40))]
+      text('crumbs', crumbs.join('  >  '), 'cyan')
+      const walk = (n: TreeNode, depth: number) => {
+        if (f && !hasMatch(n, f)) return
+        const open = Boolean(f) || n.id === zoomId || expanded.has(n.id)
+        const glyph = n.children.length ? (open ? '-' : '+') : '·'
+        const dim = n.state === 'answered' || n.state === 'asserts-nothing' || n.state === 'overruled'
+        row(nodeKey(n.id), `${'  '.repeat(depth)}${glyph} ${cut(n.label, width - 6 - depth * 2)}`, () => void toggleNode($, o, n), n.color, dim)
+        if (!open) return
+        const b = (n.body ?? v.bodies?.[n.id] ?? '').trim()
+        if (b && !n.label.includes(b)) for (const [i, l] of b.split('\n').entries()) text(`b:${n.id}:${i}`, `${'  '.repeat(depth + 2)}${l || ' '}`, undefined, true)
+        for (const c of n.children) walk(c, depth + 1)
+      }
+      const root = zoomId ? findNode(tree, zoomId) : undefined
+      if (root) walk(root, 0)
+      else for (const c of tree.children) walk(c, 0)
+      body.push(
+        <Box key="r-nav">
+          <Button key="zoom" plain hotkey="z" onPress={(p: any) => { const id = acted(v, p.requestId); if (id && id !== zoomId) void update($, view, x => ({ ...x, zoom: [...(x.zoom ?? []), id], expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), id])] })) }}>zoom into the row</Button>
+          <Button key="up" plain hotkey="u" onPress={() => void update($, view, x => ({ ...x, zoom: (x.zoom ?? []).slice(0, -1) }))}>up</Button>
+          <Button key="expand-all" plain hotkey="x" onPress={(p: any) => { const id = acted(v, p.requestId); const n = id ? findNode(tree, id) : undefined; if (n) void update($, view, x => ({ ...x, expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), ...descendants(n)])] })) }}>expand all beneath</Button>
+          <Button key="follow" plain hotkey="g" onPress={(p: any) => { const id = acted(v, p.requestId); const n = id ? findNode(tree, id) : undefined; if (n?.target) void reveal($, n.target, p.requestId) }}>go to what the row is about</Button>
+        </Box>,
+      )
+      body.push(
+        <Box key="r-jump">
+          <Button key="jump-issues" plain hotkey="i" onPress={(p: any) => void reveal($, 'issues', p.requestId)}>issues</Button>
+          <Button key="jump-ask" plain hotkey="t" onPress={(p: any) => void reveal($, 'ask:thread', p.requestId)}>thread</Button>
+          <Button key="jump-reply" plain hotkey="r" onPress={(p: any) => void reveal($, 'reply', p.requestId)}>reply</Button>
+          <Button key="jump-run" plain hotkey="w" onPress={(p: any) => void reveal($, 'run', p.requestId)}>who did what</Button>
+          <Button key="open-ticket" plain hotkey="o" onPress={() => { void update($, view, x => ({ ...x, ticket: sel.ticket, open: [...new Set([...(x.open ?? []), sel.ticket])] })); void openView($, 'tickets') }}>the ticket</Button>
+          {v.items.length > 1 ? <Button key="next" plain hotkey="n" onPress={() => { const i = v.items.findIndex(it => it.md5 === sel.md5); void selectDraft($, o, v.items[(i + 1) % v.items.length].md5, false) }}>next draft</Button> : null}
+        </Box>,
+      )
+    }
+    if (sel) {
+      const open = v.tree?.open ?? 0
+      if (v.mode === 'list') body.push(
+        <Box key="r-decide">
+          <Button key="send" plain hotkey="s" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`)}>Send, {o.sendStatus}{open ? ` (${open} open)` : ''}</Button>
+          <Button key="solve" plain hotkey="v" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`, 'solved')}>Send, solved</Button>
+          <Button key="modify" plain hotkey="m" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'modify' }))}>Modify</Button>
+          <Button key="deny" plain hotkey="d" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'deny' }))}>Deny</Button>
+        </Box>,
+      )
+      if (v.mode === 'modify') body.push(<Input key="modify-note" label="what to change" placeholder="one line for the drafter; Esc keeps the draft as it is" autoFocus submitLabel="return" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'modify', txt, p.requestId)} />)
+      if (v.mode === 'deny') body.push(<Input key="deny-reason" label="why" placeholder="recorded with the deny" autoFocus submitLabel="deny" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'deny', txt, p.requestId)} />)
+    }
+  } else if (which === 'tickets') {
+    text('q0', `poll ${v.poll}${v.lastPoll ? `, last ${ago(v.lastPoll)} ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, undefined, true)
+    if (v.lastResult && !v.pollError) text('q0r', `  proxy answered: ${cut(v.lastResult, width - 20)}`, undefined, true)
+    const opened = new Set(v.open ?? [])
+    const rows = v.queue.filter(q => match(q.ticket, q.subject, q.state))
+    if (!v.queue.length) text('q1', 'No open tickets seen. /desk poll asks now; /desk query shows the search.', undefined, true)
+    else if (!rows.length) text('q1', `No ticket matches "${f}".`, undefined, true)
+    for (const q of rows) {
+      const isOpen = opened.has(q.ticket)
+      row(`ticket:${q.ticket}`, `${isOpen ? '-' : '+'} #${q.ticket} ${q.state}${q.sla ? ` SLA ${q.sla.slice(5, 16)}` : ''} ${Math.round(q.age_s / 60)}m  ${cut(q.subject ?? '', width - 36)}`,
+        () => void update($, view, x => ({ ...x, ticket: q.ticket, open: isOpen ? (x.open ?? []).filter(t => t !== q.ticket) : [...(x.open ?? []), q.ticket] })), undefined, q.state === 'skipped' || q.state === 'sent')
+      if (!isOpen) continue
+      text(`th:${q.ticket}`, `    thread: ${q.thread ? `${q.thread.messages} of ${q.thread.count ?? '?'} comments recorded${q.thread.fetched_at ? ` ${ago(q.thread.fetched_at * 1000)} ago` : ''}` : 'not recorded'}`, undefined, true)
+      text(`run:${q.ticket}`, `    run: ${q.run ? `phase ${q.run.phase}, rounds ${q.run.rounds ?? 0}, agents ${q.run.agents ?? 0}` : 'none'}`, undefined, true)
+      const drafts = v.items.filter(i => i.ticket === q.ticket)
+      if (!drafts.length) text(`d0:${q.ticket}`, '    drafts: none waiting', undefined, true)
+      for (const i of drafts) row(`draft:${i.md5}`, `    draft ${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m  ${cut(i.text, width - 44)}`, () => void selectDraft($, o, i.md5))
+    }
+    const under = (requestId: string): string | undefined => {
+      const k = ring.get(requestId)
+      const t = k?.startsWith('ticket:') ? k.slice(7) : k?.startsWith('draft:') ? v.items.find(i => i.md5 === k.slice(6))?.ticket : undefined
+      return t ?? v.ticket
+    }
+    body.push(
+      <Box key="q-actions">
+        <Button key="pull" plain hotkey="p" onPress={(p: any) => { const id = under(p.requestId); if (id) pull($, o, id, 'pulled by the operator at the desk') }}>pull the ticket under the ring</Button>
+        <Button key="reread" plain hotkey="r" onPress={(p: any) => { const id = under(p.requestId); if (id) void $.prompt.submit({ text: `Read every comment on ticket #${id} again now with ${o.outwardTool} (proxy ${o.readProxy}, endpoint ${o.commentsEndpoint}, arguments {"ticket_id":"${id}"}), so the desk records the thread afresh. Do not post anything.` }).catch(() => undefined) }}>re-read its thread</Button>
+        <Button key="open-review" plain hotkey="o" onPress={(p: any) => { const id = under(p.requestId); const d = v.items.find(i => i.ticket === id); if (d) void selectDraft($, o, d.md5) }}>its draft in Review</Button>
+      </Box>,
+    )
+  } else {
     const tail = v.tail ? v.wall.find(w => w.id === v.tail) : undefined
     if (tail) {
       body.push(
@@ -1100,109 +1262,28 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
           <Text color="cyan">  #{tail.ticket} {tail.role} {tail.label}  {tail.status}  {ago(tail.started)}</Text>
         </Box>,
       )
-      if (!tail.lines.length) line({ key: 'tail-0', text: 'Nothing said yet.', dim: true })
-      tail.lines.forEach((l, i) => line({ key: `tail-${i}`, text: l }))
+      if (!tail.lines.length) text('tail-0', 'Nothing said yet.', undefined, true)
+      tail.lines.forEach((l, i) => text(`tail-${i}`, l))
     } else {
       const byTicket = new Map<string, WallAgent[]>()
       for (const w of v.wall) byTicket.set(w.ticket, [...(byTicket.get(w.ticket) ?? []), w])
-      if (!byTicket.size) line({ key: 'w0', text: 'No agents yet. A poll or /desk run N starts a run; every agent shows here as it works, Enter tails one.', dim: true })
+      if (!byTicket.size) text('w0', 'No agents yet. A poll or /desk run N starts a run; every agent shows here as it works, Enter tails one.', undefined, true)
       for (const [ticket, agents] of byTicket) {
         const rows = agents.filter(a => match(ticket, a.role, a.label, a.last, a.status))
         if (!rows.length) continue
-        line({ key: `w-${ticket}`, text: `#${ticket}${t?.run?.ticket === ticket ? `  phase ${t.run.phase}` : ''}  ${rows.filter(a => a.status === 'running').length} running`, color: 'cyan' })
+        text(`w-${ticket}`, `#${ticket}${v.trace?.run?.ticket === ticket ? `  phase ${v.trace.run.phase}` : ''}  ${rows.filter(a => a.status === 'running').length} running`, 'cyan')
         for (const a of rows) {
           const glyph = a.status === 'running' ? '*' : a.status === 'pending' ? '.' : a.status === 'failed' ? 'x' : 'v'
-          line({ key: `agent:${a.id}`, text: `${glyph} ${a.role} ${a.label} ${ago(a.started)}  ${cut(a.last, width - 30)}`, color: a.status === 'failed' ? 'red' : undefined, dim: a.status !== 'running', press: () => void update($, view, x => ({ ...x, tail: a.id })) })
+          row(`agent:${a.id}`, `${glyph} ${a.role} ${a.label} ${ago(a.started)}  ${cut(a.last, width - 30)}`, () => void update($, view, x => ({ ...x, tail: a.id })), a.status === 'failed' ? 'red' : undefined, a.status !== 'running')
         }
       }
-    }
-  } else if (which === 'queue') {
-    line({ key: 'q0', text: `poll ${v.poll}${v.lastPoll ? `, last ${ago(v.lastPoll)} ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, dim: true })
-    if (v.lastResult && !v.pollError) line({ key: 'q0r', text: `  proxy answered: ${cut(v.lastResult, width - 20)}`, dim: true })
-    const rows = v.queue.filter(q => match(q.ticket, q.subject, q.state))
-    if (!v.queue.length) line({ key: 'q1', text: 'No open tickets seen. /desk poll asks now; /desk query shows the search.', dim: true })
-    else if (!rows.length) line({ key: 'q1', text: `No ticket matches "${f}".`, dim: true })
-    for (const q of rows) {
-      line({ key: `ticket:${q.ticket}`, text: `${q.ticket === v.ticket ? '>' : ' '} #${q.ticket} ${q.state}${q.sla ? ` SLA ${q.sla.slice(5, 16)}` : ''} ${Math.round(q.age_s / 60)}m  ${cut(q.subject ?? '', width - 36)}`, dim: q.state === 'skipped' || q.state === 'sent', press: () => void showTicket($, o, q.ticket) })
-    }
-    body.push(
-      <Box key="q-actions">
-        <Button key="pull" plain hotkey="p" onPress={(p: any) => { const under = ring.get(p.requestId)?.replace(/^ticket:/, ''); const id = under && /^\d+$/.test(under) ? under : v.ticket; if (id) pull($, o, id, 'pulled by the operator at the desk') }}>pull the ticket under the ring</Button>
-      </Box>,
-    )
-  } else if (which === 'ticket') {
-    const q = v.queue.find(x => x.ticket === v.ticket)
-    if (!v.ticket) line({ key: 't0', text: 'No ticket chosen. Press a row in Queue, or a draft in Decide, and it shows here.', dim: true })
-    else {
-      line({ key: 't1', text: `#${v.ticket}  ${cut(q?.subject ?? '', width - 20)}`, color: 'cyan' })
-      line({ key: 't2', text: `${q ? `${q.state}${q.sla ? `, SLA ${q.sla.slice(5, 16)}` : ''}, open ${Math.round(q.age_s / 60)}m` : 'not in the queue'}  |  run: ${t ? `phase ${t.run.phase}, rounds ${t.run.rounds ?? 0}, agents ${t.run.agents?.length ?? 0}` : 'none'}`, dim: true })
-      const folded = new Set(v.folded ?? [])
-      const toggle = (k: string) => void update($, view, x => ({ ...x, folded: (x.folded ?? []).includes(k) ? (x.folded ?? []).filter(y => y !== k) : [...(x.folded ?? []), k] }))
-      const section = (k: string, hotkey: string, title: string, lines: Line[]) => {
-        const shown = f ? lines.filter(l => match(l.text)) : lines
-        const open = f ? shown.length > 0 : !folded.has(k)
-        body.push(<Button key={`sec:${k}`} plain hotkey={hotkey} onPress={() => toggle(k)}>{`${open ? '-' : '+'} ${title} (${lines.length}${f && shown.length !== lines.length ? `, ${shown.length} match` : ''})`}</Button>)
-        if (open) for (const l of shown) line(l)
-      }
-      const msgs = t?.thread?.messages ?? []
-      section('thread', 't', 'THREAD', msgs.length
-        ? msgs.map((m, i) => ({ key: `m-${m.id ?? i}`, text: `${m.who} ${when(m.at)}: ${m.text}`, color: m.who === 'customer' ? 'yellow' : undefined }))
-        : [{ key: 'm0', text: 'not captured: the model reads the comments and the desk records them as the live thread', dim: true }])
-      section('agents', 'a', 'AGENTS', (t?.run.agents ?? []).map(a => ({ key: `ta-${a.id}`, text: `${a.status === 'completed' ? 'v' : a.status === 'failed' ? 'x' : '*'} ${a.role} ${a.label} (${a.model ?? '?'})${a.params ? ` ${cut(a.params, 50)}` : ''}${a.summary ? `: ${a.summary}` : ''}`, color: a.status === 'failed' ? 'red' : undefined, dim: a.status !== 'running' })))
-      const findings: Line[] = []
-      for (const k of ['hypothesis', 'evidence', 'counter', 'objection', 'answer', 'summary']) {
-        const fs = (t?.findings ?? []).filter(x => x.kind === k)
-        if (!fs.length) continue
-        findings.push({ key: `tk-${k}`, text: k.toUpperCase(), color: k === 'counter' || k === 'objection' ? 'yellow' : 'green' })
-        for (const x of fs) findings.push({ key: `tf-${x.id}`, text: `  (${x.agent}) ${x.text}${x.receipts?.length ? ` <${x.receipts.map(r => r.replace(/^rcpt:/, '')).join(',')}>` : ''}` })
-      }
-      section('findings', 'e', 'FINDINGS', findings)
-      section('receipts', 'r', 'RECEIPTS', (t?.receipts ?? []).map(r => ({ key: `tr-${r.id}`, text: `${r.id.replace(/^rcpt:/, '')} ${r.kind}${r.source ? ` ${r.source}${r.page_origin === 'search' ? ' (search result)' : ''}` : ''}: "${r.quote}"`, dim: true })))
-      section('claims', 'l', 'CLAIMS IN THE DRAFT', (t?.claims ?? []).map(c => ({ key: `tc-${c.text.slice(0, 24)}`, text: `${c.problems?.length ? c.problems.join(',') : c.echo ? 'echo' : 'ok'}: ${c.text}`, color: c.problems?.length ? 'yellow' : undefined })))
-      section('drafts', 'g', 'DRAFTS', v.items.filter(i => i.ticket === v.ticket).map(i => ({ key: `draft:${i.md5}`, text: `${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m  ${cut(i.text, width - 40)}`, press: () => { void update($, view, x => ({ ...x, selected: i.md5, mode: 'list' })); void openView($, 'decide') } })))
-      const order = v.queue.map(x => x.ticket)
-      const next = order.length ? order[(Math.max(0, order.indexOf(v.ticket)) + 1) % order.length] : undefined
-      body.push(
-        <Box key="t-actions">
-          {next && next !== v.ticket ? <Button key="next-ticket" plain hotkey="n" onPress={() => void showTicket($, o, next)}>next ticket #{next}</Button> : null}
-        </Box>,
-      )
-    }
-  } else {
-    const rows = v.items.filter(i => match(i.ticket, i.md5, i.text, i.checks.verdict, i.state))
-    if (!v.items.length) line({ key: 'd0', text: `No drafts filed. The drafter files one with ${TOOL}; nothing posts without a Send here.`, dim: true })
-    else if (!rows.length) line({ key: 'd0', text: `No draft matches "${f}".`, dim: true })
-    for (const i of rows) line({ key: `draft:${i.md5}`, text: `${i.md5 === sel?.md5 ? '>' : ' '} #${i.ticket} ${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m`, press: () => void update($, view, x => ({ ...x, selected: i.md5, ticket: i.ticket, mode: 'list' })) })
-    if (sel) {
-      line({ key: 'ds', text: `thread: ${sel.checks.thread?.status === 'captured' ? `${sel.checks.thread.messages} of ${sel.checks.thread.console_count} comments recorded` : 'NOT captured'} | claims: ${sel.checks.claims ? `${sel.checks.claims.credited} of ${sel.checks.claims.checkable} receipted` : 'n/a'}${sel.checks.warnings.length ? ` | ${sel.checks.warnings.join(', ')}` : ''}`, dim: true })
-      for (const q of (sel.checks.thread?.open_questions ?? []).slice(0, 4)) line({ key: `dq-${q.slice(0, 16)}`, text: `customer asked: ${q}`, color: 'yellow' })
-      const objections = (t?.findings ?? []).filter(x => x.kind === 'objection' && !/NO OBJECTIONS/i.test(x.text))
-      for (const x of objections.slice(-4)) line({ key: `do-${x.id}`, text: `objection (${x.agent}): ${x.text}`, color: 'yellow' })
-      line({ key: 'dh', text: `draft ${sel.md5.slice(0, 8)} for #${sel.ticket}:`, color: 'cyan' })
-      for (const [n, l] of sel.text.split('\n').entries()) line({ key: `dl-${n}`, text: l || ' ' })
-      body.push(
-        <Box key="d-actions">
-          {v.mode === 'list' ? (
-            <Box>
-              <Button key="send" variant="primary" hotkey="s" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`)}>s Send, {o.sendStatus}</Button>
-              <Button key="solve" hotkey="v" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`, 'solved')}>v Send, solved</Button>
-              <Button key="modify" hotkey="m" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'modify' }))}>m Modify</Button>
-              <Button key="deny" hotkey="d" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'deny' }))}>d Deny</Button>
-              <Button key="open-ticket" plain hotkey="o" onPress={() => void showTicket($, o, sel.ticket)}>the ticket</Button>
-              {v.items.length > 1 ? <Button key="next" plain hotkey="n" onPress={() => void update($, view, x => { const i = x.items.findIndex(it => it.md5 === sel.md5); const nx = x.items[(i + 1) % x.items.length]; return { ...x, selected: nx?.md5, ticket: nx?.ticket } })}>next draft</Button> : null}
-            </Box>
-          ) : null}
-        </Box>,
-      )
-      if (v.mode === 'modify') body.push(<Input key="modify-note" label="what to change" placeholder="one line for the drafter; Esc keeps the draft as it is" autoFocus submitLabel="return" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'modify', txt, p.requestId)} />)
-      if (v.mode === 'deny') body.push(<Input key="deny-reason" label="why" placeholder="recorded with the deny" autoFocus submitLabel="deny" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'deny', txt, p.requestId)} />)
     }
   }
 
   return (
     <Box flexDirection="column">
       {nav}
-      {legend}
+      {keysOff}
       {finder}
       {body}
     </Box>

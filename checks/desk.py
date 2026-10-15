@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import confirm_ledger as CL
 import claim_receipts as CR
 import thread_review as TR
+import desk_tree as DT
 
 OPERATOR = "operator"
 # Official documentation hosts a docs receipt may cite, on top of claim_receipts' own list: ARGUS_DESK_DOCS_HOSTS=a,b
@@ -828,7 +829,8 @@ class Desk:
     def queue_view(self):
         now = self.clock()
         q = self._queue()
-        waiting = {i["ticket"] for i in self.list()["items"]}
+        items = self.list()["items"]
+        waiting = {i["ticket"] for i in items}
         rows = []
         for tid, row in q.items():
             st = row["state"]
@@ -836,8 +838,14 @@ class Desk:
                 st = "waiting"
             elif st == "drafting" and now - row.get("drafting_at", now) > STALE_S:
                 st = "stale"
+            th = (self._thread(tid) or {})
+            run = self._run(tid)
             rows.append({"ticket": tid, "state": st, "sla": row.get("sla"), "subject": row.get("subject"),
-                         "age_s": int(now - row.get("first_seen", now)), "status": row.get("status")})
+                         "age_s": int(now - row.get("first_seen", now)), "status": row.get("status"), "updated": row.get("updated"),
+                         "thread": {"messages": len(th.get("thread", {}).get("messages", [])), "count": (th.get("receipt") or {}).get("count"),
+                                    "fetched_at": th.get("thread", {}).get("fetched_at")} if th else None,
+                         "run": {"phase": run.get("phase"), "rounds": run.get("rounds", 0), "agents": len(run.get("agents", []))} if run.get("phase") else None,
+                         "drafts": [i["md5"] for i in items if i["ticket"] == tid]})
         busy = [r for r in rows if r["state"] in ("drafting", "waiting")]
         pullable = [r for r in rows if r["state"] in ("new", "reopened", "stale")]
         pullable.sort(key=lambda r: (r["sla"] is None, r["sla"] or "", -r["age_s"]))
@@ -990,7 +998,7 @@ def render_audit(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
@@ -1001,7 +1009,10 @@ def main(argv=None):
     ap.add_argument("--state")
     ap.add_argument("--updated", help="mark: the ticket's updated_at as read back after the post")
     ap.add_argument("--timeout", type=float, default=1800)
-    ap.add_argument("--text", action="store_true", help="stats as text")
+    ap.add_argument("--text", action="store_true", help="stats, audit or tree as text")
+    ap.add_argument("--node", help="tree: only this node (its body loaded when it lives in a file)")
+    ap.add_argument("--depth", type=int, default=99, help="tree --text: how deep to print")
+    ap.add_argument("--via", help="tree: the proxy/endpoint a Send will use, for the SEND node")
     a = ap.parse_args(argv)
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
     d = Desk(os.path.expanduser(a.root))
@@ -1035,6 +1046,14 @@ def main(argv=None):
         out = d.audit(a.md5, a.ticket)
         if a.text and out.get("ok"):
             print(render_audit(out))
+            return
+    elif a.cmd == "tree":
+        out = DT.build(d, a.md5, a.ticket, send={"status": a.status, "via": a.via})
+        if out.get("ok") and a.node:
+            hit = DT.find(out["tree"], a.node)
+            out = dict(out, tree=DT.load_body(d, hit)) if hit else {"ok": False, "reason": "no node %s" % a.node}
+        if a.text and out.get("ok"):
+            print("\n".join(DT.render(out["tree"], max_depth=a.depth)))
             return
     elif a.cmd == "verify":
         out = d.verify()

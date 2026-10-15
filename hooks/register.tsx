@@ -22,6 +22,11 @@ const opts = (o: Record<string, unknown>): Opts => ({
   outwardTool: String(o.outwardTool ?? 'invoke_proxy'),
 })
 
+// invoke_proxy as Argus shows it (2026-10-15): required proxy (an enum of 49 services) and endpoint (a name such
+// as zendesk_get_ticket, not a path), optional arguments (object or JSON string). There is no method field, so
+// the endpoint name is the only sign of a read. Anything not plainly a read is outward, on every proxy.
+const READ_ENDPOINT = /^[a-z0-9]+_(get|list|search|read|show|fetch|count|describe)(_|$)/i
+
 const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'consent', 'requestMeta'])
 
 /** Every string an outward call carries, nested or not: the candidates for a granted md5. */
@@ -37,16 +42,30 @@ const strings = (v: unknown, out: string[] = [], depth = 0): string[] => {
   return out
 }
 
-/** A call that can write to the console: a non-GET method, or a body with content. Read calls pass. */
+/** arguments may arrive as a JSON string; parse it so the reply text and the ticket id are visible. */
+const normalize = (args: Record<string, unknown>): Record<string, unknown> => {
+  if (typeof args.arguments !== 'string') return args
+  try {
+    return { ...args, arguments: JSON.parse(args.arguments) as unknown }
+  } catch {
+    return args
+  }
+}
+
+/**
+ * A call that can write: any endpoint whose name is not plainly a read, on any proxy. Fails closed: no endpoint,
+ * or a write method or body in the old path-and-method shape, is outward too.
+ */
 const isOutward = (args: Record<string, unknown>): boolean => {
+  const endpoint = typeof args.endpoint === 'string' ? args.endpoint : ''
+  if (!endpoint || !READ_ENDPOINT.test(endpoint)) return true
   const flat = JSON.stringify(args).toLowerCase()
-  const method = /"(?:method|verb|http_method)"\s*:\s*"(post|put|patch|delete)"/.test(flat)
-  const body = /"(?:body|json|data|payload|comment)"\s*:/.test(flat) && !/"method"\s*:\s*"get"/.test(flat)
-  return method || body
+  return /"(?:method|verb|http_method)"\s*:\s*"(post|put|patch|delete)"/.test(flat)
 }
 
 const ticketOf = (args: Record<string, unknown>): string | undefined => {
-  const m = JSON.stringify(args).match(/tickets?\/(\d{4,})/) ?? JSON.stringify(args).match(/"ticket(?:_id)?"\s*:\s*"?(\d{4,})/)
+  const flat = JSON.stringify(args)
+  const m = flat.match(/tickets?\/(\d{4,})/) ?? flat.match(/"ticket(?:_id|Id)?"\s*:\s*"?(\d{4,})/)
   return m?.[1]
 }
 
@@ -157,7 +176,7 @@ export const register: Register = (on, options) => {
   // 2. the gate: an outward call passes only by spending an open grant on the exact text it carries.
   on('tool.call', async ($, e, next) => {
     if (!String(e.tool).includes(o.outwardTool)) return next(e)
-    const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
+    const args = normalize(Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k))))
     if (!isOutward(args)) {
       // A read: let it run, and when it looks like the ticket's comments, capture them as the live thread.
       const ran = await next(e)

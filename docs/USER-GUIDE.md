@@ -84,7 +84,23 @@ A Send lasts 6 hours. A draft nobody decides is dropped after 24 hours.
    it. On the next poll the ticket has left the open set, which the queue records as the transition
    confirmed. If the customer answers, the ticket comes back as `reopened` and is pulled first.
 
-Hand controls: `/desk run N`, `/desk trace N` (the trace as text in the transcript), `/desk poll`,
+## 3a. Accountability: the record behind a reply
+
+Every reply can be walked backwards to its evidence and its authors. `/desk audit N` (or `/desk audit <md5>`)
+prints the chain for the ticket's latest draft: the exact bytes and their hash, the readback after posting,
+who pressed and when, any HOLD the Send overruled, the checks at filing, then each factual sentence with
+its receipt, the receipt's source and the captured bytes it was checked against (file and hash), the agent
+that minted it, that agent's model and prompt hash; then every agent in the run with its prompt, its full
+answer and every proxy call it made (arguments and a hash of the result); then the captures; then the
+integrity check. The records live under `~/.argus-desk`: `runs/N/events.jsonl` (the tail), `findings.jsonl`,
+`calls.jsonl` (every call), `prompts/<agent>.txt`, `answers/<agent>.txt`, `threads/N.json` and `pages/`
+(what was read), `receipts.jsonl`, `requests.jsonl`, `decisions.jsonl`, `transitions.jsonl`. Every record
+the desk writes is chained (`prev`, `h`: a sha256 over the previous hash and the row); `/desk verify` walks
+every chained file and names the first broken link, so an edited or deleted record shows. A refused receipt
+is on the tail too, with the quote the agent claimed and why it was refused.
+
+Hand controls: `/desk run N`, `/desk trace N` (the trace as text in the transcript), `/desk audit N`,
+`/desk verify`, `/desk poll`,
 `/desk pull N`, `/desk pause`, `/desk resume`, `/desk stats`. The default search assumes the Argus proxies
 `zendesk-full` (reads) and `zendesk-write` (posts) and the endpoints `zendesk_search_tickets`,
 `zendesk_get_ticket`, `zendesk_list_comments` and `zendesk_update_ticket`; if your Argus names them

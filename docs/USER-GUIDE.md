@@ -88,20 +88,31 @@ Leave the session open. The desk does the pulling and the investigating; you do 
    checked against the search result that names the URL, not against the page itself. A receipt on a page
    the agent fetched by its URL through the proxy carries no mark. The agents run with every tool the
    session has; the gate holds on the proxy.
-4. **You read the trace, then decide.** `/desk` opens the pane. Four tabs, keys `1` to `4`, `j`/`k` to
-   scroll, `n` for the next draft. The keys work while the pane holds the focus: press ctrl+x then tab
-   (or click the pane); typed into the prompt they are just text. Without the focus, use the commands:
-   `/desk wall`, `/desk queue`, `/desk ticket N`, `/desk decide`, and `/desk trace N` for the trace as text.
-   - **Wall**: every agent on every ticket, live: role, model, minutes running, its last tool call or
-     sentence. This is where you see what it is working through.
-   - **Queue**: the open set and where each ticket stands (`new`, `drafting`, `waiting`, `stale`, `sent`,
-     `skipped`).
-   - **Ticket**: the trace of the selected ticket: phase, each agent and its summary, then HYPOTHESIS,
-     EVIDENCE, COUNTER, OBJECTION, ANSWER, SUMMARY findings with their receipt ids, the RECEIPTS with their
-     sources and quotes, and CLAIMS IN THE DRAFT: each factual sentence marked `ok <receipt>`, `uncovered`,
-     `echo` (restates the customer) or the specific problem. Read this before you Send.
-   - **Decide**: the draft, its checks, the customer's open questions, the reviewer's objections, and the
-     buttons.
+4. **You read the trace, then decide.** `/desk` opens four panes: **Wall**, **Queue**, **Ticket** and
+   **Decide**. They are panes of Claude Code's own, so the tab bar above them switches views (click a tab,
+   or Tab onto it and Enter), and the keys `1` to `4` do the same from inside any of them.
+
+   A pane takes the keyboard after ctrl+x then tab, or a click on it; until then its second line reads
+   `keys off` and says so. Once it holds the keys, that line names the keys of the view you are in. Tab and
+   the arrows walk the rows, Enter opens the row under the ring, Esc hands the keys back to the prompt.
+   Every view has a filter: `f` puts the cursor in the field, type, Enter narrows the rows to what matches,
+   `c` clears it. Without the keys, the commands do the same: `/desk wall`, `/desk queue`, `/desk ticket N`,
+   `/desk decide`, and `/desk trace N` prints the trace as text.
+   - **Wall**: every agent on every ticket, live, one row each: role, label, minutes running, its last tool
+     call or sentence. Enter on a row tails that agent (everything it has said and called, as it happens);
+     `b` comes back to the list. This is where you watch the work.
+   - **Queue**: the open set, one row per ticket: state (`new`, `drafting`, `waiting`, `stale`, `sent`,
+     `skipped`), SLA, age, subject. Enter opens the ticket in the Ticket view; `p` pulls the ticket under
+     the ring into a run.
+   - **Ticket**: one ticket, in sections that fold on their key: THREAD (`t`, the customer's and our
+     comments as the desk recorded them, the customer's in yellow), AGENTS (`a`), FINDINGS (`e`: HYPOTHESIS,
+     EVIDENCE, COUNTER, OBJECTION, ANSWER, SUMMARY with their receipt ids), RECEIPTS (`r`, sources and
+     quotes), CLAIMS IN THE DRAFT (`l`: each factual sentence `ok <receipt>`, `uncovered`, `echo` or the
+     specific problem) and DRAFTS (`g`; Enter on a draft takes you to Decide with it selected). `n` moves to
+     the next ticket in the queue. The filter searches across every section. Read this before you Send.
+   - **Decide**: the drafts waiting, one row each; Enter selects one. Below it: its checks, the customer's
+     open questions, the reviewer's objections, the full text, and the buttons. `o` opens its ticket, `n`
+     the next draft.
 5. **Press one of the buttons** (or its key):
    - **Send, pending** (`s`): approves this exact text with the ticket going to Pending. The model is told
      to post it with that status in the same update, and the post goes through once.
@@ -270,8 +281,10 @@ Sonnet, the adversary and drafter to Opus.
   account, not you, when the proxy runs under a service account (it did on the Argus workstation): set the
   query to your Zendesk user id with `/desk query type:ticket status<pending assignee:<id>` (kept for every
   session on the workstation; `/desk query` shows it, `/desk query default` restores the option).
-- **The pane ignores the keys.** It does not hold the focus: press ctrl+x then tab, or use the tab commands.
-- **A run finished in seconds with no receipts.** Look at the Ticket tab or `/desk trace N`: an agent that
+- **The pane ignores the keys.** Its second line reads `keys off`: press ctrl+x then tab, or click the pane. A
+  field with the cursor in it (the filter, a Modify note) takes every key until Esc. Without the keys, the view
+  commands (`/desk queue`, `/desk ticket N`) still work.
+- **A run finished in seconds with no receipts.** Look at the Ticket view or `/desk trace N`: an agent that
   says it had no proxy tool or that a desk tool was not answered means the desk was started outside a
   `/desk` command; type `/desk` and `/desk run N` again.
 - **The agents still report "no tool.call hook answered" for desk_receipt or file_draft.** On that host a

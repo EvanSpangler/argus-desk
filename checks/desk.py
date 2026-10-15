@@ -755,8 +755,9 @@ class Desk:
             c = CR.check(drafts[-1]["text"], ticket, self.receipts_path, datetime.fromtimestamp(self.clock(), timezone.utc),
                          inbound="\n".join(m["text"] for m in (self._thread(ticket) or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer"))
             claims = c["claims"]
+        th = self._thread(ticket) or {}
         return {"ok": True, "run": run, "findings": findings, "receipts": list(reversed(uniq)), "events": events[-200:],
-                "claims": claims, "drafts": drafts}
+                "claims": claims, "drafts": drafts, "thread": th.get("thread"), "thread_count": (th.get("receipt") or {}).get("count")}
 
     # ---- the queue: open tickets the poller saw, and where each one stands
     def _queue(self):

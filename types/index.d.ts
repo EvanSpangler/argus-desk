@@ -45,6 +45,8 @@ export type Finding = { id: string; agent: string; role: string; kind: string; t
 export type Receipt = { id: string; kind: string; ticket: string; quote: string; source?: string; bound?: string[]; minted?: string; page_origin?: 'fetch' | 'search' }
 export type Claim = { text: string; classes?: string[]; receipts?: string[]; problems?: string[]; echo?: boolean }
 
+export type ThreadMessage = { id?: string; who: string; at?: number; text: string }
+
 export type Trace = {
   ok: boolean
   run: { ticket: string; phase: string; rounds?: number; agents?: RunAgent[]; started?: number }
@@ -53,6 +55,8 @@ export type Trace = {
   events?: Array<{ agent: string; kind: string; text: string; ts?: number }>
   claims?: Claim[]
   drafts?: DeskItem[]
+  thread?: { id?: string; source?: string; fetched_at?: number; messages: ThreadMessage[] }
+  thread_count?: number
 }
 
 export type DeskView = {
@@ -68,8 +72,12 @@ export type DeskView = {
   lastPoll?: number
   pollError?: string
   lastResult?: string
-  tab: 'wall' | 'queue' | 'ticket' | 'decide'
-  scroll: number
+  /** The filter text per view, applied on Enter. */
+  filter?: { wall?: string; queue?: string; ticket?: string; decide?: string }
+  /** The agent whose tail the Wall shows, instead of the list. */
+  tail?: string
+  /** The Ticket view's folded sections. */
+  folded?: string[]
 }
 
 declare module 'claude-code' {

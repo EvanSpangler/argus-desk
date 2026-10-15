@@ -70,6 +70,10 @@ class DeskTests(unittest.TestCase):
         self.assertIn("too-soon", r["hits"])
         self.assertIn("repeat-ask", r["hits"])
         self.assertEqual(r["thread"]["open_questions"], [])  # question predates our last send
+        tr = d.trace("5")
+        self.assertEqual([m["who"] for m in tr["thread"]["messages"]], ["customer", "us"])  # the pane shows the thread it checked against
+        self.assertEqual(tr["thread_count"], 2)
+        self.assertIsNone(d.trace("404")["thread"])
 
     def test_unrecorded_comment_holds(self):
         d, c = mk()

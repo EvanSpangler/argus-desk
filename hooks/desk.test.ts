@@ -102,7 +102,7 @@ test('the pane shows the draft with its checks and the three decisions on every 
   fake(on, () => ({ ok: true, items: [ITEM] }))
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
   for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ plugin: 'argus-desk', surface, component: 'Pane', requestId: 'argus-desk', props: { title: 'Desk', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
+    const ui = await $.ui.mount({ plugin: 'argus-desk', surface, component: 'Pane', requestId: 'desk-decide', props: { title: 'Decide', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
     expect(await ui.find({ type: 'Text', text: /1 waiting/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /NOT captured/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /0 of 2 receipted/ })).toBeDefined()
@@ -118,7 +118,7 @@ test('Send grants through desk.py and wakes the model to post; Deny records the 
   const prompts: string[] = []
   on('prompt.submit', async (_$: any, e: any) => { prompts.push(e.text); return { text: e.text } })
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
-  const ui = await $.ui.mount({ plugin: 'argus-desk', surface: 'terminal', component: 'Pane', requestId: 'argus-desk', props: { title: 'Desk', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
+  const ui = await $.ui.mount({ plugin: 'argus-desk', surface: 'terminal', component: 'Pane', requestId: 'desk-decide', props: { title: 'Decide', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
   await ui.press({ key: 'send' })
   const grant = calls.find(c => cmdOf(c) === 'grant')
   expect(grant).toBeDefined()
@@ -318,6 +318,8 @@ test('a documentation search is on the record and captured as a page per officia
 })
 
 test('the poller\'s pull spawns under the driver a /desk command created; /desk queue switches the tab without a key', async ($, on) => {
+  const opened: string[] = []
+  on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })
   const clock = mock.clock(on)
   const store: any[] = []
   fake(on, r => {
@@ -338,8 +340,9 @@ test('the poller\'s pull spawns under the driver a /desk command created; /desk 
   await clock.advance(4_000)
   expect(spawns.map(s => s.description)).toEqual(['investigator #123457 inv1', 'investigator #123457 inv2', 'investigator #123457 inv3'])
   const r = await $.command.run({ command: 'desk', args: 'queue' })
-  expect(String(r.text)).toMatch(/Desk: queue tab/)
+  expect(String(r.text)).toMatch(/Desk: Queue/)
   expect(String(r.text)).toMatch(/ctrl\+x then tab/)
+  expect(opened).toContain('desk-queue!')
 })
 
 test('/desk query sets the search the poller sends, kept in the plugin store, and the poll line names it', async ($, on) => {
@@ -433,4 +436,85 @@ test('guardRecord=false lets a shell command name the desk (for working on the d
   on('tool.call', { tool: 'Bash' }, async () => ({ result: 'ok' }))
   const r = await $.tool.call({ tool: 'Bash', command: 'python3 -I checks/desk.py --root /tmp/t list' } as any)
   expect(r.deny).toBeUndefined()
+})
+
+// ---- the designed pane (0.7): four panes, rows the ring walks, a filter per view, the keys named on the pane
+
+const TRACE_T = { ok: true, run: { ticket: '123457', phase: 'review', rounds: 1, agents: [{ id: 'a1', role: 'investigator', label: 'inv1', model: 'sonnet', status: 'completed', summary: 'broker off', started: 1 }] },
+  findings: [{ id: 'f1', agent: 'inv1', role: 'investigator', kind: 'evidence', text: 'The broker is disabled', receipts: ['rcpt:r1'] }],
+  receipts: [{ id: 'rcpt:r1', kind: 'material', ticket: '123457', quote: 'broker disabled' }], claims: [], drafts: [],
+  thread: { id: '123457', source: 'live', messages: [{ id: '1', who: 'customer', at: 1760000000, text: 'Why is the connector unhealthy?' }, { id: '2', who: 'staff', at: 1760000100, text: 'Looking now.' }] }, thread_count: 2 }
+const ROWS = [NEXT, { ticket: '123456', state: 'waiting', age_s: 900, subject: 'Scan stuck' }]
+const mountPane = ($: any, id: string, isFocused = true) => $.ui.mount({ plugin: 'argus-desk', surface: 'terminal', component: 'Pane', requestId: id, props: { title: id, isFocused, bodyColumns: 100, placement: 'dock' } } as any)
+
+test('each view is a pane of its own: 1 to 4 open the others with the focus, and a pane without the keys says how to take them', async ($, on) => {
+  fake(on, r => (cmdOf(r) === 'queue' ? { ok: true, rows: ROWS } : { ok: true, items: [ITEM] }))
+  const opened: string[] = []
+  on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })
+  await $.command.run({ command: 'desk', args: '' })
+  expect(opened).toEqual(['desk-wall', 'desk-queue', 'desk-ticket', 'desk-decide', 'desk-decide!'])
+  const off = await mountPane($, 'desk-decide', false)
+  expect(await off.find({ type: 'Text', text: /keys off: press ctrl\+x then tab/ })).toBeDefined()
+  await off.unmount()
+  const ui = await mountPane($, 'desk-decide')
+  expect(await ui.find({ type: 'Text', text: /keys off/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /s: send/ })).toBeDefined()
+  await ui.press({ key: 'go-queue' })
+  expect(opened[opened.length - 1]).toBe('desk-queue!')
+  await ui.unmount()
+})
+
+test('a Queue row opens the ticket; the Ticket pane shows the thread, agents and findings as sections that fold; the filter narrows rows', async ($, on) => {
+  fake(on, r => (cmdOf(r) === 'trace' ? TRACE_T : cmdOf(r) === 'queue' ? { ok: true, rows: ROWS } : { ok: true, items: [] }))
+  const opened: string[] = []
+  on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })
+  await $.command.run({ command: 'desk', args: 'queue' })
+  const q = await mountPane($, 'desk-queue')
+  expect(await q.find({ key: 'ticket:123457' })).toBeDefined()
+  expect(await q.find({ key: 'ticket:123456' })).toBeDefined()
+  await q.input({ key: 'filter', text: 'scan' })
+  expect(await q.find({ key: 'ticket:123456' })).toBeDefined()
+  expect(await q.find({ key: 'ticket:123457' })).toBeUndefined()
+  await q.press({ key: 'clear' })
+  expect(await q.find({ key: 'ticket:123457' })).toBeDefined()
+  await q.press({ key: 'ticket:123457' })
+  expect(opened[opened.length - 1]).toBe('desk-ticket!')
+  await q.unmount()
+  const t = await mountPane($, 'desk-ticket')
+  expect((await t.find({ type: 'Text', text: /#123457/ }))).toBeDefined()
+  expect(await t.find({ type: 'Text', text: /customer .*Why is the connector unhealthy\?/ })).toBeDefined()
+  expect(await t.find({ type: 'Text', text: /\(inv1\) The broker is disabled <r1>/ })).toBeDefined()
+  expect(await t.find({ type: 'Text', text: /"broker disabled"/ })).toBeDefined()
+  await t.press({ key: 'sec:thread' })
+  expect(await t.find({ type: 'Text', text: /Why is the connector/ })).toBeUndefined()
+  expect(await t.find({ key: 'sec:thread', text: /\+ THREAD \(2\)/ })).toBeDefined()
+  await t.press({ key: 'sec:thread' })
+  expect(await t.find({ type: 'Text', text: /Why is the connector/ })).toBeDefined()
+  await t.input({ key: 'filter', text: 'broker' })
+  expect(await t.find({ type: 'Text', text: /Why is the connector/ })).toBeUndefined()
+  expect(await t.find({ type: 'Text', text: /The broker is disabled/ })).toBeDefined()
+  await t.unmount()
+})
+
+test('the Wall lists every agent as a row; Enter tails one, b comes back', async ($, on) => {
+  const clock = mock.clock(on)
+  fake(on, r => (cmdOf(r) === 'trace' ? { ok: true, run: { ticket: '123457', phase: 'new', agents: [] }, findings: [], receipts: [], drafts: [], events: [] } : cmdOf(r) === 'queue' ? { ok: true, rows: [NEXT] } : { ok: true, items: [] }))
+  const spawns: any[] = []
+  on('agent.spawn', async (_$: any, e: any) => { spawns.push(e); return { agentId: `w${spawns.length}`, model: e.model ?? 'sonnet' } })
+  await $.command.run({ command: 'desk', args: 'pull 123457' })
+  await clock.advance(2_100)
+  expect(spawns.length).toBe(3)
+  const w = await mountPane($, 'desk-wall')
+  expect(await w.find({ type: 'Text', text: /#123457/ })).toBeDefined()
+  const rows = await w.findAll({ type: 'Button', text: /\* investigator inv/ })
+  expect(rows.map((r: any) => r.text.slice(0, 19))).toEqual(['* investigator inv1', '* investigator inv2', '* investigator inv3'])
+  expect(rows[0].key).toMatch(/^agent:/)
+  await w.press({ key: rows[1].key! })
+  expect(await w.find({ key: 'back' })).toBeDefined()
+  expect(await w.find({ type: 'Text', text: /investigator inv2 {2}running/ })).toBeDefined()
+  expect(await w.find({ type: 'Text', text: /Nothing said yet/ })).toBeDefined()
+  expect(await w.find({ key: rows[0].key! })).toBeUndefined()
+  await w.press({ key: 'back' })
+  expect(await w.find({ key: rows[0].key! })).toBeDefined()
+  await w.unmount()
 })

@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -109,7 +109,7 @@
     "maxRounds": {
       "type": "number",
       "title": "Review rounds",
-      "default": 1,
+      "default": 2,
       "description": "How many times the drafter revises after reviewer objections before the draft goes to the operator (0 to 3)."
     }
   },

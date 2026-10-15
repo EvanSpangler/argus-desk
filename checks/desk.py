@@ -114,16 +114,70 @@ class Desk:
             out["thread"] = {"status": "no-thread"}
             out["warnings"].append("no-thread-captured")
             inbound = ""
-        # 3. claims: two-leg receipts. Shadow in v0: Argus has no receipt minting yet, so this is a count, not a hold.
+        # 3. claims: two-leg receipts, LIVE since v0.3 (the shadow count let drafts with uncovered and echo
+        # sentences through as "clear"; the operator judged that far below the fleet's bar). Every checkable
+        # sentence needs a receipt that says what it says; a problem on any sentence is a HOLD with its code.
         c = CR.check(draft, ticket, self.receipts_path, datetime.fromtimestamp(now, timezone.utc), inbound=inbound)
         claims = [r for r in c["claims"] if "snippet" not in r["classes"]]
         out["claims"] = {"checkable": len(claims), "credited": c["credited"],
                          "uncovered": sum(1 for r in claims if "uncovered" in r["problems"]),
-                         "echo": sum(1 for r in claims if r.get("echo")), "hits": c["hits"], "shadow": True}
-        if c["hits"]:
-            out["warnings"].append("claims:" + ",".join(c["hits"]))
+                         "echo": sum(1 for r in claims if r.get("echo")), "hits": c["hits"], "shadow": False}
+        out["hits"] += [h for h in c["hits"] if h not in out["hits"]]
+        # 4. voice: the operator's own lint rules (<root>/voice-rules.json, exported from the fleet's voice-lint;
+        # a built-in floor when the file is absent). block is a HOLD voice:<id>, warn is a warning.
+        voice = self._voice(draft)
+        out["voice"] = voice
+        out["hits"] += ["voice:" + v["id"] for v in voice if v["severity"] == "block"]
+        out["warnings"] += ["voice:" + v["id"] for v in voice if v["severity"] == "warn"]
         out["verdict"] = "hold" if out["hits"] else "clear"
         return out
+
+    # The floor that applies without the operator's exported rules: what the fleet blocks on every channel.
+    BUILTIN_VOICE = [
+        {"id": "em-dash", "pattern": "\u2014", "severity": "block"},
+        {"id": "en-dash", "pattern": "\u2013", "severity": "block"},
+        {"id": "absolutely-right", "pattern": "you(?:'re| are) absolutely right", "severity": "block"},
+        {"id": "hope-finds-you-well", "pattern": "hope this (?:email|message|note) finds you well", "severity": "block"},
+        {"id": "template-placeholder", "pattern": "\\[(?:name|customer|date|link|insert[^\\]]*)\\]|<(?:name|customer|link)>", "severity": "block"},
+        {"id": "ai-self-reference", "pattern": "\\b(?:as an ai|language model|i am an ai)\\b", "severity": "block"},
+        {"id": "model-vendor-name", "pattern": "\\b(?:claude|anthropic|openai|chatgpt|gpt-?\\d|gemini|argus)\\b", "severity": "block"},
+        {"id": "typed-sign-off", "pattern": "(?:^|\\n)\\s*(?:best regards|kind regards|regards|thanks|thank you|cheers|best)[,!.]?\\s*\\n\\s*\\S+\\s*$", "severity": "block"},
+        {"id": "unconfirmed-wording", "pattern": "\\b(?:i suspect|unconfirmed|i believe this is|my guess)\\b", "severity": "warn"},
+        {"id": "let-me-know-if", "pattern": "let me know if", "severity": "warn"},
+        {"id": "dont-hesitate", "pattern": "don'?t hesitate", "severity": "warn"},
+        {"id": "feel-free", "pattern": "feel free to", "severity": "warn"},
+        {"id": "hope-this-helps", "pattern": "hope this helps", "severity": "warn"},
+    ]
+
+    def _voice_rules(self):
+        path = os.path.join(self.root, "voice-rules.json")
+        rules = None
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    rules = json.load(fh).get("rules")
+            except (OSError, ValueError):
+                rules = None
+        out = []
+        for r in rules or self.BUILTIN_VOICE:
+            ch = r.get("channels") or ["all"]
+            if not ({"all", "customer", "ticket"} & set(ch)):
+                continue
+            try:
+                out.append((r["id"], r.get("severity", "warn"), re.compile(r["pattern"], re.IGNORECASE | re.MULTILINE)))
+            except (re.error, KeyError):
+                continue
+        return out
+
+    def _voice(self, draft):
+        hits = []
+        for rid, sev, rx in self._voice_rules():
+            if sev not in ("block", "warn"):
+                continue
+            m = rx.search(draft)
+            if m:
+                hits.append({"id": rid, "severity": sev, "at": draft[max(0, m.start() - 20):m.end() + 20].replace("\n", " ")})
+        return hits
 
     # ---- commands
     def file(self, ticket, draft, source="argus", supersedes=None, by="argus"):

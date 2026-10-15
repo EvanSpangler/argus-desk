@@ -129,7 +129,9 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
       if (b.agent?.id) { const prev = store.agents.find(a => a.id === b.agent.id) ?? {}; store.agents = [...store.agents.filter(a => a.id !== b.agent.id), { ...prev, ...b.agent }] }
       return { ok: true }
     }
-    if (c === 'trace') return { ok: true, run: { ticket: '123457', phase: store.phase, agents: store.agents, rounds: store.rounds }, findings: [], receipts: [], drafts: [] }
+    if (c === 'trace') return { ok: true, run: { ticket: '123457', phase: store.phase, agents: store.agents, rounds: store.rounds }, findings: [], receipts: [], drafts: [],
+      // inv1 and inv3 minted receipts; inv2 minted none, so the floor sends it back in once (as inv2b)
+      events: [{ agent: 'inv1', kind: 'receipt', text: 'a' }, { agent: 'inv1', kind: 'receipt', text: 'b' }, { agent: 'inv3', kind: 'receipt', text: 'c' }, { agent: 'inv3', kind: 'receipt', text: 'd' }, { agent: 'inv2b', kind: 'receipt', text: 'e' }, { agent: 'inv2b', kind: 'receipt', text: 'f' }] }
     return { ok: true, items: [] }
   })
   const spawns: any[] = []
@@ -155,22 +157,32 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
   await finish('inv1', 'cause: label'); await finish('inv2', 'evidence thin')
   expect(spawns.length).toBe(3, 'nothing moves until every investigator is done')
   await finish('inv3', 'history clean')
-  expect(spawns[3].description).toBe('adversary #123457 adv')
+  // the evidence floor: inv2 recorded no receipts, so it goes back in once before the adversary
+  expect(spawns[3].description).toBe('investigator #123457 inv2b')
+  expect(spawns[3].prompt).toMatch(/recorded 0 receipts/)
+  expect(spawns[3].prompt).toMatch(/evidence thin/)
+  await finish('inv2b', 'evidence: two receipts now')
+  expect(spawns[4].description).toBe('adversary #123457 adv')
   await finish('adv', 'counter: GitHub-only step')
-  expect(spawns[4].description).toBe('drafter #123457 draft')
-  expect(spawns[4].prompt).toMatch(/file_draft/)
-  expect(spawns[4].prompt).toMatch(/counter: GitHub-only step/)
+  expect(spawns[5].description).toBe('drafter #123457 draft')
+  expect(spawns[5].prompt).toMatch(/file_draft/)
+  expect(spawns[5].prompt).toMatch(/counter: GitHub-only step/)
   await finish('draft', 'md5 abc filed')
-  expect(spawns[5].description).toBe('reviewer #123457 rev')
-  await finish('rev', 'Objection: the wizexclude step does not apply to ADO')
-  expect(spawns[6].description).toBe('drafter #123457 draft2')
-  expect(spawns[6].prompt).toMatch(/Revise/)
+  // two independent reviewers per round, different checklists
+  expect(spawns.slice(6, 8).map(s => s.description)).toEqual(['reviewer #123457 rev', 'reviewer #123457 revB'])
+  expect(spawns[6].prompt).toMatch(/Checklist A/)
+  expect(spawns[7].prompt).toMatch(/Checklist B/)
+  await finish('rev', 'NO OBJECTIONS')
+  expect(spawns.length).toBe(8, 'the round waits for both reviewers')
+  await finish('revB', 'Objection: the wizexclude step does not apply to ADO')
+  expect(spawns[8].description).toBe('drafter #123457 draft2')
+  expect(spawns[8].prompt).toMatch(/Revise/)
   await finish('draft2', 'md5 def filed')
-  expect(spawns[7].description).toBe('reviewer #123457 rev2')
-  await finish('rev2', 'NO OBJECTIONS')
-  expect(spawns.length).toBe(8)
+  expect(spawns.slice(9, 11).map(s => s.description)).toEqual(['reviewer #123457 rev2', 'reviewer #123457 rev2B'])
+  await finish('rev2', 'NO OBJECTIONS'); await finish('rev2B', 'NO OBJECTIONS')
+  expect(spawns.length).toBe(11)
   expect(store.phase).toBe('done')
-  expect(store.agents.find(a => a.label === 'rev').summary).toMatch(/Objection/)
+  expect(store.agents.find(a => a.label === 'revB').summary).toMatch(/Objection/)
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(0)
 })
 

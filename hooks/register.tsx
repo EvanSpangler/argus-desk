@@ -49,7 +49,7 @@ const opts = (o: Record<string, unknown>): Opts => ({
   adversaryModel: String(o.adversaryModel ?? 'opus'),
   drafterModel: String(o.drafterModel ?? 'opus'),
   reviewerModel: String(o.reviewerModel ?? 'sonnet'),
-  maxRounds: Math.max(0, Math.min(3, Number(o.maxRounds ?? 1) || 0)),
+  maxRounds: Math.max(0, Math.min(3, Number(o.maxRounds ?? 2) || 0)),
 })
 
 // invoke_proxy as Argus shows it (2026-10-15): required proxy (an enum of 49 services) and endpoint (a name such
@@ -197,6 +197,10 @@ const prompts: Record<Role, (o: Opts, ticket: string, angle: string, context: st
   investigator: (o, ticket, angle, context) =>
     `You investigate Zendesk ticket #${ticket} for the support engineer who will answer it. Your angle: ${angle}\n` +
     `${readingRules(o, ticket)}\n${context}\n` +
+    `The bar (the operator's own): a cause needs two legs, the mechanism from the official documentation (the governing prose sentence, never a YAML or code example) ` +
+    `and the customer's own data showing it applies to them. Open and read every attachment and log the customer gave before you say anything is missing or ask for it. ` +
+    `Read the whole thread with every comment, not the first page. Record at least ${RECEIPT_FLOOR} receipts; a docs receipt for every product behaviour you assert, a material receipt for every fact about their setup. ` +
+    `Fewer than ${RECEIPT_FLOOR} receipts means you have not investigated and the desk sends you back in. ` +
     `Finish with one ${FINDING} of kind summary (cause, confidence low/medium/high, what the customer must be asked, what you could not verify), ` +
     `and answer in under 200 words with the same.`,
   adversary: (o, ticket, _angle, context) =>
@@ -208,18 +212,39 @@ const prompts: Record<Role, (o: Opts, ticket: string, angle: string, context: st
     `You draft the public reply on Zendesk ticket #${ticket}. The findings, counters and receipts are below; read the thread yourself as well.\n` +
     (angle ? `${angle}\n` : '') +
     `${readingRules(o, ticket)}\n${context}\n` +
-    `Rules for the reply: answer what the customer needs, in plain words, under 220 words. No dashes of any kind. Never promise a time. ` +
-    `Do not repeat what we already told them. Every factual sentence must carry a receipt; a claim with no receipt is removed or turned into a question for the customer. ` +
+    `Rules for the reply, the operator's own: answer the customer's need in the first paragraph, in plain words; prefer a documentation link to a list of steps, and give numbered steps only when they asked for steps or the link alone will not do. ` +
+    `No dashes of any kind. Never promise a time. No closing offer, no sign-off, no greeting line beyond the first (Zendesk appends the signature). ` +
+    `Do not restate the customer's words back to them; a sentence that echoes them is not an answer and is counted against the draft. Do not repeat what we already told them. ` +
+    `There is no "unconfirmed", "I suspect" or "I believe" wording that makes an unverified sentence acceptable: a claim is verified with a receipt or it is cut; if you cannot verify the answer, ask for exactly what would settle it and assert nothing. ` +
+    `Every factual sentence must carry a receipt that says what the sentence says. When the reply escalates to engineering, say "I've passed along your request to the WizOS engineering team." and only when there is a documented mismatch between the docs and what the product did. ` +
     `File it with ${TOOL}: ticket, draft (the exact text), and citations as a list of {sentence, receipt} covering every factual sentence. ` +
     `If the ticket needs no reply from us right now, call ${SKIP} with the reason instead. Do not post anything. Answer with the md5 ${TOOL} returned and one line on what the reply does.`,
   reviewer: (o, ticket, angle, context) =>
     `You review the filed reply on Zendesk ticket #${ticket} before the operator sees it. You may only object; you do not score and you do not praise.\n` +
     (angle ? `${angle}\n` : '') +
     `${readingRules(o, ticket)}\n${context}\n` +
-    `Object when: a customer question is left unanswered; a sentence contradicts something we said earlier on the thread; a step does not apply to their platform or setup; ` +
-    `a factual sentence has no receipt or its receipt does not say that; the reply repeats what they already tried; the reply hedges on something the evidence settles. ` +
-    `Record each objection with ${FINDING} kind objection, quoting the sentence. If there is nothing to object to, record one objection with the text "NO OBJECTIONS" and why you looked and found none. Answer with the list.`,
+    `You are a checker, not a writer: do not suggest wording, do not grade style. Every quote you give must be copied exactly from the thread or the draft; a quote that is not there is discarded and counted against you. ` +
+    `Record each objection with ${FINDING} kind objection, quoting the draft sentence and the customer's or our earlier words it fails against. ` +
+    `If there is nothing to object to after working the whole checklist, record one objection with the text "NO OBJECTIONS" and, for each checklist item, what you checked and found. Answer with the list.`,
 }
+
+/** Receipts an investigator must mint before its pass counts; below it the desk sends it back in once. */
+const RECEIPT_FLOOR = 2
+
+/** Two reviewers per round, independent, different checklists; both must find nothing for the round to clear. */
+const REVIEW_ANGLES = [
+  `Checklist A, the thread. 1. QUESTIONS: list every question or request in the customer's latest messages, including ones without a question mark; for each decide exactly one: ` +
+  `answered (a draft sentence directly answers it with real information; quote it), asked_back (the draft asks a genuine question of ours needed to answer it), ` +
+  `unknown_stated (the draft says plainly we do not have the answer yet AND what we are doing about it: a reproduction, an escalation, a follow-up), or not_answered (talking around it, ` +
+  `answering a different or only part of the question, or restating their question back to them). Every not_answered is an objection. ` +
+  `2. CONSTRAINTS: anything they said they want, need, cannot or will not do; does the draft recommend, assume or require the opposite? Their guess about the cause is not a constraint. ` +
+  `3. OUR EARLIER REPLIES: does the draft silently reverse a factual or instructional statement we made earlier on the thread? An explained change is not silent. ` +
+  `4. RE-ASKS: does the draft ask for something the customer already gave, the same item, not a more precise check of it? 5. USES WHAT THEY SAID: does the draft ignore a fact, file or log they already gave?`,
+  `Checklist B, the evidence and the need. 1. RECEIPTS: for each factual sentence in the draft, does its receipt actually say that, from the official docs for product behaviour and from the customer's own material for their setup? ` +
+  `A sentence with no receipt, a receipt that says something weaker, or an inference from a receipt is an objection. 2. PLATFORM: does every step and control apply to this customer's platform, product version and setup as the thread shows it? ` +
+  `3. THE NEED: does the first paragraph answer what the customer actually needs, or does it restate, hedge, hold ("still checking" with no action) or defer? ` +
+  `4. ESCALATION: if the draft says engineering is looking, is there a documented mismatch between the docs and the product on record, or is it a promise? 5. COMMITMENTS: any time, date or outcome the draft promises.`,
+]
 
 const ANGLES = [
   'documentation first: find the official page that answers this and what it says applies to this customer\'s platform; note every step that is platform-specific.',
@@ -283,6 +308,18 @@ async function advance($: any, o: Opts, ticket: string): Promise<void> {
       await go('investigate', 'investigate')
       await Promise.all(ANGLES.map((angle, i) => spawnRole($, o, ticket, 'investigator', `inv${i + 1}`, angle, o.investigatorModel)))
     } else if (phase === 'investigate' && !live('investigator') && of('investigator').length) {
+      // the evidence floor: an investigator that completed with fewer receipts than the floor goes back in once,
+      // told what it recorded, before the adversary sees anything
+      const receipts = (label: string) => (t.events ?? []).filter(e => e.kind === 'receipt' && e.agent === label).length
+      const retry = of('investigator').filter(a => a.status === 'completed' && !a.label.endsWith('b') && receipts(a.label) < RECEIPT_FLOOR && !of('investigator').some(b => b.label === `${a.label}b`))
+      if (retry.length) {
+        await desk($, o, ['event'], JSON.stringify({ ticket, agent: 'desk', kind: 'phase', text: `below the evidence floor: ${retry.map(a => `${a.label} (${receipts(a.label)} receipts)`).join(', ')}; sending back in` }))
+        await Promise.all(retry.map(a => {
+          const i = Number((a.label.match(/\d+/) ?? ['1'])[0]) - 1
+          return spawnRole($, o, ticket, 'investigator', `${a.label}b`, `${ANGLES[i] ?? ANGLES[0]} Your first pass recorded ${receipts(a.label)} receipts and concluded: ${a.summary ?? '(nothing)'}. That is below the floor of ${RECEIPT_FLOOR}: read the comments endpoint for the whole thread, open the attachments, fetch the docs page that governs the behaviour, and receipt what you read before you conclude.`, o.investigatorModel)
+        }))
+        return
+      }
       await go('adversary', 'adversary')
       await spawnRole($, o, ticket, 'adversary', 'adv', '', o.adversaryModel)
     } else if (phase === 'adversary' && !live('adversary') && of('adversary').length) {
@@ -290,10 +327,14 @@ async function advance($: any, o: Opts, ticket: string): Promise<void> {
       await spawnRole($, o, ticket, 'drafter', 'draft', '', o.drafterModel)
     } else if (phase === 'draft' && !live('drafter') && of('drafter').length) {
       await go('review', `review ${rounds + 1}`)
-      await spawnRole($, o, ticket, 'reviewer', rounds ? `rev${rounds + 1}` : 'rev', '', o.reviewerModel)
+      const base = rounds ? `rev${rounds + 1}` : 'rev'
+      await Promise.all(REVIEW_ANGLES.map((angle, i) => spawnRole($, o, ticket, 'reviewer', i ? `${base}${String.fromCharCode(65 + i)}` : base, angle, o.reviewerModel)))
     } else if (phase === 'review' && !live('reviewer') && of('reviewer').length) {
-      const last = of('reviewer').slice(-1)[0]
-      const objected = !/NO OBJECTIONS/i.test(last.summary ?? '')
+      // this round's reviewers are the last REVIEW_ANGLES.length spawned; the round clears only when every one found nothing
+      const round = of('reviewer').slice(-REVIEW_ANGLES.length)
+      const objectors = round.filter(a => !/NO OBJECTIONS/i.test(a.summary ?? ''))
+      const last = { summary: objectors.length ? objectors.map(a => `${a.label}: ${a.summary ?? ''}`).join(' | ') : round[0]?.summary }
+      const objected = objectors.length > 0
       if (objected && rounds <= o.maxRounds) {
         await go('draft', `redraft ${rounds + 1} after objections`)
         const prev = t.drafts?.slice(-1)[0]?.md5

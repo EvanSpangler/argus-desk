@@ -77,13 +77,25 @@ class DeskTests(unittest.TestCase):
         r = d.file("6", DRAFT)
         self.assertIn("unrecorded-comment", r["hits"])
 
-    def test_claims_are_shadow_counts(self):
+    def test_claims_hold_live(self):
         d, c = mk()
-        r = d.file("7", DRAFT)
-        self.assertEqual(r["claims"]["credited"], 0)
+        r = d.file("9", DRAFT)
         self.assertGreater(r["claims"]["checkable"], 0)
-        self.assertEqual(r["verdict"], "clear", "claims do not hold in v0")
+        self.assertEqual(r["claims"]["credited"], 0)
+        self.assertEqual(r["verdict"], "hold", r)
+        self.assertIn("uncovered", r["hits"], r)
+        self.assertFalse(r["claims"]["shadow"])
 
+    def test_voice_rules_hold_on_block_and_warn_on_warn(self):
+        d, c = mk()
+        r = d.file("9", "Hi,\n\nYou're absolutely right. Let me know if that helps.")
+        self.assertIn("voice:absolutely-right", r["hits"], r)
+        self.assertIn("voice:let-me-know-if", r["warnings"], r)
+        with open(os.path.join(d.root, "voice-rules.json"), "w") as fh:
+            json.dump({"rules": [{"id": "custom-word", "pattern": "synergy", "severity": "block", "channels": ["all"]}]}, fh)
+        r = d.file("9", "Hi,\n\nWe will look for synergy here.")
+        self.assertIn("voice:custom-word", r["hits"], r)
+        self.assertNotIn("voice:absolutely-right", r["hits"])
     def test_cli_roundtrip(self):
         import subprocess
         root = tempfile.mkdtemp(); here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "desk.py")

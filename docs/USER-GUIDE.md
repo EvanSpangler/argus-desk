@@ -39,12 +39,19 @@ Leave the session open. The desk does the pulling and the investigating; you do 
    open tickets. The Queue tab says when it last polled and whether the search failed.
 2. **It runs one ticket at a time.** SLA soonest first, then a ticket the customer has answered since we
    replied, then the oldest. A run is a tree of subagents inside this session:
-   - three **investigators** in parallel (docs first; evidence first; thread first), each on a cheap model;
+   - three **investigators** in parallel (docs first; evidence first; thread first), each on a cheap model.
+     Each must record at least 2 receipts; one that finishes under that floor is sent back in once, told
+     what it recorded, before anything else moves;
    - an **adversary** that assumes the leading explanation is wrong and records counters;
-   - a **drafter** that writes the reply and files it with a citation for every factual sentence;
-   - a **reviewer** that may only object (unanswered question, contradiction with the thread, a step that
-     does not fit their platform, a sentence without a receipt). One objection sends it back to the
-     drafter once (option `maxRounds`); then it comes to you.
+   - a **drafter** that writes the reply and files it with a citation for every factual sentence, under
+     the standing rules (answer the need first, docs link over steps, no unconfirmed wording, no echo of
+     the customer's words, no sign-off, the escalation phrase);
+   - two independent **reviewers** per round, each with its own checklist: A reads the thread (every
+     question answered, asked back or stated unknown with an action; constraints; silent reversals;
+     re-asks; ignored material), B reads the evidence (each receipt says what the sentence says; platform
+     fit; the first paragraph answers the need; escalation backed by a documented mismatch; commitments).
+     They may only object. One objection from either sends the draft back to the drafter, up to
+     `maxRounds` times (default 2); then it comes to you with the objections on the trace.
    Nothing else is pulled while a run is on or a draft is waiting for you. `/desk run 123456` starts a run
    by hand and holds the prompt until it ends; `/desk pull 123456` starts one in the background.
 3. **Receipts.** An agent can only cite what it actually read: a sentence verbatim from an official
@@ -119,15 +126,27 @@ A HOLD is advice for you, not a block. You can still press Send.
 | `repeat-ask` | It asks the customer again while our last question is still unanswered. |
 | `announced-reversal` | It contradicts something we already told the customer. |
 | `question-not-answered` | The customer asked something the draft does not address. |
+| `uncovered` | A factual sentence has no receipt. |
+| `receipt-unrelated`, `weak-evidence`, `partial-binding` | The receipt bound to a sentence does not say what the sentence says. |
+| `cause-needs-product-leg-and-material` | A cause is asserted with only one of its two legs (docs mechanism, customer's own data). |
+| `unconfirmed-wording` | "I suspect", "unconfirmed" or similar: a claim is verified or cut. |
+| `echo-only` | Every credited sentence only restates the customer. |
+| `voice:<rule>` | A block rule from your voice rules matched (dashes, "absolutely right", placeholders, a typed sign-off, a vendor or model name). Warn rules appear as warnings. |
 
-Warnings (shown, never a HOLD): `no-thread-captured`, and `claims:...` when claims have no receipts.
+Warnings (shown, never a HOLD): `no-thread-captured`, and `voice:<rule>` for warn-level voice rules.
+
+Your voice rules live in `<stateDir>/voice-rules.json` (`{"rules": [{"id", "pattern", "severity":
+"block|warn", "channels": ["all"]}]}`), exported from your own lint; without the file a built-in floor
+applies (the dashes, "you're absolutely right", template placeholders, AI self-reference, vendor names, a
+typed sign-off).
 
 ## 6. Numbers
 
 `/desk stats` prints: drafts filed, how many were sent as filed, sent after a Modify, or denied, the wait
 from filing to your decision, posts through the gate and how many status transitions the next poll
 confirmed, the queue counts, and how often a HOLD was overruled. This is what the pilot is judged on.
-A run costs one context per agent (six to eight per ticket); the investigators and reviewer default to
+A run costs one context per agent (eight to fourteen per ticket: three investigators plus any sent back
+in, the adversary, the drafter, two reviewers per round); the investigators and reviewers default to
 Sonnet, the adversary and drafter to Opus.
 
 ## 7. Turn it off

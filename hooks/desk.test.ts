@@ -11,7 +11,7 @@ const fake = (on: any, answer: (r: Run) => Record<string, unknown>) => {
   })
   return calls
 }
-const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark'].includes(String(a)))
+const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'trace', 'wait'].includes(String(a)))
 
 const DRAFT = 'Hi Sam,\n\nThe broker is disabled, so the connector reports unhealthy. Re-enable it under Settings > Connectors.\n\nThanks!\n'
 const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state: 'pending', filed: 1, age_s: 120, chars: 120, text: DRAFT,
@@ -113,11 +113,28 @@ test('Send grants through desk.py and wakes the model to post; Deny records the 
 const SEARCH = { results: [{ id: 123456, status: 'open', subject: 'Scan stuck', updated_at: '2026-10-15T01:00:00Z' }, { id: 123457, status: 'new', subject: 'SLA one', sla_next_breach_at: '2026-10-15T09:00:00Z', updated_at: '2026-10-15T02:00:00Z' }], count: 2 }
 const NEXT = { ticket: '123457', state: 'new', sla: '2026-10-15T09:00:00Z', age_s: 5 }
 
-test('/desk poll searches the open set through the outward tool, folds it into the queue and pulls the next ticket', async ($, on) => {
+const RUN = (phase: string, agents: any[] = [], rounds = 0) => ({ ok: true, run: { ticket: '123457', phase, agents, rounds }, findings: [], receipts: [], drafts: [] })
+
+test('/desk poll searches the open set, folds it into the queue and starts a run; each turn.complete advances the run', async ($, on) => {
   const clock = mock.clock(on)
-  const calls = fake(on, r => (cmdOf(r) === 'sync' ? { ok: true, rows: [NEXT], next: NEXT, busy: [] } : cmdOf(r) === 'queue' ? { ok: true, rows: [NEXT] } : { ok: true, items: [] }))
-  const prompts: string[] = []
-  on('prompt.submit', async (_$: any, e: any) => { prompts.push(e.text); return { text: e.text } })
+  // desk.py as a fake with a tiny run store, so advance() reads back what it wrote
+  const store: { phase: string; agents: any[]; rounds: number } = { phase: 'new', agents: [], rounds: 0 }
+  const calls = fake(on, r => {
+    const c = cmdOf(r)
+    if (c === 'sync') return { ok: true, rows: [NEXT], next: NEXT, busy: [] }
+    if (c === 'queue') return { ok: true, rows: [NEXT] }
+    if (c === 'run') {
+      const b = JSON.parse(r.stdin!)
+      if (b.phase) { store.phase = b.phase; if (b.phase === 'review') store.rounds++ }
+      if (b.agent?.id) { const prev = store.agents.find(a => a.id === b.agent.id) ?? {}; store.agents = [...store.agents.filter(a => a.id !== b.agent.id), { ...prev, ...b.agent }] }
+      return { ok: true }
+    }
+    if (c === 'trace') return { ok: true, run: { ticket: '123457', phase: store.phase, agents: store.agents, rounds: store.rounds }, findings: [], receipts: [], drafts: [] }
+    return { ok: true, items: [] }
+  })
+  const spawns: any[] = []
+  on('agent.spawn', async (_$: any, e: any) => { spawns.push(e); return { agentId: `a${spawns.length}`, model: e.model ?? 'sonnet' } })
+  on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
   const searches: any[] = []
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async (_$: any, e: any) => { searches.push(e); return { result: SEARCH, text: JSON.stringify(SEARCH) } })
   await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 1 } } as any)
@@ -126,20 +143,48 @@ test('/desk poll searches the open set through the outward tool, folds it into t
   expect(String(r.text)).toMatch(/Polled 2/)
   expect(String(r.text)).toMatch(/pulled #123457/)
   expect(searches[0].endpoint).toBe('zendesk_search_tickets')
-  expect(searches[0].proxy).toBe('zendesk-full')
   const sync = calls.find(c => cmdOf(c) === 'sync')
-  expect(sync).toBeDefined()
-  const tickets = JSON.parse(sync!.stdin!).tickets
-  expect(tickets.map((t: any) => t.id)).toEqual(['123456', '123457'])
-  expect(tickets[1].sla).toBe('2026-10-15T09:00:00Z')
-  const mark = calls.find(c => cmdOf(c) === 'mark')
-  expect(mark).toBeDefined()
-  expect(mark!.argv).toContain('123457')
-  expect(mark!.argv).toContain('drafting')
+  expect(JSON.parse(sync!.stdin!).tickets.map((t: any) => t.id)).toEqual(['123456', '123457'])
+  // the run starts from a timer dispatch: three investigators first
   await clock.advance(5)
-  expect(prompts.join(' || ')).toMatch(/#123457[^|]*file_draft[^|]*skip_ticket/)
-  // the gate saw the search as a read: no consume
+  expect(calls.find(c => cmdOf(c) === 'mark')!.argv).toContain('drafting')
+  expect(spawns.map(s => s.description)).toEqual(['investigator #123457 inv1', 'investigator #123457 inv2', 'investigator #123457 inv3'])
+  expect(spawns[0].prompt).toMatch(/investigate Zendesk ticket #123457/)
+  expect(spawns[0].prompt).toMatch(/desk_receipt/)
+  const finish = async (label: string, answer: string) => { const id = store.agents.find(a => a.label === label && a.status === 'running')!.id; await $.turn.complete({ agentId: id, answer, reason: 'answer', durationMs: 1, isAborted: false, turnId: `t-${id}` } as any); await clock.advance(5) }
+  await finish('inv1', 'cause: label'); await finish('inv2', 'evidence thin')
+  expect(spawns.length).toBe(3, 'nothing moves until every investigator is done')
+  await finish('inv3', 'history clean')
+  expect(spawns[3].description).toBe('adversary #123457 adv')
+  await finish('adv', 'counter: GitHub-only step')
+  expect(spawns[4].description).toBe('drafter #123457 draft')
+  expect(spawns[4].prompt).toMatch(/file_draft/)
+  expect(spawns[4].prompt).toMatch(/counter: GitHub-only step/)
+  await finish('draft', 'md5 abc filed')
+  expect(spawns[5].description).toBe('reviewer #123457 rev')
+  await finish('rev', 'Objection: the wizexclude step does not apply to ADO')
+  expect(spawns[6].description).toBe('drafter #123457 draft2')
+  expect(spawns[6].prompt).toMatch(/Revise/)
+  await finish('draft2', 'md5 def filed')
+  expect(spawns[7].description).toBe('reviewer #123457 rev2')
+  await finish('rev2', 'NO OBJECTIONS')
+  expect(spawns.length).toBe(8)
+  expect(store.phase).toBe('done')
+  expect(store.agents.find(a => a.label === 'rev').summary).toMatch(/Objection/)
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(0)
+})
+
+test('/desk run N holds the turn through desk.py wait and prints the trace', async ($, on) => {
+  const clock = mock.clock(on)
+  const calls = fake(on, r => (cmdOf(r) === 'wait' ? { ok: true, phase: 'done' } : cmdOf(r) === 'trace' ? RUN('done', [{ id: 'a1', role: 'drafter', label: 'draft', model: 'opus', status: 'completed', summary: 'filed', started: 1 }]) : { ok: true, items: [], rows: [] }))
+  on('agent.spawn', async () => ({ agentId: 'a1', model: 'sonnet' }))
+  const r = await $.command.run({ command: 'desk', args: 'run 123457' })
+  expect(String(r.text)).toMatch(/Run on #123457/)
+  expect(String(r.text)).toMatch(/drafter draft \(opus\) completed: filed/)
+  const w = calls.find(c => cmdOf(c) === 'wait')
+  expect(w).toBeDefined()
+  expect(w!.argv).toContain('123457')
+  await clock.advance(5)
 })
 
 test('the poller runs on the clock while polling is on, and not while paused', async ($, on) => {

@@ -138,5 +138,37 @@ class DeskTests(unittest.TestCase):
         self.assertEqual([r["state"] for r in d.queue_view()["rows"] if r["ticket"] == "11"], ["stale"])
 
 
+    def test_run_findings_receipts_cite_trace(self):
+        d, c = mk()
+        D.CR.POLICY["docs_hosts"].append("docs.example.org")
+        d.run_update("12", phase="investigate", agent={"id": "a1", "role": "investigator", "model": "sonnet", "status": "running"})
+        d.run_update("12", agent={"id": "a1", "status": "completed", "summary": "broker disabled"})
+        self.assertEqual(d._run("12")["agents"][0]["status"], "completed")
+        self.assertIn("ended", d._run("12")["agents"][0])
+        d.event("12", "a1", "tool", "docs_search broker")
+        self.assertTrue(d.finding("12", "a1", "investigator", "hypothesis", "The broker is disabled")["ok"])
+        self.assertFalse(d.finding("12", "a1", "investigator", "guess", "x")["ok"])
+        # a docs receipt needs the page captured and the quote verbatim in its prose
+        self.assertEqual(d.receipt("12", "docs", "Re-enable the broker under Settings", "https://docs.example.org/broker")["why"], "page-not-captured")
+        d.page("https://docs.example.org/broker", "Broker health\n\nRe-enable the broker under Settings > Connectors to restore scanning.\n")
+        r = d.receipt("12", "docs", "Re-enable the broker under Settings", "https://docs.example.org/broker", by="a1")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(d.receipt("12", "docs", "words not on the page at all", "https://docs.example.org/broker")["why"], "quote-not-in-prose")
+        # material must be in the captured thread
+        d.capture("12", [{"id": "1", "who": "customer", "at": T0, "text": "Our connector reports unhealthy since Monday."}], 1)
+        self.assertTrue(d.receipt("12", "material", "connector reports unhealthy", by="a1")["ok"])
+        self.assertFalse(d.receipt("12", "material", "something they never said")["ok"])
+        # cite binds a receipt to a draft sentence and the claim check credits it
+        md5 = d.file("12", DRAFT)["md5"]
+        sent = "Re-enable the broker in the portal under Settings > Connectors, then run a fresh scan."
+        out = d.cite("12", [{"receipt": r["id"], "sentence": sent}, {"receipt": "rcpt:nope", "sentence": sent}])
+        self.assertEqual((out["bound"], out["unknown"]), (1, ["rcpt:nope"]))
+        t = d.trace("12")
+        self.assertEqual(t["run"]["phase"], "investigate")
+        self.assertEqual(len(t["findings"]), 1)
+        self.assertEqual(len(t["receipts"]), 2, "one row per receipt id after rebinding")
+        self.assertEqual(len(t["drafts"]), 1)
+        self.assertTrue(any(cl.get("receipts") for cl in t["claims"]), t["claims"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -75,6 +75,42 @@
       "title": "Outward tool name",
       "default": "invoke_proxy",
       "description": "Substring of the tool name that can post to the ticketing console."
+    },
+    "docsHosts": {
+      "type": "string",
+      "title": "Documentation hosts",
+      "default": "docs.wiz.io",
+      "description": "Comma-separated hosts whose pages may back a docs receipt."
+    },
+    "investigatorModel": {
+      "type": "string",
+      "title": "Investigator model",
+      "default": "sonnet",
+      "description": "Model alias or id for this role's subagents."
+    },
+    "adversaryModel": {
+      "type": "string",
+      "title": "Adversary model",
+      "default": "opus",
+      "description": "Model alias or id for this role's subagents."
+    },
+    "drafterModel": {
+      "type": "string",
+      "title": "Drafter model",
+      "default": "opus",
+      "description": "Model alias or id for this role's subagents."
+    },
+    "reviewerModel": {
+      "type": "string",
+      "title": "Reviewer model",
+      "default": "sonnet",
+      "description": "Model alias or id for this role's subagents."
+    },
+    "maxRounds": {
+      "type": "number",
+      "title": "Review rounds",
+      "default": 1,
+      "description": "How many times the drafter revises after reviewer objections before the draft goes to the operator (0 to 3)."
     }
   },
   "author": {

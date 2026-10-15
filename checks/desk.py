@@ -17,12 +17,18 @@ Subcommands (JSON in on stdin where noted, JSON out on stdout, exit 0 unless the
   stats                                                        -> the economics table
 """
 import argparse, hashlib, json, os, re, sys, time
+from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import confirm_ledger as CL
 import claim_receipts as CR
 import thread_review as TR
 
 OPERATOR = "operator"
+# Official documentation hosts a docs receipt may cite, on top of claim_receipts' own list: ARGUS_DESK_DOCS_HOSTS=a,b
+for _h in os.environ.get("ARGUS_DESK_DOCS_HOSTS", "").split(","):
+    if _h.strip() and _h.strip() not in CR.POLICY["docs_hosts"]:
+        CR.POLICY["docs_hosts"].append(_h.strip())
+FINDING_KINDS = ("hypothesis", "evidence", "counter", "objection", "answer", "summary")
 STATUSES = ("pending", "solved", "open", "on-hold")   # the Zendesk status a Send may set
 STALE_S = 30 * 60                                     # a pull with nothing filed after this is offered again
 DASH = re.compile("[–—]")
@@ -47,6 +53,7 @@ class Desk:
         self.decisions_path = os.path.join(root, "decisions.jsonl")
         self.transitions_path = os.path.join(root, "transitions.jsonl")
         self.queue_path = os.path.join(root, "queue.json")
+        os.makedirs(os.path.join(root, "runs"), exist_ok=True)
 
     # ---- storage helpers
     def _rows(self, path):
@@ -108,7 +115,7 @@ class Desk:
             out["warnings"].append("no-thread-captured")
             inbound = ""
         # 3. claims: two-leg receipts. Shadow in v0: Argus has no receipt minting yet, so this is a count, not a hold.
-        c = CR.check(draft, ticket, self.receipts_path, now, inbound=inbound)
+        c = CR.check(draft, ticket, self.receipts_path, datetime.fromtimestamp(now, timezone.utc), inbound=inbound)
         claims = [r for r in c["claims"] if "snippet" not in r["classes"]]
         out["claims"] = {"checkable": len(claims), "credited": c["credited"],
                          "uncovered": sum(1 for r in claims if "uncovered" in r["problems"]),
@@ -232,6 +239,148 @@ class Desk:
                         return {"ok": True, "md5": md5, "ticket": ticket, "status": need}
         pend = [i["md5"] for i in self.list()["items"]]
         return {"ok": False, "tried": tried, "undecided": pend}
+
+    # ---- runs: one investigation per ticket, a tree of agents, everything they read and said
+    def _run_dir(self, ticket):
+        d = os.path.join(self.root, "runs", str(ticket))
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _run(self, ticket):
+        p = os.path.join(self._run_dir(ticket), "run.json")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as fh:
+                return json.load(fh)
+        return {"ticket": str(ticket), "started": self.clock(), "agents": [], "phase": "new", "rounds": 0}
+
+    def _save_run(self, run):
+        p = os.path.join(self._run_dir(run["ticket"]), "run.json")
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(run, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+        return run
+
+    def run_update(self, ticket, phase=None, agent=None):
+        """Record a phase change or an agent's state. `agent` = {id, role, model, status, summary?, params?}."""
+        run = self._run(ticket)
+        if phase:
+            run["phase"], run["phase_at"] = phase, self.clock()
+            if phase == "review":
+                run["rounds"] = run.get("rounds", 0) + 1
+        if agent and agent.get("id"):
+            rows = [a for a in run["agents"] if a["id"] != agent["id"]]
+            prev = next((a for a in run["agents"] if a["id"] == agent["id"]), {})
+            row = dict(prev, **{k: v for k, v in agent.items() if v is not None})
+            row.setdefault("started", self.clock())
+            if row.get("status") in ("completed", "failed", "killed"):
+                row.setdefault("ended", self.clock())
+            rows.append(row)
+            run["agents"] = sorted(rows, key=lambda a: a["started"])
+        self._save_run(run)
+        return {"ok": True, "run": run}
+
+    def event(self, ticket, agent, kind, text):
+        """One line of the tail: what an agent is doing right now. Kept short, kept all."""
+        row = {"agent": agent, "kind": kind, "text": str(text or "")[:400]}
+        self._append(os.path.join(self._run_dir(ticket), "events.jsonl"), row)
+        return {"ok": True}
+
+    def finding(self, ticket, agent, role, kind, text, receipts=None, about=None):
+        """What an agent concluded: a hypothesis, evidence for or against, an objection, an answer to one."""
+        if kind not in FINDING_KINDS:
+            return {"ok": False, "reason": "kind must be one of %s" % ", ".join(FINDING_KINDS)}
+        if not str(text or "").strip():
+            return {"ok": False, "reason": "text is empty"}
+        row = {"id": "f-" + md5_of("%s%s%s%s" % (ticket, agent, kind, text))[:8], "agent": agent, "role": role, "kind": kind,
+               "text": str(text)[:2000], "receipts": [r for r in (receipts or []) if isinstance(r, str)], "about": about}
+        self._append(os.path.join(self._run_dir(ticket), "findings.jsonl"), row)
+        return {"ok": True, "id": row["id"]}
+
+    def receipt(self, ticket, kind, quote, source=None, by=None):
+        """Mint a receipt from something an agent actually read: `docs` (a page on an official host, the quote
+        verbatim), `material` (the customer's own words, found in the captured thread), `test` (recorded output
+        of a real run). The rules are claim_receipts'; a quote nobody read is refused."""
+        now = datetime.fromtimestamp(self.clock(), timezone.utc)
+        quote = str(quote or "").strip()
+        if kind == "docs":
+            page = self._page(source)
+            if page is None:
+                return {"ok": False, "why": "page-not-captured", "source": source}
+            r = CR.mint_docs(self.receipts_path, ticket, source or "", quote, page, [quote], now)
+        elif kind == "material":
+            rec = self._thread(ticket)
+            inbound = "\n".join(m["text"] for m in (rec or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer")
+            r = CR.mint_material(self.receipts_path, ticket, quote, inbound, [quote], now)
+        elif kind == "test":
+            r = CR.mint_test(self.receipts_path, ticket, source or "", quote, "captured_text", [quote], now)
+        else:
+            return {"ok": False, "why": "kind must be docs, material or test"}
+        if r.get("ok"):
+            self._append(os.path.join(self._run_dir(ticket), "events.jsonl"), {"agent": by or "", "kind": "receipt", "text": "%s %s: %s" % (r["id"], kind, quote[:120])})
+        return r
+
+    def page(self, source, body):
+        """Keep the body of a page an agent fetched, so a docs receipt can be checked against it."""
+        if not source or not str(body or "").strip():
+            return {"ok": False, "reason": "source and body"}
+        os.makedirs(os.path.join(self.root, "pages"), exist_ok=True)
+        with open(os.path.join(self.root, "pages", md5_of(source) + ".json"), "w", encoding="utf-8") as fh:
+            json.dump({"source": source, "body": str(body), "ts": self.clock()}, fh, ensure_ascii=False)
+        return {"ok": True, "source": source, "chars": len(str(body))}
+
+    def _page(self, source):
+        p = os.path.join(self.root, "pages", md5_of(source or "") + ".json")
+        if not os.path.exists(p):
+            return None
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh).get("body")
+
+    def cite(self, ticket, citations):
+        """Bind receipts to the sentences of a draft: each citation is {receipt, sentence}. A receipt the ticket
+        does not hold is refused; the binding is a fresh row so the claim check finds the sentence in `bound`."""
+        mine = {r["id"]: r for r in CR.load(self.receipts_path) if r["ticket"] == str(ticket)}
+        out = {"ok": True, "bound": 0, "unknown": []}
+        for c in citations or []:
+            rid, sent = str(c.get("receipt") or ""), str(c.get("sentence") or "").strip()
+            if rid not in mine or not sent:
+                out["unknown"].append(rid)
+                continue
+            row = dict(mine[rid], bound=sorted(set(mine[rid].get("bound", [])) | {sent}), minted=datetime.fromtimestamp(self.clock(), timezone.utc).isoformat())
+            CR._append(self.receipts_path, row)
+            out["bound"] += 1
+        return out
+
+    def wait(self, ticket, timeout_s=1800, poll_s=2.0):
+        """Block until the run's phase is terminal; the mod calls this from a command so the turn holds."""
+        deadline = time.time() + float(timeout_s)
+        while True:
+            run = self._run(ticket)
+            if run.get("phase") in ("done", "failed"):
+                return {"ok": True, "phase": run["phase"], "ticket": str(ticket)}
+            if time.time() >= deadline:
+                return {"ok": False, "phase": run.get("phase"), "reason": "timeout", "ticket": str(ticket)}
+            time.sleep(poll_s)
+
+    def trace(self, ticket):
+        """Everything the operator reads before Send: the run, its agents, the findings, the receipts, the tail."""
+        d = self._run_dir(ticket)
+        run = self._run(ticket)
+        findings = self._rows(os.path.join(d, "findings.jsonl"))
+        events = self._rows(os.path.join(d, "events.jsonl"))
+        receipts = [r for r in CR.load(self.receipts_path) if r["ticket"] == str(ticket)]
+        seen, uniq = set(), []
+        for r in reversed(receipts):
+            if r["id"] not in seen:
+                seen.add(r["id"]); uniq.append(r)
+        drafts = [i for i in self.list()["items"] if i["ticket"] == str(ticket)]
+        claims = []
+        if drafts:
+            c = CR.check(drafts[-1]["text"], ticket, self.receipts_path, datetime.fromtimestamp(self.clock(), timezone.utc),
+                         inbound="\n".join(m["text"] for m in (self._thread(ticket) or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer"))
+            claims = c["claims"]
+        return {"ok": True, "run": run, "findings": findings, "receipts": list(reversed(uniq)), "events": events[-200:],
+                "claims": claims, "drafts": drafts}
 
     # ---- the queue: open tickets the poller saw, and where each one stands
     def _queue(self):
@@ -393,7 +542,7 @@ def stats_text(s):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
@@ -402,12 +551,13 @@ def main(argv=None):
     ap.add_argument("--status", default="pending", help="status the granted post must set")
     ap.add_argument("--ticket")
     ap.add_argument("--state")
+    ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--text", action="store_true", help="stats as text")
     a = ap.parse_args(argv)
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
     d = Desk(os.path.expanduser(a.root))
     body = {}
-    if a.cmd in ("file", "consume", "capture", "sync"):
+    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite"):
         raw = sys.stdin.read()
         body = json.loads(raw) if raw.strip() else {}
     if a.cmd == "file":
@@ -428,6 +578,22 @@ def main(argv=None):
         out = d.queue_view()
     elif a.cmd == "mark":
         out = {"ok": True, "row": d._mark(a.ticket, a.state, note=a.note or None)} if a.ticket and a.state else {"ok": False, "reason": "--ticket and --state"}
+    elif a.cmd == "run":
+        out = d.run_update(body.get("ticket"), body.get("phase"), body.get("agent"))
+    elif a.cmd == "event":
+        out = d.event(body.get("ticket"), body.get("agent"), body.get("kind"), body.get("text"))
+    elif a.cmd == "finding":
+        out = d.finding(body.get("ticket"), body.get("agent"), body.get("role"), body.get("kind"), body.get("text"), body.get("receipts"), body.get("about"))
+    elif a.cmd == "receipt":
+        out = d.receipt(body.get("ticket"), body.get("kind"), body.get("quote"), body.get("source"), body.get("by"))
+    elif a.cmd == "page":
+        out = d.page(body.get("source"), body.get("body"))
+    elif a.cmd == "cite":
+        out = d.cite(body.get("ticket"), body.get("citations"))
+    elif a.cmd == "trace":
+        out = d.trace(a.ticket)
+    elif a.cmd == "wait":
+        out = d.wait(a.ticket, a.timeout)
     elif a.cmd == "capture":
         out = d.capture(body.get("ticket"), body.get("messages"), body.get("count"))
     else:

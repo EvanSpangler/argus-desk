@@ -195,7 +195,10 @@ Sonnet, the adversary and drafter to Opus.
   answered: ...`. That is the proxy's own reply to the search the desk sent, with the proxy and endpoint
   names it used. An HTTP 404 or "unknown endpoint" means the names differ from the defaults: set the
   plugin's options (`/plugin` > argus-desk > configure) to the names your Argus lists for `invoke_proxy`.
-  A `{"results":[]}` means the search query matched nothing: check `searchQuery` against your assignee.
+  A `{"results":[]}` means the search query matched nothing. The default `assignee:me` is the proxy's own
+  account, not you, when the proxy runs under a service account (it did on the Argus workstation): set the
+  query to your Zendesk user id with `/desk query type:ticket status<pending assignee:<id>` (kept for every
+  session on the workstation; `/desk query` shows it, `/desk query default` restores the option).
 - **The pane ignores the keys.** It does not hold the focus: press ctrl+x then tab, or use the tab commands.
 - **A run finished in seconds with no receipts.** Look at the Ticket tab or `/desk trace N`: an agent that
   says it had no proxy tool or that a desk tool was not answered means the desk was started outside a

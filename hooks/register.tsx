@@ -419,11 +419,23 @@ async function findOutward($: any, o: Opts): Promise<string | undefined> {
 }
 
 /** One poll: the open set, folded into the queue; then the next ticket, if nothing is being worked. */
-async function tick($: any, o: Opts, force = false): Promise<{ polled: number; pulled?: string; error?: string; head?: string }> {
+/** The search query: the operator's `/desk query ...` override (kept in the plugin store across sessions), else the option. */
+async function queryOf($: any, o: Opts): Promise<string> {
+  try {
+    const q = await $.store.get('searchQuery')
+    if (typeof q === 'string' && q.trim()) return q.trim()
+  } catch {
+    /* a host without a store */
+  }
+  return o.searchQuery
+}
+
+async function tick($: any, o: Opts, force = false): Promise<{ polled: number; pulled?: string; error?: string; head?: string; query?: string }> {
   let text = ''
+  const query = await queryOf($, o)
   try {
     const name = await findOutward($, o)
-    const r = await $.tool.call({ tool: name, proxy: o.readProxy, endpoint: o.searchEndpoint, arguments: { query: o.searchQuery, sort_by: 'created_at', sort_order: 'asc' } })
+    const r = await $.tool.call({ tool: name, proxy: o.readProxy, endpoint: o.searchEndpoint, arguments: { query, sort_by: 'created_at', sort_order: 'asc' } })
     if (r.deny || r.isError) return { polled: 0, error: `${o.readProxy} ${o.searchEndpoint}: ${String(r.deny ?? r.text ?? 'search failed').replace(/\s+/g, ' ').slice(0, 200)}` }
     text = String(r.text ?? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result ?? '')))
   } catch (err) {
@@ -435,7 +447,7 @@ async function tick($: any, o: Opts, force = false): Promise<{ polled: number; p
   // own words, with the proxy and endpoint tried, are the result the operator needs.
   if (!tickets.length && /"error"|HTTP \d{3}|not found|unauthori|forbidden|denied|invalid|unknown endpoint/i.test(text)) {
     await update($, view, x => ({ ...x, lastPoll: Date.now(), pollError: head, lastResult: head }))
-    return { polled: 0, error: `${o.readProxy} ${o.searchEndpoint} answered: ${head}` }
+    return { polled: 0, error: `${o.readProxy} ${o.searchEndpoint} for query "${query}" answered: ${head}`, query }
   }
   const v = await desk($, o, ['sync'], JSON.stringify({ tickets }))
   await update($, view, x => ({ ...x, lastPoll: Date.now(), pollError: undefined, lastResult: head }))
@@ -445,7 +457,7 @@ async function tick($: any, o: Opts, force = false): Promise<{ polled: number; p
     return { polled: tickets.length, pulled: next.ticket }
   }
   await refresh($, o)
-  return { polled: tickets.length, head }
+  return { polled: tickets.length, head, query }
 }
 
 /** The tickets in a search result, whatever the proxy wraps them in. */
@@ -661,7 +673,18 @@ export const register: Register = (on, options) => {
     }
     if (args === 'poll') {
       const t = await tick($, o, true)
-      return { text: t.error ? `Poll failed: ${t.error}` : `Polled ${t.polled} open ticket(s)${t.pulled ? `, pulled #${t.pulled}` : ''}.${t.polled ? '' : ` The proxy answered: ${t.head ?? '(empty)'}`}` }
+      return { text: t.error ? `Poll failed: ${t.error}` : `Polled ${t.polled} open ticket(s)${t.pulled ? `, pulled #${t.pulled}` : ''}.${t.polled ? '' : ` For query "${t.query ?? ''}" the proxy answered: ${t.head ?? '(empty)'}. If the proxy runs under a service account, assignee:me is not you: /desk query type:ticket status<pending assignee:<your Zendesk user id>`}` }
+    }
+    if (/^query(\s|$)/.test(args)) {
+      const q = args.replace(/^query\s*/, '').trim()
+      if (!q) return { text: `Search query: ${await queryOf($, o)}\n/desk query <zendesk search> sets it for every session on this workstation; /desk query default restores the option.` }
+      try {
+        if (q === 'default') await $.store.delete('searchQuery')
+        else await $.store.set('searchQuery', q)
+      } catch (err) {
+        return { text: `Not kept: ${String(err).slice(0, 200)}` }
+      }
+      return { text: `Search query now: ${await queryOf($, o)}. /desk poll to try it.` }
     }
     if (args === 'pause' || args === 'resume') {
       await update($, view, v => ({ ...v, poll: args === 'pause' ? 'paused' : 'on' }))

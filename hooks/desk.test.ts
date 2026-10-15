@@ -267,11 +267,11 @@ test('a poll that gets an error body back names the proxy, the endpoint and the 
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: {}, text: answer }))
   await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
   const r = await $.command.run({ command: 'desk', args: 'poll' })
-  expect(String(r.text)).toMatch(/Poll failed: zendesk-full zendesk_search_tickets answered: .*HTTP 404/)
+  expect(String(r.text)).toMatch(/Poll failed: zendesk-full zendesk_search_tickets for query ".*" answered: .*HTTP 404/)
   // an empty but healthy answer is reported with the proxy's words too, so a wrong query shows
   answer = '{"results":[],"count":0}'
   const r2 = await $.command.run({ command: 'desk', args: 'poll' })
-  expect(String(r2.text)).toMatch(/Polled 0 open ticket\(s\)\. The proxy answered: \{"results":\[\],"count":0\}/)
+  expect(String(r2.text)).toMatch(/Polled 0 open ticket\(s\)\. For query ".*" the proxy answered: \{"results":\[\],"count":0\}/)
 })
 
 test('a documentation search is on the record and captured as a page per official URL, so a docs receipt can quote it', async ($, on) => {
@@ -308,4 +308,23 @@ test('the poller\'s pull spawns under the driver a /desk command created; /desk 
   const r = await $.command.run({ command: 'desk', args: 'queue' })
   expect(String(r.text)).toMatch(/Desk: queue tab/)
   expect(String(r.text)).toMatch(/ctrl\+x then tab/)
+})
+
+test('/desk query sets the search the poller sends, kept in the plugin store, and the poll line names it', async ($, on) => {
+  const kv: Record<string, unknown> = {}
+  on('store.get', async (_$: any, e: any) => ({ value: kv[e.key] }))
+  on('store.set', async (_$: any, e: any) => { kv[e.key] = e.value; return { value: undefined } })
+  on('store.delete', async (_$: any, e: any) => { delete kv[e.key]; return { value: undefined } })
+  fake(on, () => ({ ok: true, items: [], rows: [], next: null, busy: [] }))
+  const searches: any[] = []
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async (_$: any, e: any) => { searches.push(e); return { result: {}, text: '{"results":[],"count":0}' } })
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
+  const set = await $.command.run({ command: 'desk', args: 'query type:ticket status<pending assignee:25873958858140' })
+  expect(String(set.text)).toMatch(/Search query now: type:ticket status<pending assignee:25873958858140/)
+  searches.length = 0
+  const r = await $.command.run({ command: 'desk', args: 'poll' })
+  expect(searches[0].arguments.query).toBe('type:ticket status<pending assignee:25873958858140')
+  expect(String(r.text)).toMatch(/For query "type:ticket status<pending assignee:25873958858140" the proxy answered/)
+  const show = await $.command.run({ command: 'desk', args: 'query' })
+  expect(String(show.text)).toMatch(/Search query: type:ticket status<pending assignee:25873958858140/)
 })

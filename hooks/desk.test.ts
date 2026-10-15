@@ -19,7 +19,7 @@ const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state:
 
 test('an outward post with no grant is refused and told what to do', async ($, on) => {
   const calls = fake(on, r => (cmdOf(r) === 'consume' ? { ok: false, tried: [], undecided: [ITEM.md5] } : { ok: true, items: [ITEM] }))
-  const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, comment: { body: DRAFT, public: true } } } as any)
+  const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-write', endpoint: 'ticketing_update_ticket', arguments: { ticket_id: 123456, comment: { body: DRAFT, public: true } } } as any)
   expect(r.deny).toMatch(/argus-desk/)
   expect(r.deny).toMatch(/file_draft/)
   expect(r.deny).toMatch(/a1b2c3d4/)
@@ -32,9 +32,9 @@ test('an outward post passes once the exact text has an open grant, and the gran
   let consumed = 0
   const calls = fake(on, r => (cmdOf(r) === 'consume' ? { ok: ++consumed === 1, md5: ITEM.md5 } : { ok: true, items: [] }))
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: { posted: true } }))
-  const first = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: JSON.stringify({ ticket_id: 123456, comment: { body: DRAFT } }) } as any)
+  const first = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-write', endpoint: 'ticketing_update_ticket', arguments: JSON.stringify({ ticket_id: 123456, comment: { body: DRAFT } }) } as any)
   expect(first.deny).toBeUndefined()
-  const second = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: JSON.stringify({ ticket_id: 123456, comment: { body: DRAFT } }) } as any)
+  const second = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-write', endpoint: 'ticketing_update_ticket', arguments: JSON.stringify({ ticket_id: 123456, comment: { body: DRAFT } }) } as any)
   expect(second.deny).toMatch(/argus-desk/)
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(2)
 })
@@ -43,7 +43,7 @@ test('a read of the ticket comments passes untouched and is captured as the live
   const calls = fake(on, () => ({ ok: true, items: [] }))
   const payload = { comments: [{ id: 1, author_role: 'end-user', created_at: '2026-10-14T10:00:00Z', plain_body: 'Scans fail. Which version?' }, { id: 2, author_role: 'agent', created_at: '2026-10-14T11:00:00Z', plain_body: 'Please send the logs.' }], count: 2 }
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: payload, text: JSON.stringify(payload) }))
-  const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket_comments', arguments: { ticket_id: 123456 } } as any)
+  const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_get_ticket_comments', arguments: { ticket_id: 123456 } } as any)
   expect(r.deny).toBeUndefined()
   const cap = calls.find(c => cmdOf(c) === 'capture')
   expect(cap).toBeDefined()
@@ -56,11 +56,11 @@ test('a read of the ticket comments passes untouched and is captured as the live
 test('fails closed: a write on any proxy, or a call with no endpoint, needs a grant; a named read does not', async ($, on) => {
   const calls = fake(on, r => (cmdOf(r) === 'consume' ? { ok: false, tried: [], undecided: [] } : { ok: true, items: [] }))
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: { ok: true }, text: '{}' }))
-  const slack = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'slack-response', endpoint: 'slack_post_message', arguments: { channel: 'C1', text: DRAFT } } as any)
-  expect(slack.deny).toMatch(/argus-desk/)
-  const bare = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full' } as any)
+  const chat = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'chat-out', endpoint: 'chat_post_message', arguments: { channel: 'C1', text: DRAFT } } as any)
+  expect(chat.deny).toMatch(/argus-desk/)
+  const bare = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full' } as any)
   expect(bare.deny).toMatch(/argus-desk/)
-  const read = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_search_tickets', arguments: '{"query":"status:open"}' } as any)
+  const read = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_search_tickets', arguments: '{"query":"status:open"}' } as any)
   expect(read.deny).toBeUndefined()
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(2)
 })

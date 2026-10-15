@@ -23,7 +23,7 @@ const opts = (o: Record<string, unknown>): Opts => ({
 })
 
 // invoke_proxy as Argus shows it (2026-10-15): required proxy (an enum of 49 services) and endpoint (a name such
-// as zendesk_get_ticket, not a path), optional arguments (object or JSON string). There is no method field, so
+// as ticketing_get_ticket, not a path), optional arguments (object or JSON string). There is no method field, so
 // the endpoint name is the only sign of a read. Anything not plainly a read is outward, on every proxy.
 const READ_ENDPOINT = /^[a-z0-9]+_(get|list|search|read|show|fetch|count|describe)(_|$)/i
 

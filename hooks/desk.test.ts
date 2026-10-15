@@ -328,3 +328,32 @@ test('/desk query sets the search the poller sends, kept in the plugin store, an
   const show = await $.command.run({ command: 'desk', args: 'query' })
   expect(String(show.text)).toMatch(/Search query: type:ticket status<pending assignee:25873958858140/)
 })
+
+test('agentTools=mcp attaches the desk tools to each agent type as an MCP server, so a call inside an agent is served by a process, not a hook', { options: { agentTools: 'mcp', stateDir: '/tmp/desk-mcp-test' } }, async ($, on) => {
+  const specs: any[] = []
+  on('agent.register', async (_$: any, e: any) => { specs.push(e); return { value: { agent: `argus-desk:${e.name}` } } })
+  fake(on, () => ({ ok: true, items: [], rows: [], next: null, busy: [] }))
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: {}, text: '{}' }))
+  // the agent types are registered in session.start and again by the first /desk command (the test host fires no session.start)
+  await $.command.run({ command: 'desk', args: 'pause' })
+  expect(specs.map(s => s.name)).toEqual(['investigator', 'adversary', 'drafter', 'reviewer'])
+  const inv = specs[0]
+  expect(inv.mcpServers).toHaveLength(1)
+  const srv = inv.mcpServers[0].desk
+  expect(srv.args.join(' ')).toMatch(/checks\/desk_mcp\.py --root \/tmp\/desk-mcp-test --role investigator --docs-hosts docs\.wiz\.io/)
+  expect(String(inv.prompt)).toMatch(/served by the MCP server named desk/)
+  expect(inv.tools).toBeUndefined()
+})
+
+test('by default the agent types carry no MCP server and the hook-served desk tools answer', async ($, on) => {
+  const specs: any[] = []
+  on('agent.register', async (_$: any, e: any) => { specs.push(e); return { value: { agent: `argus-desk:${e.name}` } } })
+  fake(on, () => ({ ok: true, id: 'f-1', items: [], rows: [], next: null, busy: [] }))
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: {}, text: '{}' }))
+  // the agent types are registered in session.start and again by the first /desk command (the test host fires no session.start)
+  await $.command.run({ command: 'desk', args: 'pause' })
+  expect(specs.length).toBe(4)
+  expect(specs.every(s => s.mcpServers === undefined)).toBe(true)
+  const r = await $.tool.call({ tool: 'mcp__argus-desk__desk_finding', ticket: '123456', kind: 'hypothesis', text: 'x' } as any)
+  expect(String(r.result)).toMatch(/Recorded f-1 \(hypothesis\)/)
+})

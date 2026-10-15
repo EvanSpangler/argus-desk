@@ -28,7 +28,7 @@ type Opts = {
   stateDir: string; python: string; outwardTool: string
   pollMinutes: number; readProxy: string; writeProxy: string; searchEndpoint: string; searchQuery: string
   commentsEndpoint: string; ticketEndpoint: string; updateEndpoint: string; sendStatus: string
-  docsTool: string; docsSource: string; docsHosts: string; investigatorModel: string; adversaryModel: string; drafterModel: string; reviewerModel: string; maxRounds: number
+  docsTool: string; docsSource: string; docsHosts: string; agentTools: 'hooks' | 'mcp'; investigatorModel: string; adversaryModel: string; drafterModel: string; reviewerModel: string; maxRounds: number
 }
 
 const opts = (o: Record<string, unknown>): Opts => ({
@@ -47,6 +47,7 @@ const opts = (o: Record<string, unknown>): Opts => ({
   docsTool: String(o.docsTool ?? 'enterprise_search'),
   docsSource: String(o.docsSource ?? 'wiz_docs_public'),
   docsHosts: String(o.docsHosts ?? 'docs.wiz.io'),
+  agentTools: String(o.agentTools ?? 'hooks') === 'mcp' ? 'mcp' : 'hooks',
   investigatorModel: String(o.investigatorModel ?? 'sonnet'),
   adversaryModel: String(o.adversaryModel ?? 'opus'),
   drafterModel: String(o.drafterModel ?? 'opus'),
@@ -533,6 +534,27 @@ function startPolling($: any, o: Opts): void {
   })
 }
 
+/** The agent types, registered once per module load: from session.start, and again from the first /desk command in case
+ * that registration was lost (a reload, a host that fires no session.start). Idempotent by a module flag. */
+let agentsRegistered = false
+async function ensureAgents($: any, o: Opts): Promise<void> {
+  if (agentsRegistered) return
+  agentsRegistered = true
+  for (const role of ROLES) {
+    try {
+      // 2026-10-15, workstation: a desk tool called from inside a spawned agent reached no hook there. With agentTools=mcp
+      // the agent type carries the desk's tools as an MCP server (checks/desk_mcp.py, the same desk.py record), served by
+      // a process, not a hook. The main session keeps the hook-served tools either way.
+      const mcpServers = o.agentTools === 'mcp'
+        ? [{ desk: { command: o.python, args: ['-I', `${$.plugin.root}/checks/desk_mcp.py`, '--root', o.stateDir, '--role', role, '--docs-hosts', o.docsHosts] } }]
+        : undefined
+      await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.${mcpServers ? ` The desk tools (${TOOL}, ${SKIP}, ${FINDING}, ${RECEIPT}) are served by the MCP server named desk.` : ''}`, ...(mcpServers ? { mcpServers } : {}), model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
+    } catch {
+      /* a host without agent types: the role prompt rides in the task and the gate still holds */
+    }
+  }
+}
+
 export const register: Register = (on, options) => {
   const o = opts(options as Record<string, unknown>)
 
@@ -575,13 +597,7 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     await findOutward($, o)
-    for (const role of ROLES) {
-      try {
-        await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.`, model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
-      } catch {
-        /* a host without agent types: the role prompt rides in the task and the gate still holds */
-      }
-    }
+    await ensureAgents($, o)
     if (e.isInteractive) {
       await update($, view, v => ({ ...v, poll: o.pollMinutes > 0 ? 'on' : 'off' }))
       await refresh($, o)
@@ -631,6 +647,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'desk' }, async ($, e) => {
     const args = (e.args ?? '').trim()
+    await ensureAgents($, o)
     startDriver($, o, 'command')
     if (/^stats\b/.test(args)) {
       const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'stats', '--text'], { timeoutMs: 60_000 })

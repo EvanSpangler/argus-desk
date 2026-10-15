@@ -21,7 +21,7 @@ You need Claude Code 2.1.296 or later and `python3` on the workstation.
      Never delete an existing folder to make room; rename it. A zip copy is not a git checkout, so the
      gate0 line `git` says `not-a-checkout`; that is expected.
 2. Check it, in a terminal: `bash ~/argus-desk/gate0.sh`. Every line starts with `GATE0`. You want
-   `validate ✔ Validation passed`, `plugin test 15 pass 0 fail` and `python tests OK`.
+   `validate ✔ Validation passed`, `plugin test 18 pass 0 fail` and `python tests OK`.
 3. Turn it on: `bash ~/argus-desk/gate0.sh --install`. This adds one line to the `env` block of
    `~/.claude/settings.json` and changes nothing else.
 4. Restart Claude Code (exit and start it again, or open a new terminal tab).
@@ -203,6 +203,13 @@ Sonnet, the adversary and drafter to Opus.
 - **A run finished in seconds with no receipts.** Look at the Ticket tab or `/desk trace N`: an agent that
   says it had no proxy tool or that a desk tool was not answered means the desk was started outside a
   `/desk` command; type `/desk` and `/desk run N` again.
+- **The agents still report "no tool.call hook answered" for desk_receipt or file_draft.** On that host a
+  hook does not answer inside a spawned agent. Switch the agents to the MCP-served desk tools: in
+  `~/.claude/settings.json` add `"pluginConfigs": {"argus-desk": {"agentTools": "mcp"}}` (the key is
+  `argus-desk@inline` when `claude plugin list` shows the plugin as inline), restart `argus`, and run the
+  ticket again. The tools then come from the plugin's own MCP server (`checks/desk_mcp.py`, one per agent
+  type, the same record on disk); the main session keeps the hook-served ones. `/desk trace N` shows the
+  agent as the author of each finding.
 - **Nothing gets pulled although tickets are open.** The pane shows `poll paused` (`/desk resume`), or a
   ticket is `drafting` or `waiting`: decide it, or `/desk pull N` to force another.
 - **Everything shows `thread: NOT captured`.** The model drafted without reading the comments. Ask it to

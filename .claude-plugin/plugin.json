@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -81,6 +81,12 @@
       "title": "Documentation hosts",
       "default": "docs.wiz.io",
       "description": "Comma-separated hosts whose pages may back a docs receipt."
+    },
+    "agentTools": {
+      "type": "string",
+      "title": "Agent desk tools",
+      "default": "hooks",
+      "description": "How the spawned agents reach file_draft, skip_ticket, desk_finding and desk_receipt: hooks (the mod answers them) or mcp (an MCP server shipped with the plugin, for a host where a hook does not answer inside agents)."
     },
     "investigatorModel": {
       "type": "string",

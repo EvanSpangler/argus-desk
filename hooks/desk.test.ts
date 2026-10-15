@@ -54,6 +54,26 @@ test('a read of the ticket comments passes untouched and is captured as the live
   expect(body.messages[2].who).toBe('staff')
 })
 
+test('receipt fault 2026-10-15: a comments read wrapped in an envelope, or a JSON string, with only html bodies, is still the thread', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [] }))
+  const inner = { data: { count: 2, comments: [
+    { id: 11, public: true, author: { role: 'end-user' }, created_at: '2026-10-15T10:00:00Z', html_body: '<div>All sensors are&nbsp;latest version.<br>Please assist.</div>' },
+    { id: 12, public: true, author: { role: 'agent' }, created_at: '2026-10-15T11:00:00Z', html_body: '<p>Please send the bundle.</p>' },
+  ] } }
+  const payload = { ok: true, result: JSON.stringify(inner) }
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: payload, text: JSON.stringify(payload) }))
+  const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_list_comments', arguments: JSON.stringify({ ticket_id: '123456' }) } as any)
+  expect(r.deny).toBeUndefined()
+  const cap = calls.find(c => cmdOf(c) === 'capture')
+  expect(cap).toBeDefined()
+  const body = JSON.parse(cap!.stdin!)
+  expect(body.ticket).toBe('123456')
+  expect(body.count).toBe(2)
+  expect(body.messages[0].who).toBe('customer')
+  expect(body.messages[0].text).toBe('All sensors are latest version.\nPlease assist.')
+  expect(body.messages[1].who).toBe('us')
+})
+
 test('fails closed: a write on any proxy, or a call with no endpoint, needs a grant; a named read does not', async ($, on) => {
   const calls = fake(on, r => (cmdOf(r) === 'consume' ? { ok: false, tried: [], undecided: [] } : { ok: true, items: [] }))
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: { ok: true }, text: '{}' }))

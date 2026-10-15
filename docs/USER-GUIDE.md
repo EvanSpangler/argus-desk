@@ -293,3 +293,5 @@ Sonnet, the adversary and drafter to Opus.
   customer, `/desk` shows the run and you can Deny the new draft; the `sent` line stays on the record.
 - **Everything shows `thread: NOT captured`.** The model drafted without reading the comments. Ask it to
   read the ticket's comments, then file again.
+
+**A receipt is refused on words the agent did read.** Since 0.6.4 the refusal says what the desk holds. `no-thread-captured`: no comments read of that ticket reached the desk in this run, so the agent must read every comment through the proxy first (the desk records that read as the thread). `quote-not-in-material` now names how many customer messages and characters the thread holds; `quote-not-from-customer` means the words are in one of our own replies. `page-not-captured` lists the documentation URLs captured so far; a page is found under its URL however it is written (with or without https://, trailing slash, or anchor). The refusals are on the ticket record as `receipt-refused` events, visible in `/desk trace N`.

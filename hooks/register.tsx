@@ -124,6 +124,53 @@ const isOutward = (args: Record<string, unknown>): boolean => {
   return /"(?:method|verb|http_method)"\s*:\s*"(post|put|patch|delete)"/.test(flat)
 }
 
+/** The comments array of a read result, wherever the proxy put it: at the top, under data/result/response, or as a JSON
+ *  string inside the JSON. Returns the array and the count beside it when the payload carries one. */
+const commentsIn = (v: unknown, depth = 0): { comments: Array<Record<string, unknown>>; count?: number } | undefined => {
+  if (depth > 5 || v == null) return undefined
+  if (typeof v === 'string') {
+    if (depth === 0 || !/"comments"\s*:\s*\[/.test(v)) return undefined
+    try {
+      return commentsIn(JSON.parse(v), depth + 1)
+    } catch {
+      return undefined
+    }
+  }
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      const f = commentsIn(x, depth + 1)
+      if (f) return f
+    }
+    return undefined
+  }
+  if (typeof v === 'object') {
+    const rec = v as Record<string, unknown>
+    if (Array.isArray(rec.comments)) {
+      const count = typeof rec.count === 'number' ? rec.count : typeof rec.comment_count === 'number' ? rec.comment_count : undefined
+      return { comments: rec.comments.filter(c => c && typeof c === 'object') as Array<Record<string, unknown>>, count }
+    }
+    for (const x of Object.values(rec)) {
+      const f = commentsIn(x, depth + 1)
+      if (f) return f
+    }
+  }
+  return undefined
+}
+
+/** Our side of a comment: the proxy may say it as author_role, via_agent, or an author object with a role. */
+const isOurs = (c: Record<string, unknown>): boolean => {
+  const author = c.author as Record<string, unknown> | undefined
+  const role = String(c.author_role ?? author?.role ?? '').toLowerCase()
+  return c.via_agent === true || role === 'agent' || role === 'admin'
+}
+
+/** The text of a comment: plain first; html only when it is all the proxy filled, with its tags dropped. */
+const commentText = (c: Record<string, unknown>): string => {
+  for (const k of ['plain_body', 'body', 'text', 'content', 'message']) if (typeof c[k] === 'string' && (c[k] as string).trim()) return c[k] as string
+  if (typeof c.html_body === 'string') return c.html_body.replace(/<br\s*\/?>|<\/p>|<\/div>|<\/li>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim()
+  return ''
+}
+
 const ticketOf = (args: Record<string, unknown>): string | undefined => {
   const flat = JSON.stringify(args)
   const m = flat.match(/tickets?\/(\d{4,})/) ?? flat.match(/"ticket(?:_id|Id)?"\s*:\s*"?(\d{4,})/)
@@ -170,6 +217,22 @@ async function refresh($: any, o: Opts, notice?: string): Promise<DeskItem[]> {
     /* no status line on this surface */
   }
   return items
+}
+
+/** What the desk holds, said in the refusal, so a refused verbatim quote reads as what it is (2026-10-15 receipt fault). */
+const refusalDetail = (r: Record<string, unknown>): string => {
+  const why = String(r.why ?? '')
+  if (why === 'page-not-captured') {
+    const cap = Array.isArray(r.captured) ? (r.captured as unknown[]).map(String) : []
+    return `; fetch the page through the proxy first, then quote it with the URL as the result names it (captured so far: ${cap.length ? cap.join(', ') : 'none'})`
+  }
+  if (why === 'no-thread-captured') return `; ${String(r.hint ?? '')}`
+  if (why === 'quote-not-in-material') {
+    const t = (r.thread ?? {}) as Record<string, unknown>
+    return `; the captured thread holds ${String(t.customer_messages ?? '?')} customer message(s), ${String(t.customer_chars ?? '?')} chars; quote the customer's words as the proxy returned them`
+  }
+  if (why === 'quote-not-from-customer') return `; those words are in a ${String(r.found_in ?? '')} message, not the customer's`
+  return ''
 }
 
 async function wallLine($: any, o: Opts, agentId: string, kind: string, text: string): Promise<void> {
@@ -811,7 +874,7 @@ export const register: Register = (on, options) => {
     const r = await desk($, o, ['receipt'], JSON.stringify({ ticket: String(a.ticket ?? ''), kind: String(a.kind ?? ''), quote: String(a.quote ?? ''), source: a.source, by: who?.label }))
     // a refused receipt is on the record too: the agent claimed to have read something the capture does not hold
     if (a.agentId && !r.ok) await wallLine($, o, a.agentId, 'receipt-refused', `${String(a.kind)} ${String(r.why ?? r.reason)}: "${String(a.quote ?? '').slice(0, 120)}"${a.source ? ` (${String(a.source)})` : ''}`)
-    return { result: r.ok ? `Receipt ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}. Only a sentence you actually read, verbatim, can be receipted${r.why === 'page-not-captured' ? '; fetch the page through the proxy first' : ''}.` }
+    return { result: r.ok ? `Receipt ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}. Only a sentence you actually read, verbatim, can be receipted${refusalDetail(r)}.` }
   }).catch(() => ({ deny: 'argus-desk: the receipt was not minted, try again' }))
 
   // 2. the gate: an outward call passes only by spending an open grant on the exact text it carries.
@@ -860,19 +923,25 @@ export const register: Register = (on, options) => {
         // the call on the record, whole: who read what, with what arguments, and a hash of what came back
         const who = agentId ? active.get(agentId) : undefined
         if (ticket || who) await desk($, o, ['call'], JSON.stringify({ ticket: who?.ticket ?? ticket, agent: who?.label ?? 'main', tool, args, result: text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny }))
-        if (ticket && text && /"comments"\s*:\s*\[/.test(text)) {
+        // 2026-10-15 (receipt fault): the comments read is the thread whatever the proxy wraps it in (a data or result envelope, a
+        // JSON string inside JSON), whatever the agent named the ticket argument (the agent's own ticket stands in), and
+        // whichever body field the proxy filled. A read that reached the hook but was not recognised left the desk with no
+        // thread, and every verbatim customer quote was then refused as "quote-not-in-material".
+        const forTicket = ticket ?? who?.ticket
+        if (forTicket && text && /\\?"comments\\?"\s*:\s*\[/.test(text)) {
           try {
-            const parsed = JSON.parse(text) as { comments?: Array<Record<string, unknown>>; count?: number }
-            const comments = parsed.comments ?? []
-            const messages = comments.map((c, i) => ({
-              id: String(c.id ?? i),
-              // Internal notes are staff: bots post several on every new ticket, and counting them as our replies held
-              // every draft on cadence (too-many). Only a public comment from our side is a reply.
-              who: c.public === false ? 'staff' : c.author_role === 'agent' || c.via_agent === true ? 'us' : 'customer',
-              at: typeof c.created_at === 'string' ? Date.parse(c.created_at) / 1000 : undefined,
-              text: String(c.plain_body ?? c.body ?? ''),
-            }))
-            await desk($, o, ['capture'], JSON.stringify({ ticket, messages, count: parsed.count ?? comments.length }))
+            const found = commentsIn(JSON.parse(text))
+            if (found) {
+              const messages = found.comments.map((c, i) => ({
+                id: String(c.id ?? i),
+                // Internal notes are staff: bots post several on every new ticket, and counting them as our replies held
+                // every draft on cadence (too-many). Only a public comment from our side is a reply.
+                who: c.public === false ? 'staff' : isOurs(c) ? 'us' : 'customer',
+                at: typeof c.created_at === 'string' ? Date.parse(c.created_at) / 1000 : undefined,
+                text: commentText(c),
+              }))
+              await desk($, o, ['capture'], JSON.stringify({ ticket: forTicket, messages, count: found.count ?? found.comments.length }))
+            }
           } catch {
             /* not a comments payload after all */
           }

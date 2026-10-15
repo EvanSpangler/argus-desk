@@ -46,6 +46,43 @@ class McpTests(unittest.TestCase):
         self.assertIn("hypothesis", kinds, trace)
         self.assertEqual(trace["findings"][0].get("agent"), "investigator", "the role is the recorded author")
 
+    def test_receipt_fault_a_handler_error_is_the_tools_answer_not_the_servers_end(self):
+        # 2026-10-15: one desk_finding "failed with Connec[tion closed]" and the agent lost every later call
+        real = M.handle
+        def boom(desk, role, name, a):
+            if name == "desk_finding":
+                raise RuntimeError("boom \u2013 dash")
+            return real(desk, role, name, a)
+        M.handle = boom
+        try:
+            res = talk(self.root, "investigator", [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "desk_finding", "arguments": {"ticket": "1", "kind": "summary", "text": "x"}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "desk_receipt", "arguments": {"ticket": "1", "kind": "material", "quote": "caf\u00e9 \u2013 words"}}},
+            ])
+        finally:
+            M.handle = real
+        self.assertEqual(len(res), 2, res)
+        self.assertTrue(res[0]["result"]["isError"]); self.assertIn("RuntimeError", res[0]["result"]["content"][0]["text"])
+        self.assertIn("no-thread-captured", res[1]["result"]["content"][0]["text"])
+        self.assertIn("read every comment", res[1]["result"]["content"][0]["text"])
+
+    def test_receipt_fault_refusals_carry_what_the_desk_holds(self):
+        import desk as D
+        d = D.Desk(self.root)
+        d.capture("7", [{"id": "1", "who": "customer", "at": 1.0, "text": "All sensors are latest version. Please assist."}], 1)
+        D.CR.POLICY["docs_hosts"].append("docs.wiz.io")
+        d.page("https://docs.wiz.io/docs/sensor-versions", "The sensor updates itself when a new version is published.", origin="search")
+        res = talk(self.root, "investigator", [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "desk_receipt", "arguments": {"ticket": "7", "kind": "material", "quote": "All sensors are latest version."}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "desk_receipt", "arguments": {"ticket": "7", "kind": "material", "quote": "not their words"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "desk_receipt", "arguments": {"ticket": "7", "kind": "docs", "quote": "The sensor updates itself when a new version is published", "source": "docs.wiz.io/docs/sensor-versions/"}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "desk_receipt", "arguments": {"ticket": "7", "kind": "docs", "quote": "anything", "source": "https://docs.wiz.io/docs/elsewhere"}}},
+        ])
+        self.assertFalse(res[0]["result"]["isError"], res[0])
+        self.assertIn("1 customer message(s)", res[1]["result"]["content"][0]["text"])
+        self.assertFalse(res[2]["result"]["isError"], res[2])
+        self.assertIn("captured so far: https://docs.wiz.io/docs/sensor-versions", res[3]["result"]["content"][0]["text"])
+
     def test_file_draft_files_and_marks_drafting(self):
         res = talk(self.root, "drafter", [
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "file_draft", "arguments": {"ticket": "123456", "draft": DRAFT, "citations": [{"sentence": "The broker for this connector is disabled, so the connector reports unhealthy.", "receipt": "r-none"}]}}},

@@ -10,6 +10,7 @@ A claim is verified or it is absent: hedged "unconfirmed" wording never clears a
 Stdlib only. Time is injected for tests.
 """
 import hashlib
+import html as _html
 import json
 import os
 import re
@@ -28,6 +29,14 @@ _QUOTES = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013":
 def norm(s):
     s = "".join(_QUOTES.get(c, c) for c in str(s or ""))
     return re.sub(r"\s+", " ", s.lower()).strip()
+
+
+def plain(s):
+    """Text out of a comment body that may be HTML: tags dropped, entities unescaped. A customer's words quoted from
+    the console are plain; the proxy may hand the agent html_body, and the two must compare equal."""
+    t = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</tr>", "\n", str(s or ""), flags=re.I)
+    t = re.sub(r"<[^>]+>", "", t)
+    return _html.unescape(t)
 
 
 def squash(s):
@@ -147,7 +156,7 @@ def prose_of(page):
 def mint_docs(path, ticket, url, quote, page_body, claims, now, extra=None):
     """Refuse unless the quote sits verbatim in the PROSE of a page the harness fetched from an allowed host.
     `extra` is merged into the row: the desk records where the captured body came from (page_origin)."""
-    host = re.sub(r"^https?://", "", url).split("/")[0]
+    host = re.sub(r"^https?://", "", str(url or "").strip(), flags=re.I).split("/")[0].lower()
     if host not in POLICY["docs_hosts"]:
         return {"ok": False, "why": "docs-host-not-official"}
     if re.match(r"\s*(for example|example|sample|e\.g\.)", norm(quote)) or len(quote.split()) < 4:
@@ -177,7 +186,7 @@ def mint_test(path, ticket, did, output, origin, claims, now, snippet=None):
 
 def mint_material(path, ticket, quote, inbound, claims, now):
     """The customer's own words or file, found in the recorded inbound. About THEIR system only."""
-    if norm(quote) not in norm(inbound):
+    if norm(plain(quote)) not in norm(plain(inbound)):
         return {"ok": False, "why": "quote-not-in-material"}
     row = {"id": "rcpt:material-" + hashlib.sha256(quote.encode()).hexdigest()[:8], "kind": "material",
            "ticket": str(ticket), "minted": now.isoformat(), "quote": quote, "bound": list(claims)}

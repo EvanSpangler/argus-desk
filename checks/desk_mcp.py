@@ -19,7 +19,7 @@ import argparse, json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DESK = os.path.join(HERE, "desk.py")
-VERSION = "0.6.2"
+VERSION = "0.6.4"
 
 TOOLS = [
     {"name": "file_draft",
@@ -111,7 +111,18 @@ def handle(desk, role, name, a):
         if r.get("ok"):
             return "Receipt %s." % r.get("id"), False
         why = r.get("why") or r.get("reason")
-        more = "; fetch the page in this run first, then quote it" if why == "page-not-captured" else ""
+        # 2026-10-15 (receipt fault): the refusal says what the desk holds, so a byte-exact quote refused is readable as what it is
+        more = ""
+        if why == "page-not-captured":
+            cap = r.get("captured") or []
+            more = "; fetch the page in this run first, then quote it with the URL as the result names it (captured so far: %s)" % (", ".join(cap) if cap else "none")
+        elif why == "no-thread-captured":
+            more = "; " + s(r.get("hint"))
+        elif why == "quote-not-in-material":
+            t = r.get("thread") or {}
+            more = "; the captured thread holds %s customer message(s), %s chars; quote the customer's words as the proxy returned them" % (t.get("customer_messages"), t.get("customer_chars"))
+        elif why == "quote-not-from-customer":
+            more = "; those words are in a %s message, not the customer's" % r.get("found_in")
         return "Refused: %s. Only a sentence you actually read, verbatim, can be receipted%s." % (why, more), True
     return "unknown tool %s" % name, True
 
@@ -136,13 +147,19 @@ def serve(desk, role, inp=sys.stdin, out=sys.stdout):
         elif method == "tools/list":
             res = {"tools": TOOLS}
         elif method == "tools/call":
-            text, err = handle(desk, role, s(params.get("name")), params.get("arguments") or {})
+            # 2026-10-15 (receipt fault): a handler that raised killed the server, and every later call from that agent answered
+            # "Connection closed". The error is the tool's answer now; the server keeps serving.
+            try:
+                text, err = handle(desk, role, s(params.get("name")), params.get("arguments") or {})
+            except Exception as e:  # noqa: BLE001
+                text, err = "desk tool %s failed: %s: %s" % (s(params.get("name")), type(e).__name__, str(e)[:300]), True
             res = {"content": [{"type": "text", "text": text}], "isError": err}
         else:
             out.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found: %s" % method}}) + "\n")
             out.flush()
             continue
-        out.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}, ensure_ascii=False) + "\n")
+        # ASCII on the wire: a stdout whose encoding is not UTF-8 cannot raise on a quote with an accent or a dash
+        out.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}, ensure_ascii=True) + "\n")
         out.flush()
 
 
@@ -152,6 +169,11 @@ def main(argv=None):
     ap.add_argument("--role", default="model", help="the agent type this server is attached to; recorded as the author")
     ap.add_argument("--docs-hosts", default=os.environ.get("ARGUS_DESK_DOCS_HOSTS", "docs.wiz.io"))
     a = ap.parse_args(argv)
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            stream.reconfigure(errors="replace")   # a byte the locale cannot decode must not end the server
+        except (AttributeError, ValueError):
+            pass
     serve(Desk(os.path.expanduser(a.root), a.docs_hosts), a.role)
 
 

@@ -318,6 +318,42 @@ class RemediationTests(unittest.TestCase):
         r2 = d.receipt("3", "docs", "Re-enable the broker to restore scanning", "https://docs.example.org/b")
         self.assertEqual([x for x in D.CR.load(d.receipts_path) if x["id"] == r2["id"]][0]["page_origin"], "fetch")
 
+    def test_receipt_fault_material_refusals_say_what_the_desk_holds(self):
+        # 2026-10-15, workstation: verbatim customer quotes came back quote-not-in-material; the desk could not say why.
+        d, c = mk()
+        r = d.receipt("5", "material", "the sensors are all on the latest version", by="inv1")
+        self.assertEqual(r["why"], "no-thread-captured", r)
+        self.assertIn("read every comment", r["hint"])
+        d.capture("5", [{"id": "1", "who": "customer", "at": T0 - 600, "text": "<div>The sensors are all on the&nbsp;latest version.<br>Please assist.</div>"},
+                        {"id": "2", "who": "us", "at": T0 - 300, "text": "Please send the diagnostic bundle."}], 2)
+        ok = d.receipt("5", "material", "The sensors are all on the latest version.", by="inv1")
+        self.assertTrue(ok["ok"], ok)   # an html body still carries the customer's words
+        r = d.receipt("5", "material", "Please send the diagnostic bundle.", by="inv1")
+        self.assertEqual(r["why"], "quote-not-from-customer", r); self.assertEqual(r["found_in"], "us")
+        r = d.receipt("5", "material", "something nobody wrote", by="inv1")
+        self.assertEqual(r["why"], "quote-not-in-material", r)
+        self.assertEqual(r["thread"]["customer_messages"], 1); self.assertGreater(r["thread"]["customer_chars"], 10)
+        kinds = [e["kind"] for e in d.trace("5")["events"]]
+        self.assertEqual(kinds.count("receipt-refused"), 3, kinds); self.assertIn("receipt", kinds)
+
+    def test_receipt_fault_docs_page_found_under_the_url_however_it_is_written(self):
+        d, c = mk()
+        D.CR.POLICY["docs_hosts"].append("docs.example.org")
+        d.page("https://docs.example.org/docs/how-detection-works/", "Detection runs on the latest scan of each workload.", origin="fetch")
+        for src in ("docs.example.org/docs/how-detection-works", "https://docs.example.org/docs/how-detection-works#top",
+                    "https://docs.example.org/docs/how-detection-works?x=1", "HTTPS://DOCS.example.org/docs/how-detection-works/"):
+            r = d.receipt("6", "docs", "Detection runs on the latest scan of each workload", src, by="inv1")
+            self.assertTrue(r["ok"], (src, r))
+        r = d.receipt("6", "docs", "Detection runs on the latest scan of each workload", "https://docs.example.org/docs/other", by="inv1")
+        self.assertEqual(r["why"], "page-not-captured")
+        self.assertEqual(r["captured"], ["https://docs.example.org/docs/how-detection-works/"])
+        self.assertEqual(D.canon_url("https://Docs.Example.org/a/b/?q=1#f"), "docs.example.org/a/b")
+        # a page file written by an older version (exact-string key) still resolves
+        import hashlib, json
+        with open(os.path.join(d.root, "pages", hashlib.md5(b"https://docs.example.org/old").hexdigest() + ".json"), "w") as fh:
+            json.dump({"source": "https://docs.example.org/old", "body": "Old pages are still read by the desk.", "origin": "fetch", "ts": 1}, fh)
+        self.assertTrue(d.receipt("6", "docs", "Old pages are still read by the desk", "https://docs.example.org/old")["ok"])
+
     def test_one_dash_is_one_hit(self):
         d, c = mk()
         r = d.file("4", "Hi,\n\nThe broker is off \u2014 turn it on.\n")

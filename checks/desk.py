@@ -64,6 +64,16 @@ def sha_of(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
 
+
+def canon_url(source):
+    """One key for one page: scheme dropped, host lowercased, anchor and query dropped, trailing slash and
+    punctuation dropped, so 'docs.wiz.io/docs/x/' and 'https://docs.wiz.io/docs/x#top' are the same page."""
+    u = str(source or "").strip().strip("<>").rstrip(".,;:)")
+    u = re.sub(r"^https?://", "", u, flags=re.I)
+    u = u.split("#", 1)[0].split("?", 1)[0]
+    host, sep, path = u.partition("/")
+    return (host.lower() + sep + path).rstrip("/")
+
 def md5_of(text):
     return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()
 
@@ -486,20 +496,43 @@ class Desk:
         if kind == "docs":
             page = self._page(source)
             if page is None:
-                return {"ok": False, "why": "page-not-captured", "source": source}
-            # page_origin says what the captured body is: the page itself (fetch), or a docs search result that
-            # names this URL (search). The audit shows the difference; the quote check is the same.
-            r = CR.mint_docs(self.receipts_path, ticket, source or "", quote, page["body"], [quote], now, extra={"page_origin": page.get("origin")})
+                # 2026-10-15 (receipt fault): the refusal names what IS captured, so an agent that wrote the URL another way
+                # (no scheme, trailing slash, anchor) can see the mismatch instead of reading "not captured" as "not read".
+                r = {"ok": False, "why": "page-not-captured", "source": source, "captured": self._pages_captured()}
+            else:
+                # page_origin says what the captured body is: the page itself (fetch), or a docs search result that
+                # names this URL (search). The audit shows the difference; the quote check is the same.
+                r = CR.mint_docs(self.receipts_path, ticket, source or "", quote, page["body"], [quote], now, extra={"page_origin": page.get("origin")})
         elif kind == "material":
             rec = self._thread(ticket)
-            inbound = "\n".join(m["text"] for m in (rec or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer")
-            r = CR.mint_material(self.receipts_path, ticket, quote, inbound, [quote], now)
+            if rec is None:
+                # 2026-10-15 (receipt fault): "quote-not-in-material" against an empty thread read as a verbatim quote being refused. A thread
+                # nobody captured is its own answer: the comments read never reached the desk in this run.
+                r = {"ok": False, "why": "no-thread-captured",
+                     "hint": "no comments read of #%s reached the desk in this run; read every comment through the proxy first (the desk records that read as the thread), then quote" % ticket}
+            else:
+                msgs = rec.get("thread", {}).get("messages", [])
+                cust = [m for m in msgs if m.get("who") == "customer"]
+                inbound = "\n".join(m.get("text", "") for m in cust)
+                r = CR.mint_material(self.receipts_path, ticket, quote, inbound, [quote], now)
+                if not r.get("ok"):
+                    q = CR.norm(CR.plain(quote))
+                    elsewhere = [m.get("who") for m in msgs if m.get("who") != "customer" and q and q in CR.norm(CR.plain(m.get("text", "")))]
+                    r = {"ok": False, "why": "quote-not-from-customer" if elsewhere else "quote-not-in-material",
+                         "thread": {"messages": len(msgs), "customer_messages": len(cust), "customer_chars": len(inbound),
+                                    "fetched_age_s": int(self.clock() - float(rec.get("thread", {}).get("fetched_at") or 0))}}
+                    if elsewhere:
+                        r["found_in"] = elsewhere[0]
         elif kind == "test":
             r = CR.mint_test(self.receipts_path, ticket, source or "", quote, "captured_text", [quote], now)
         else:
             return {"ok": False, "why": "kind must be docs, material or test"}
         if r.get("ok"):
             self._append(os.path.join(self._run_dir(ticket), "events.jsonl"), {"agent": by or "", "kind": "receipt", "text": "%s %s: %s" % (r["id"], kind, quote[:120])})
+        else:
+            # the refusal is on the record with its reason, whichever path (hook or MCP) asked
+            self._append(os.path.join(self._run_dir(ticket), "events.jsonl"),
+                         {"agent": by or "", "kind": "receipt-refused", "text": "%s %s: %s%s" % (kind, r.get("why") or r.get("reason"), quote[:120], (" (%s)" % source) if source else "")})
         return r
 
     def audit(self, md5=None, ticket=None):
@@ -556,7 +589,7 @@ class Desk:
                "prompt_sha": (agents.get(by) or {}).get("prompt_sha"), "page_origin": r.get("page_origin")}
         src = out["source"]
         if r.get("kind") == "docs" and src:
-            p = os.path.join(self.root, "pages", md5_of(src) + ".json")
+            p = self._page_file(src)
             out["captured"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p), "origin": r.get("page_origin")} if os.path.exists(p) else None
         elif r.get("kind") == "material":
             p = os.path.join(self.root, "threads", "%s.json" % ticket)
@@ -599,17 +632,43 @@ class Desk:
         if not source or not str(body or "").strip():
             return {"ok": False, "reason": "source and body"}
         os.makedirs(os.path.join(self.root, "pages"), exist_ok=True)
-        with open(os.path.join(self.root, "pages", md5_of(source) + ".json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(self.root, "pages", md5_of(canon_url(source)) + ".json"), "w", encoding="utf-8") as fh:
             json.dump({"source": source, "body": str(body), "origin": origin if origin in ("fetch", "search") else "search", "ts": self.clock()}, fh, ensure_ascii=False)
         return {"ok": True, "source": source, "chars": len(str(body)), "origin": origin}
 
     def _page(self, source):
-        p = os.path.join(self.root, "pages", md5_of(source or "") + ".json")
-        if not os.path.exists(p):
-            return None
-        with open(p, encoding="utf-8") as fh:
-            rec = json.load(fh)
-        return {"body": rec.get("body"), "origin": rec.get("origin") or "search"}
+        # 2026-10-15 (receipt fault): keyed by the canonical URL (no scheme, no anchor or query, no trailing slash, host lowercased) so the
+        # URL as the agent wrote it meets the URL as the search result named it; files keyed the old way still resolve.
+        for key in (canon_url(source), str(source or "")):
+            p = os.path.join(self.root, "pages", md5_of(key) + ".json")
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as fh:
+                    rec = json.load(fh)
+                return {"body": rec.get("body"), "origin": rec.get("origin") or "search"}
+        return None
+
+    def _page_file(self, source):
+        """The page file for a URL: canonical key first, the exact string for files written before 0.6.4."""
+        for key in (canon_url(source), str(source or "")):
+            p = os.path.join(self.root, "pages", md5_of(key) + ".json")
+            if os.path.exists(p):
+                return p
+        return os.path.join(self.root, "pages", md5_of(canon_url(source)) + ".json")
+
+    def _pages_captured(self, limit=8):
+        """The documentation URLs captured so far, newest first: what a docs receipt may name."""
+        d = os.path.join(self.root, "pages")
+        if not os.path.isdir(d):
+            return []
+        rows = []
+        for n in os.listdir(d):
+            try:
+                with open(os.path.join(d, n), encoding="utf-8") as fh:
+                    pg = json.load(fh)
+                rows.append((float(pg.get("ts") or 0), str(pg.get("source") or "")))
+            except (OSError, ValueError):
+                continue
+        return [src for _, src in sorted(rows, reverse=True)[:limit] if src]
 
     def cite(self, ticket, citations):
         """Bind receipts to the sentences of a draft: each citation is {receipt, sentence}. A receipt the ticket

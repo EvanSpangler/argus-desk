@@ -284,7 +284,7 @@ async function spawnRole($: any, o: Opts, ticket: string, role: Role, label: str
     return undefined
   }
   active.set(id, { ticket, role, label })
-  await desk($, o, ['run'], JSON.stringify({ ticket, agent: { id, agentId: id, role, label, model: String(r.model ?? model), status: 'running', params: angle.slice(0, 80) } }))
+  await desk($, o, ['run'], JSON.stringify({ ticket, agent: { id, agentId: id, role, label, model: String(r.model ?? model), status: 'running', params: angle.slice(0, 80), prompt } }))
   await update($, view, v => ({ ...v, wall: [...v.wall.filter(w => w.id !== id), { id, ticket, role, label, status: 'running', started: Date.now(), last: 'started', lines: [] }] }))
   return id
 }
@@ -598,7 +598,7 @@ export const register: Register = (on, options) => {
       const status = ev.isAborted || ev.reason === 'error' || ev.reason === 'refusal' ? 'failed' : 'completed'
       await wallLine($, o, id, 'done', text.replace(/\s+/g, ' ').slice(0, 200))
       active.delete(id)
-      await desk($, o, ['run'], JSON.stringify({ ticket: a.ticket, agent: { id, status, summary: text.slice(0, 600) } }))
+      await desk($, o, ['run'], JSON.stringify({ ticket: a.ticket, agent: { id, status, summary: text.slice(0, 600), answer: text, reason: ev.reason } }))
       await update($, view, v => ({ ...v, wall: v.wall.map(w => (w.id === id ? { ...w, status, last: text.slice(0, 160) } : w)) }))
       pending.add(a.ticket)
     }
@@ -610,6 +610,17 @@ export const register: Register = (on, options) => {
     if (/^stats\b/.test(args)) {
       const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'stats', '--text'], { timeoutMs: 60_000 })
       return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${r.stderr.slice(0, 300)}` }
+    }
+    if (/^audit\s+\S+$/.test(args)) {
+      const a = args.replace(/^audit\s+#?/, '')
+      const sel = /^[0-9a-f]{32}$/.test(a) ? ['--md5', a] : ['--ticket', a]
+      const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'audit', ...sel, '--text'], { timeoutMs: 60_000 })
+      return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${r.stderr.slice(0, 300)}` }
+    }
+    if (/^verify$/.test(args)) {
+      const r = (await desk($, o, ['verify'])) as { ok?: boolean; files?: Record<string, { rows: number; ok: boolean; problem?: string }> }
+      const lines = Object.entries(r.files ?? {}).map(([f, v]) => `${v.ok ? 'ok ' : 'BAD'} ${f}: ${v.rows} rows${v.problem ? `, ${v.problem}` : ''}`)
+      return { text: `${r.ok ? 'Every chained record verifies.' : 'A record does not verify.'}\n${lines.join('\n')}` }
     }
     if (/^run\s+#?\d+$/.test(args)) {
       const t = args.replace(/^run\s+#?/, '')
@@ -711,6 +722,9 @@ export const register: Register = (on, options) => {
       const ticket = ticketOf(args)
       const text = (ran as { text?: string }).text
       if (agentId) await wallLine($, o, agentId, 'read', `${String(args.proxy ?? '')} ${String(args.endpoint ?? '')} ${JSON.stringify(args.arguments ?? {}).slice(0, 100)}`)
+      // the call on the record, whole: who read what, with what arguments, and a hash of what came back
+      const who = agentId ? active.get(agentId) : undefined
+      if (ticket || who) await desk($, o, ['call'], JSON.stringify({ ticket: who?.ticket ?? ticket, agent: who?.label ?? 'main', tool: String(e.tool), args, result: text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny }))
       if (ticket && text && /"comments"\s*:\s*\[/.test(text)) {
         try {
           const parsed = JSON.parse(text) as { comments?: Array<Record<string, unknown>>; count?: number }
@@ -733,8 +747,11 @@ export const register: Register = (on, options) => {
     }
     const flat = JSON.stringify(args)
     const r = await desk($, o, ['consume'], JSON.stringify({ candidates: strings(args), what: `${String(e.tool)} ${flat.slice(0, 120)}`, flat }))
+    const who = agentId ? active.get(agentId) : undefined
+    const postTicket = (r.ticket as string | undefined) ?? who?.ticket ?? ticketOf(args)
     if (r.ok) {
       const ran = await next(e)
+      if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool: String(e.tool), args, result: (ran as { text?: string }).text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny, note: `POST granted ${String(r.md5)}` }))
       await refresh($, o, `sent ${String(r.md5).slice(0, 8)}`)
       if (r.ticket && r.status) await verify($, o, String(e.tool), String(r.ticket), String(r.status))
       return ran
@@ -747,6 +764,7 @@ export const register: Register = (on, options) => {
       }
     }
     const undecided = (r.undecided as string[] | undefined) ?? []
+    if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool: String(e.tool), args, ok: false, note: `POST refused: ${String(r.code ?? r.reason ?? 'no grant')}` }))
     return {
       deny:
         `argus-desk: this call would post to the customer and carries no text the operator has granted. ` +

@@ -35,6 +35,26 @@ DASH = re.compile("[–—]")
 TIMELINE = re.compile(r"\b(shortly|soon|asap|as soon as possible|by (?:end of|eod|tomorrow|monday|tuesday|wednesday|thursday|friday)|within (?:the )?(?:hour|day|\d+ (?:hours|days)))\b", re.I)
 
 
+def _chain_hash(prev, row):
+    body = json.dumps({k: v for k, v in row.items() if k != "h"}, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256((prev + "\n" + body).encode("utf-8")).hexdigest()
+
+
+def _file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        h.update(fh.read())
+    return h.hexdigest()
+
+
+def _safe(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))[:80] or "agent"
+
+
+def sha_of(text):
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
 def md5_of(text):
     return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()
 
@@ -71,10 +91,61 @@ class Desk:
         return out
 
     def _append(self, path, row):
+        """Append one record, chained: `prev` is the previous row's hash, `h` is sha256 over prev plus the row's
+        own bytes. A row edited, dropped or inserted later breaks every hash after it (`desk verify`)."""
         row = dict(row, ts=row.get("ts") or self.clock())
+        prev = self._last_hash(path)
+        row["prev"] = prev
+        row["h"] = _chain_hash(prev, row)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return row
+
+    def _last_hash(self, path):
+        last = ""
+        if os.path.exists(path):
+            with open(path, "rb") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            last = json.loads(line).get("h") or last
+                        except ValueError:
+                            pass
+        return last
+
+    def verify(self):
+        """Walk every chained file under the root and report the first broken link in each."""
+        out = {"ok": True, "files": {}}
+        paths = [self.requests_path, self.decisions_path, self.transitions_path]
+        runs = os.path.join(self.root, "runs")
+        if os.path.isdir(runs):
+            for t in sorted(os.listdir(runs)):
+                for n in ("events.jsonl", "findings.jsonl", "calls.jsonl"):
+                    paths.append(os.path.join(runs, t, n))
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            prev, n, bad = "", 0, None
+            with open(path, encoding="utf-8") as fh:
+                for i, line in enumerate(fh, 1):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if "h" not in row:
+                        bad = bad or "line %d: unchained (written before v0.4)" % i
+                        prev = ""
+                        continue
+                    if row.get("prev", "") != prev or _chain_hash(prev, row) != row["h"]:
+                        bad = "line %d: hash mismatch" % i
+                        break
+                    prev = row["h"]
+                    n += 1
+            rel = os.path.relpath(path, self.root)
+            out["files"][rel] = {"rows": n, "ok": bad is None, "problem": bad}
+            if bad and "unchained" not in bad:
+                out["ok"] = False
+        return out
 
     def _thread(self, ticket):
         p = os.path.join(self.root, "threads", "%s.json" % ticket)
@@ -227,9 +298,14 @@ class Desk:
         r = self.ledger.grant_by_message(md5, press_id, src, OPERATOR)
         if r.get("ok"):
             self._decide(md5, req, "send", press_id)
-            # The Send carries the status the posting call must set; the gate checks the call for it.
-            self._append(self.transitions_path, {"md5": md5, "ticket": req["ticket"], "event": "granted", "status": status})
-        return dict(r, md5=md5, status=status)
+            # The Send carries the status the posting call must set; the gate checks the call for it. A Send on a
+            # draft the checks held is an overrule, named here so the audit shows what the operator waved through.
+            overruled = list(req["checks"].get("hits") or [])
+            self._append(self.transitions_path, {"md5": md5, "ticket": req["ticket"], "event": "granted", "status": status,
+                                                 "overruled": overruled, "press_id": press_id})
+            if overruled:
+                self.event(req["ticket"], "operator", "overrule", "Send on HOLD %s" % ",".join(overruled))
+        return dict(r, md5=md5, status=status, overruled=list(req["checks"].get("hits") or []))
 
     def deny(self, md5, reason):
         req = self._requests().get(md5)
@@ -257,7 +333,8 @@ class Desk:
         now = self.clock()
         self._append(self.decisions_path, {"md5": md5, "ticket": req["ticket"], "decision": decision, "note": (note or "")[:500],
                                            "filed": req["ts"], "wait_s": int(now - req["ts"]), "verdict": req["checks"]["verdict"],
-                                           "hits": req["checks"]["hits"], "source": req.get("source"),
+                                           "hits": req["checks"]["hits"], "overruled": req["checks"]["hits"] if decision == "send" else [],
+                                           "source": req.get("source"),
                                            "supersedes": req.get("supersedes"), "edit": req.get("edit")})
 
     def _required_status(self, md5):
@@ -323,6 +400,19 @@ class Desk:
             if phase == "review":
                 run["rounds"] = run.get("rounds", 0) + 1
         if agent and agent.get("id"):
+            agent = dict(agent)
+            # the exact prompt the agent was given and its full answer: kept whole, on disk, hashed in the row
+            for key, sub in (("prompt", "prompts"), ("answer", "answers")):
+                body = agent.pop(key, None)
+                if body is not None:
+                    d = os.path.join(self._run_dir(ticket), sub)
+                    os.makedirs(d, exist_ok=True)
+                    name = "%s.txt" % _safe(agent.get("label") or agent["id"])
+                    with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+                        fh.write(str(body))
+                    agent[key + "_sha"] = sha_of(body)
+                    agent[key + "_file"] = os.path.join("runs", str(ticket), sub, name)
+                    agent[key + "_chars"] = len(str(body))
             rows = [a for a in run["agents"] if a["id"] != agent["id"]]
             prev = next((a for a in run["agents"] if a["id"] == agent["id"]), {})
             row = dict(prev, **{k: v for k, v in agent.items() if v is not None})
@@ -333,6 +423,15 @@ class Desk:
             run["agents"] = sorted(rows, key=lambda a: a["started"])
         self._save_run(run)
         return {"ok": True, "run": run}
+
+    def call(self, ticket, agent, tool, args, result=None, ok=True, note=None):
+        """One tool call an agent made, with its full arguments and a hash of what came back: the record that
+        says what the agent actually read or did, not what it says it did."""
+        res = "" if result is None else str(result)
+        row = {"agent": agent or "", "tool": str(tool or ""), "args": args, "ok": bool(ok),
+               "result_sha": sha_of(res) if res else None, "result_chars": len(res), "note": note}
+        self._append(os.path.join(self._run_dir(ticket), "calls.jsonl"), row)
+        return {"ok": True}
 
     def event(self, ticket, agent, kind, text):
         """One line of the tail: what an agent is doing right now. Kept short, kept all."""
@@ -373,6 +472,96 @@ class Desk:
         if r.get("ok"):
             self._append(os.path.join(self._run_dir(ticket), "events.jsonl"), {"agent": by or "", "kind": "receipt", "text": "%s %s: %s" % (r["id"], kind, quote[:120])})
         return r
+
+    def audit(self, md5=None, ticket=None):
+        """The chain behind one reply, walked backwards: what went out, who pressed, what the checks said, each
+        sentence and its receipt, each receipt's source and captured bytes, the agent that minted it, that agent's
+        model, prompt and answer, and every call it made. Everything named is a file or a hash the reader can open."""
+        reqs = self._requests()
+        if not md5 and ticket:
+            mine = [r for r in reqs.values() if r["ticket"] == str(ticket)]
+            if not mine:
+                return {"ok": False, "reason": "no draft filed on #%s" % ticket}
+            md5 = mine[-1]["md5"]
+        req = reqs.get(md5)
+        if not req:
+            return {"ok": False, "reason": "unknown md5"}
+        ticket = req["ticket"]
+        run = self._run(ticket)
+        events = self._rows(os.path.join(self._run_dir(ticket), "events.jsonl"))
+        calls = self._rows(os.path.join(self._run_dir(ticket), "calls.jsonl"))
+        findings = self._rows(os.path.join(self._run_dir(ticket), "findings.jsonl"))
+        minted_by = {}
+        for e in events:
+            if e.get("kind") == "receipt":
+                minted_by[e["text"].split(" ", 1)[0]] = e.get("agent")
+        agents = {a.get("label"): a for a in run.get("agents", [])}
+        ledger = [e for e in self.ledger.events() if e.get("md5") == md5]
+        trans = [t for t in self._rows(self.transitions_path) if t.get("md5") == md5]
+        decision = next((d for d in reversed(self._rows(self.decisions_path)) if d.get("md5") == md5), None)
+        rec = self._thread(ticket)
+        inbound = "\n".join(m["text"] for m in (rec or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer")
+        c = CR.check(req["text"], ticket, self.receipts_path, datetime.fromtimestamp(self.clock(), timezone.utc), inbound=inbound)
+        receipts = {r["id"]: r for r in CR.load(self.receipts_path) if r["ticket"] == str(ticket)}
+        sentences = []
+        for cl in c["claims"]:
+            if "snippet" in cl.get("classes", []):
+                continue
+            rids = cl.get("receipts") or []
+            status = "ok" if rids and not cl["problems"] and not cl.get("echo") else ("echo" if cl.get("echo") else ",".join(cl["problems"]) or "uncovered")
+            sentences.append({"text": cl["text"], "status": status,
+                              "receipts": [self._receipt_chain(receipts.get(r), minted_by.get(r), agents, ticket) for r in rids]})
+        return {"ok": True, "md5": md5, "ticket": ticket, "filed": req["ts"], "by": req.get("source"), "supersedes": req.get("supersedes"),
+                "text_sha": sha_of(req["text"]), "chars": req["chars"], "checks_at_filing": req["checks"],
+                "decision": decision, "transitions": trans, "ledger": ledger, "sentences": sentences,
+                "objections": [f for f in findings if f.get("kind") == "objection" and f.get("about") in (None, md5)],
+                "agents": [self._agent_chain(a, calls, events) for a in run.get("agents", [])],
+                "captures": self._capture_chain(ticket),
+                "chain": self.verify()}
+
+    def _receipt_chain(self, r, by, agents, ticket):
+        if not r:
+            return {"id": None, "problem": "receipt not on file"}
+        out = {"id": r["id"], "kind": r.get("kind"), "source": r.get("source") or r.get("url"), "quote": r.get("quote"),
+               "minted": r.get("minted") or r.get("ts"), "by": by, "model": (agents.get(by) or {}).get("model"),
+               "prompt_sha": (agents.get(by) or {}).get("prompt_sha")}
+        src = out["source"]
+        if r.get("kind") == "docs" and src:
+            p = os.path.join(self.root, "pages", md5_of(src) + ".json")
+            out["captured"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p)} if os.path.exists(p) else None
+        elif r.get("kind") == "material":
+            p = os.path.join(self.root, "threads", "%s.json" % ticket)
+            out["captured"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p)} if os.path.exists(p) else None
+        return out
+
+    def _agent_chain(self, a, calls, events):
+        mine = [c for c in calls if c.get("agent") == a.get("label")]
+        return {"label": a.get("label"), "role": a.get("role"), "model": a.get("model"), "status": a.get("status"),
+                "started": a.get("started"), "ended": a.get("ended"), "params": a.get("params"),
+                "prompt": {"sha": a.get("prompt_sha"), "file": a.get("prompt_file"), "chars": a.get("prompt_chars")},
+                "answer": {"sha": a.get("answer_sha"), "file": a.get("answer_file"), "chars": a.get("answer_chars")},
+                "calls": len(mine), "reads": mine[:200],
+                "receipts": sum(1 for e in events if e.get("kind") == "receipt" and e.get("agent") == a.get("label")),
+                "findings": sum(1 for e in events if e.get("kind") in FINDING_KINDS and e.get("agent") == a.get("label"))}
+
+    def _capture_chain(self, ticket):
+        out = {}
+        p = os.path.join(self.root, "threads", "%s.json" % ticket)
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            out["thread"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p),
+                             "messages": len(rec.get("thread", {}).get("messages", [])),
+                             "fetched_at": rec.get("thread", {}).get("fetched_at"), "console_count": (rec.get("receipt") or {}).get("count")}
+        pages = os.path.join(self.root, "pages")
+        if os.path.isdir(pages):
+            out["pages"] = []
+            for n in sorted(os.listdir(pages)):
+                with open(os.path.join(pages, n), encoding="utf-8") as fh:
+                    pg = json.load(fh)
+                out["pages"].append({"file": os.path.join("pages", n), "source": pg.get("source"),
+                                     "sha": _file_sha(os.path.join(pages, n)), "chars": len(pg.get("body", ""))})
+        return out
 
     def page(self, source, body):
         """Keep the body of a page an agent fetched, so a docs receipt can be checked against it."""
@@ -594,6 +783,68 @@ def stats_text(s):
     return "\n".join(lines)
 
 
+def _when(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%MZ") if ts else "?"
+
+
+def render_audit(a):
+    L = ["AUDIT draft %s on #%s, filed %s by %s, %d chars, sha256 %s" % (a["md5"], a["ticket"], _when(a["filed"]), a["by"], a["chars"], a["text_sha"][:16])]
+    if a.get("supersedes"):
+        L.append("  supersedes %s" % a["supersedes"])
+    ch = a["checks_at_filing"]
+    L.append("  checks at filing: %s%s" % (ch["verdict"].upper(), (" " + ",".join(ch["hits"])) if ch["hits"] else ""))
+    d = a.get("decision")
+    if d:
+        L.append("  decision: %s at %s after %ss by the operator%s%s" % (
+            d["decision"].upper(), _when(d["ts"]), d["wait_s"], (", note: " + d["note"]) if d.get("note") else "",
+            (", OVERRULED " + ",".join(d["overruled"])) if d.get("overruled") else ""))
+    else:
+        L.append("  decision: none yet (waiting at the desk)")
+    for t in a.get("transitions", []):
+        extra = " ".join("%s=%s" % (k, v) for k, v in t.items() if k not in ("ts", "event", "md5", "ticket", "prev", "h") and v not in (None, [], ""))
+        L.append("  %s: %s %s" % (_when(t["ts"]), t["event"], extra))
+    for e in a.get("ledger", []):
+        if e.get("event") in ("consume", "grant", "deny", "withdraw", "request"):
+            L.append("  ledger %s: %s %s" % (_when(e.get("ts")), e["event"], (e.get("what") or e.get("reason") or e.get("target") or "")[:100]))
+    L.append("SENTENCES")
+    for s_ in a["sentences"]:
+        L.append("  [%s] %s" % (s_["status"], s_["text"][:200]))
+        for r in s_["receipts"]:
+            if not r.get("id"):
+                L.append("      receipt: %s" % r.get("problem"))
+                continue
+            cap = r.get("captured")
+            L.append("      %s %s by %s (%s, prompt %s): \"%s\"" % (r["id"], r["kind"], r.get("by") or "?", r.get("model") or "?",
+                                                                   (r.get("prompt_sha") or "?")[:12], (r.get("quote") or "")[:160]))
+            L.append("        source %s; captured %s" % (r.get("source"), ("%s sha %s" % (cap["file"], cap["sha"][:16])) if cap else "MISSING"))
+    if a.get("objections"):
+        L.append("OBJECTIONS ON RECORD")
+        for f in a["objections"]:
+            L.append("  %s (%s %s): %s" % (str(f.get("id", ""))[:12], f.get("role"), f.get("agent"), (f.get("text") or "")[:220]))
+    L.append("AGENTS")
+    for g in a["agents"]:
+        L.append("  %s %s (%s) %s %s to %s: %d calls, %d receipts, %d findings; prompt %s %s; answer %s %s" % (
+            g["role"], g["label"], g.get("model") or "?", g.get("status"), _when(g.get("started")), _when(g.get("ended")),
+            g["calls"], g["receipts"], g["findings"], (g["prompt"]["sha"] or "?")[:12], g["prompt"]["file"] or "(not kept)",
+            (g["answer"]["sha"] or "?")[:12], g["answer"]["file"] or "(not kept)"))
+        for c in g["reads"][:12]:
+            L.append("      %s %s %s -> %s chars sha %s" % (_when(c.get("ts")), c.get("tool"), json.dumps(c.get("args"), ensure_ascii=False)[:140],
+                                                          c.get("result_chars"), (c.get("result_sha") or "")[:12]))
+        if len(g["reads"]) > 12:
+            L.append("      ... %d more calls in runs/%s/calls.jsonl" % (len(g["reads"]) - 12, a["ticket"]))
+    cp = a.get("captures", {})
+    L.append("CAPTURES")
+    if cp.get("thread"):
+        t = cp["thread"]
+        L.append("  thread %s: %s messages, console count %s, fetched %s, sha %s" % (t["file"], t["messages"], t["console_count"], _when(t.get("fetched_at")), t["sha"][:16]))
+    for pg in cp.get("pages", []):
+        L.append("  page %s: %s, %d chars, sha %s" % (pg["file"], pg["source"], pg["chars"], pg["sha"][:16]))
+    v = a.get("chain", {})
+    bad = [k for k, f in v.get("files", {}).items() if not f["ok"]]
+    L.append("RECORD INTEGRITY: %s" % ("every chained file verifies" if v.get("ok") and not bad else "PROBLEM in " + ", ".join("%s (%s)" % (k, v["files"][k]["problem"]) for k in bad)))
+    return "\n".join(L)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait"])
@@ -634,6 +885,15 @@ def main(argv=None):
         out = {"ok": True, "row": d._mark(a.ticket, a.state, note=a.note or None)} if a.ticket and a.state else {"ok": False, "reason": "--ticket and --state"}
     elif a.cmd == "run":
         out = d.run_update(body.get("ticket"), body.get("phase"), body.get("agent"))
+    elif a.cmd == "call":
+        out = d.call(body.get("ticket"), body.get("agent"), body.get("tool"), body.get("args"), body.get("result"), body.get("ok", True), body.get("note"))
+    elif a.cmd == "audit":
+        out = d.audit(a.md5, a.ticket)
+        if a.text and out.get("ok"):
+            print(render_audit(out))
+            return
+    elif a.cmd == "verify":
+        out = d.verify()
     elif a.cmd == "event":
         out = d.event(body.get("ticket"), body.get("agent"), body.get("kind"), body.get("text"))
     elif a.cmd == "finding":

@@ -11,7 +11,7 @@ const fake = (on: any, answer: (r: Run) => Record<string, unknown>) => {
   })
   return calls
 }
-const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'trace', 'wait'].includes(String(a)))
+const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait'].includes(String(a)))
 
 const DRAFT = 'Hi Sam,\n\nThe broker is disabled, so the connector reports unhealthy. Re-enable it under Settings > Connectors.\n\nThanks!\n'
 const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state: 'pending', filed: 1, age_s: 120, chars: 120, text: DRAFT,
@@ -139,7 +139,7 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
   on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
   const searches: any[] = []
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async (_$: any, e: any) => { searches.push(e); return { result: SEARCH, text: JSON.stringify(SEARCH) } })
-  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 1 } } as any)
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
   searches.length = 0
   const r = await $.command.run({ command: 'desk', args: 'poll' })
   expect(String(r.text)).toMatch(/Polled 2/)
@@ -182,6 +182,18 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
   await finish('rev2', 'NO OBJECTIONS'); await finish('rev2B', 'NO OBJECTIONS')
   expect(spawns.length).toBe(11)
   expect(store.phase).toBe('done')
+  // accountability: the exact prompt and the full answer travel to the record, and every proxy read is a call row
+  const runRows = calls.filter(c => cmdOf(c) === 'run').map(c => JSON.parse(c.stdin!))
+  expect(runRows.find(r => r.agent?.label === 'inv1' && r.agent.prompt)?.agent.prompt).toBe(spawns[0].prompt)
+  expect(runRows.find(r => r.agent?.id === store.agents.find(a => a.label === 'revB')!.id && r.agent.answer)?.agent.answer).toMatch(/wizexclude/)
+  const callRows = calls.filter(c => cmdOf(c) === 'call').map(c => JSON.parse(c.stdin!))
+  // (the poll's own search names no ticket and no agent, so it is not a run record; the ticket read above is)
+  expect(callRows.length).toBe(1)
+  expect(callRows[0].tool).toBe('mcp__local-argus__invoke_proxy')
+  expect(callRows[0].args.endpoint).toBe('zendesk_get_ticket')
+  expect(callRows[0].ticket).toBe('123456')
+  expect(callRows[0].agent).toBe('main')
+  expect(typeof callRows[0].result).toBe('string')
   expect(store.agents.find(a => a.label === 'revB').summary).toMatch(/Objection/)
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(0)
 })
@@ -204,7 +216,7 @@ test('the poller runs on the clock while polling is on, and not while paused', a
   fake(on, r => (cmdOf(r) === 'sync' ? { ok: true, rows: [], next: null, busy: [] } : { ok: true, items: [], rows: [] }))
   let searches = 0
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => { searches++; return { result: { results: [] }, text: '{"results":[]}' } })
-  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 1 } } as any)
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
   searches = 0
   await $.command.run({ command: 'desk', args: 'resume' })
   await clock.advance(5 * 60_000 + 10)

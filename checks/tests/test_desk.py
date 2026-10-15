@@ -184,3 +184,49 @@ class DeskTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditTests(unittest.TestCase):
+    def test_chain_verifies_and_breaks_on_edit(self):
+        d, c = mk()
+        d.run_update("7", phase="new", agent={"id": "a1", "role": "investigator", "label": "inv1", "model": "sonnet", "status": "running", "prompt": "read the thread"})
+        d.event("7", "inv1", "tool", "invoke_proxy")
+        d.call("7", "inv1", "invoke_proxy", {"proxy": "zendesk-full", "endpoint": "zendesk_list_comments"}, result='{"comments":[]}')
+        d.run_update("7", agent={"id": "a1", "status": "completed", "answer": "nothing found"})
+        v = d.verify()
+        self.assertTrue(v["ok"], v)
+        self.assertEqual(v["files"]["runs/7/calls.jsonl"]["rows"], 1)
+        run = d._run("7")
+        a = run["agents"][0]
+        self.assertEqual(a["prompt_sha"], D.sha_of("read the thread"))
+        self.assertTrue(os.path.exists(os.path.join(d.root, a["answer_file"])))
+        self.assertNotIn("prompt", a)
+        p = os.path.join(d.root, "runs", "7", "events.jsonl")
+        rows = open(p).read().splitlines()
+        rows[0] = rows[0].replace("invoke_proxy", "something_else")
+        open(p, "w").write("\n".join(rows) + "\n")
+        v = d.verify()
+        self.assertFalse(v["ok"])
+        self.assertIn("hash mismatch", v["files"]["runs/7/events.jsonl"]["problem"])
+
+    def test_audit_walks_the_chain_and_names_overrules(self):
+        d, c = mk()
+        d.run_update("8", phase="draft", agent={"id": "a2", "role": "drafter", "label": "draft", "model": "opus", "status": "completed", "prompt": "write it"})
+        r = d.file("8", DRAFT)
+        self.assertEqual(r["verdict"], "hold")
+        g = d.grant(r["md5"], "press-9")
+        self.assertTrue(g["ok"], g)
+        self.assertIn("uncovered", g["overruled"])
+        a = d.audit(md5=r["md5"])
+        self.assertTrue(a["ok"], a)
+        self.assertEqual(a["decision"]["decision"], "send")
+        self.assertIn("uncovered", a["decision"]["overruled"])
+        self.assertEqual(a["transitions"][0]["overruled"], a["decision"]["overruled"])
+        self.assertTrue(any(s["status"] != "ok" for s in a["sentences"]))
+        self.assertEqual(a["agents"][0]["prompt"]["sha"], D.sha_of("write it"))
+        self.assertTrue(a["chain"]["ok"])
+        txt = D.render_audit(a)
+        self.assertIn("OVERRULED uncovered", txt)
+        self.assertIn("RECORD INTEGRITY: every chained file verifies", txt)
+        self.assertTrue(any(e["kind"] == "overrule" for e in d._rows(os.path.join(d.root, "runs", "8", "events.jsonl"))))
+        self.assertEqual(d.audit(ticket="8")["md5"], r["md5"])

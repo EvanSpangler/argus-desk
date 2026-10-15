@@ -1,10 +1,11 @@
 # argus-desk user guide
 
 argus-desk puts you between the model and the customer. Every few minutes it looks for open tickets
-assigned to you and hands the next one to the model. The model reads it, writes a reply and files it at
-the desk. You read it in the Desk pane and press **Send**, **Modify** or **Deny**. Nothing reaches the
-customer without a Send; one Send allows exactly one post of exactly that text, and the post has to set the
-ticket status you chose (Pending by default), or it is refused.
+assigned to you and starts an investigation on the next one: three investigators from different angles, an
+adversary that argues against them, a drafter that files a reply with a receipt for every factual sentence,
+and a reviewer that may only object. You read the whole trace in the Desk pane, then press **Send**,
+**Modify** or **Deny**. Nothing reaches the customer without a Send; one Send allows exactly one post of
+exactly that text, and the post has to set the ticket status you chose (Pending by default), or it is refused.
 
 ## 1. Install (once per workstation)
 
@@ -31,36 +32,43 @@ the mod did not load: see Troubleshooting.
 
 ## 3. Daily use
 
-Leave the session open. The desk does the pulling; you do the deciding.
+Leave the session open. The desk does the pulling and the investigating; you do the deciding.
 
 1. **The desk polls.** Every 5 minutes (option `pollMinutes`) it searches Zendesk through the model's own
    `invoke_proxy` tool for `type:ticket status<pending assignee:me` (option `searchQuery`): your new and
-   open tickets. The pane's second line says when it last polled and whether the search failed.
-2. **It pulls one ticket at a time.** SLA soonest first, then a ticket the customer has answered since we
-   replied, then the oldest. It wakes the model with that ticket and the model reads every comment (the
-   desk records them as the live thread), reads what the question needs, and then either files a reply
-   or calls `skip_ticket` with a reason when nothing is owed right now. Nothing else is pulled while a
-   ticket is being drafted or a draft is waiting for you. A pull that produces nothing in 30 minutes is
-   offered again.
-3. **The model files the draft.** It calls its `file_draft` tool with the exact reply. The desk runs its
-   checks and puts the draft in the pane. The model is told to wait.
-4. **You decide in the pane.** Type `/desk` if it is not already open. The pane shows:
-   - the queue: `#ticket new | drafting | waiting | stale | sent | skipped`, with the SLA and subject.
-   - one row per waiting draft: `#ticket md5 clear` or `#ticket md5 HOLD <reasons>`, its state and age.
-     Click a row to select it.
-   - `thread: 7 of 7 comments recorded`: the model read every comment the ticket has. `NOT captured`
-     means it never fetched them, so the draft was written blind.
-   - `claims: 0 of 2 receipted`: how many factual claims are backed by a recorded source. Advisory only.
-   - `customer asked: ...` in yellow: questions from the customer that our side has not answered yet.
-   - the draft text.
+   open tickets. The Queue tab says when it last polled and whether the search failed.
+2. **It runs one ticket at a time.** SLA soonest first, then a ticket the customer has answered since we
+   replied, then the oldest. A run is a tree of subagents inside this session:
+   - three **investigators** in parallel (docs first; evidence first; thread first), each on a cheap model;
+   - an **adversary** that assumes the leading explanation is wrong and records counters;
+   - a **drafter** that writes the reply and files it with a citation for every factual sentence;
+   - a **reviewer** that may only object (unanswered question, contradiction with the thread, a step that
+     does not fit their platform, a sentence without a receipt). One objection sends it back to the
+     drafter once (option `maxRounds`); then it comes to you.
+   Nothing else is pulled while a run is on or a draft is waiting for you. `/desk run 123456` starts a run
+   by hand and holds the prompt until it ends; `/desk pull 123456` starts one in the background.
+3. **Receipts.** An agent can only cite what it actually read: a sentence verbatim from an official
+   documentation page the session fetched (`docs`), or the customer's own words from the captured thread
+   (`material`). A quote that is not there is refused. The draft's claims are checked against them.
+4. **You read the trace, then decide.** `/desk` opens the pane. Four tabs, keys `1` to `4`, `j`/`k` to
+   scroll, `n` for the next draft:
+   - **Wall**: every agent on every ticket, live: role, model, minutes running, its last tool call or
+     sentence. This is where you see what it is working through.
+   - **Queue**: the open set and where each ticket stands (`new`, `drafting`, `waiting`, `stale`, `sent`,
+     `skipped`).
+   - **Ticket**: the trace of the selected ticket: phase, each agent and its summary, then HYPOTHESIS,
+     EVIDENCE, COUNTER, OBJECTION, ANSWER, SUMMARY findings with their receipt ids, the RECEIPTS with their
+     sources and quotes, and CLAIMS IN THE DRAFT: each factual sentence marked `ok <receipt>`, `uncovered`,
+     `echo` (restates the customer) or the specific problem. Read this before you Send.
+   - **Decide**: the draft, its checks, the customer's open questions, the reviewer's objections, and the
+     buttons.
 5. **Press one of the buttons** (or its key):
    - **Send, pending** (`s`): approves this exact text with the ticket going to Pending. The model is told
      to post it with that status in the same update, and the post goes through once.
    - **Send, solved** (`v`): the same, with the ticket going to Solved.
-   - **Modify** (`m`): type one line saying what to change and press Return. The model revises and files a
-     new draft, which comes back to the pane. The edit is recorded.
-   - **Deny** (`d`): type why and press the deny button. The model is told not to post and to say what the
-     ticket needs instead.
+   - **Modify** (`m`): type one line and press Return. The drafter revises with your note and files the new
+     text; the reviewer looks again; it comes back to Decide. Your note is kept as an objection on the trace.
+   - **Deny** (`d`): type why. Nothing posts; the reason is recorded on the trace.
 
 A Send lasts 6 hours. A draft nobody decides is dropped after 24 hours.
 
@@ -69,12 +77,13 @@ A Send lasts 6 hours. A draft nobody decides is dropped after 24 hours.
    it. On the next poll the ticket has left the open set, which the queue records as the transition
    confirmed. If the customer answers, the ticket comes back as `reopened` and is pulled first.
 
-Hand controls: `/desk poll` polls now, `/desk pull 123456` pulls one ticket now, `/desk pause` and
-`/desk resume` stop and start the timer. The default search assumes the Argus proxies `zendesk-full`
-(reads) and `zendesk-write` (posts) and the endpoints `zendesk_search_tickets`, `zendesk_get_ticket`,
-`zendesk_list_comments` and `zendesk_update_ticket`; if your Argus names them differently, set the
-plugin's options (`/plugin` > argus-desk > configure) and the pane's poll line will tell you when a
-search fails.
+Hand controls: `/desk run N`, `/desk trace N` (the trace as text in the transcript), `/desk poll`,
+`/desk pull N`, `/desk pause`, `/desk resume`, `/desk stats`. The default search assumes the Argus proxies
+`zendesk-full` (reads) and `zendesk-write` (posts) and the endpoints `zendesk_search_tickets`,
+`zendesk_get_ticket`, `zendesk_list_comments` and `zendesk_update_ticket`; if your Argus names them
+differently, set the plugin's options (`/plugin` > argus-desk > configure). Models per role are options
+too (`investigatorModel`, `adversaryModel`, `drafterModel`, `reviewerModel`); the docs hosts a receipt may
+cite are `docsHosts`.
 
 ## 4. What the gate does
 
@@ -118,6 +127,8 @@ Warnings (shown, never a HOLD): `no-thread-captured`, and `claims:...` when clai
 `/desk stats` prints: drafts filed, how many were sent as filed, sent after a Modify, or denied, the wait
 from filing to your decision, posts through the gate and how many status transitions the next poll
 confirmed, the queue counts, and how often a HOLD was overruled. This is what the pilot is judged on.
+A run costs one context per agent (six to eight per ticket); the investigators and reviewer default to
+Sonnet, the adversary and drafter to Opus.
 
 ## 7. Turn it off
 

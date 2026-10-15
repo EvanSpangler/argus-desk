@@ -8,6 +8,8 @@ the decision table: sent as filed, modified, denied, wait, check holds.
 
 ## Install
 
+Step by step, with what the pane shows and what each button does: [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
+
 From a terminal session of Claude Code:
 
 ```

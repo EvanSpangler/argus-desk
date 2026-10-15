@@ -41,7 +41,7 @@ test('an outward post passes once the exact text has an open grant, and the gran
 
 test('a read of the ticket comments passes untouched and is captured as the live thread', async ($, on) => {
   const calls = fake(on, () => ({ ok: true, items: [] }))
-  const payload = { comments: [{ id: 1, author_role: 'end-user', created_at: '2026-10-14T10:00:00Z', plain_body: 'Scans fail. Which version?' }, { id: 2, author_role: 'agent', created_at: '2026-10-14T11:00:00Z', plain_body: 'Please send the logs.' }], count: 2 }
+  const payload = { comments: [{ id: 1, author_role: 'end-user', created_at: '2026-10-14T10:00:00Z', plain_body: 'Scans fail. Which version?' }, { id: 2, author_role: 'agent', created_at: '2026-10-14T11:00:00Z', plain_body: 'Please send the logs.' }, { id: 3, author_role: 'agent', public: false, created_at: '2026-10-14T11:05:00Z', plain_body: 'AI classification: Troubleshooting.' }], count: 3 }
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: payload, text: JSON.stringify(payload) }))
   const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_get_ticket_comments', arguments: { ticket_id: 123456 } } as any)
   expect(r.deny).toBeUndefined()
@@ -49,8 +49,9 @@ test('a read of the ticket comments passes untouched and is captured as the live
   expect(cap).toBeDefined()
   const body = JSON.parse(cap!.stdin!)
   expect(body.ticket).toBe('123456')
-  expect(body.count).toBe(2)
+  expect(body.count).toBe(3)
   expect(body.messages[1].who).toBe('us')
+  expect(body.messages[2].who).toBe('staff')
 })
 
 test('fails closed: a write on any proxy, or a call with no endpoint, needs a grant; a named read does not', async ($, on) => {

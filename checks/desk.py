@@ -292,7 +292,8 @@ def main(argv=None):
     ap.add_argument("--note", default="")
     ap.add_argument("--text", action="store_true", help="stats as text")
     a = ap.parse_args(argv)
-    d = Desk(a.root)
+    # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
+    d = Desk(os.path.expanduser(a.root))
     body = {}
     if a.cmd in ("file", "consume", "capture"):
         raw = sys.stdin.read()

@@ -188,7 +188,9 @@ export const register: Register = (on, options) => {
           const comments = parsed.comments ?? []
           const messages = comments.map((c, i) => ({
             id: String(c.id ?? i),
-            who: c.author_role === 'agent' || c.via_agent === true || c.public === false ? 'us' : 'customer',
+            // Internal notes are staff: bots post several on every new ticket, and counting them as our replies held
+            // every draft on cadence (too-many). Only a public comment from our side is a reply.
+            who: c.public === false ? 'staff' : c.author_role === 'agent' || c.via_agent === true ? 'us' : 'customer',
             at: typeof c.created_at === 'string' ? Date.parse(c.created_at) / 1000 : undefined,
             text: String(c.plain_body ?? c.body ?? ''),
           }))

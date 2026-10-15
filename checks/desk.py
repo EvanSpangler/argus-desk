@@ -688,8 +688,19 @@ class Desk:
     def wait(self, ticket, timeout_s=1800, poll_s=2.0):
         """Block until the run's phase is terminal; the mod calls this from a command so the turn holds."""
         deadline = time.time() + float(timeout_s)
+        bad, last_err = 0, None
         while True:
-            run = self._run(ticket)
+            # 2026-10-15: one unreadable poll (a torn run.json, a transient OS error) ended the wait with a traceback and
+            # the run looked crashed while its agents ran on. A poll that fails is retried; only a persistent fault returns.
+            try:
+                run = self._run(ticket)
+                bad = 0
+            except (ValueError, OSError) as e:
+                bad, last_err = bad + 1, "%s: %s" % (type(e).__name__, str(e)[:200])
+                if bad >= 5:
+                    return {"ok": False, "phase": None, "reason": "run record unreadable: " + last_err, "ticket": str(ticket)}
+                time.sleep(poll_s)
+                continue
             if run.get("phase") in ("done", "failed"):
                 return {"ok": True, "phase": run["phase"], "ticket": str(ticket)}
             if time.time() >= deadline:

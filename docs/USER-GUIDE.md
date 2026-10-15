@@ -29,6 +29,23 @@ You need Claude Code 2.1.296 or later and `python3` on the workstation.
 To try it for one session without installing, start Claude Code with
 `claude --plugin-dir ~/argus-desk` instead of steps 3 and 4.
 
+## 1a. Upgrade (every later version)
+
+One script does the swap, the checks and the undo, from the copy that is already installed:
+
+1. `bash ~/argus-desk/upgrade.sh --check` says what is installed, which zip is newest in `~/.cache`, and
+   whether this host can fetch the zip itself (`fetch from GitHub: HTTP 200`).
+2. With HTTP 200: `bash ~/argus-desk/upgrade.sh --fetch`. Otherwise download the repository zip in your
+   browser, upload it as in section 1, and run `bash ~/argus-desk/upgrade.sh --from-zip ".cache/<name>.zip"`.
+3. The script renames the old folder `argus-desk.prev-<stamp>`, unpacks the new one and runs gate0. If
+   validate, the plugin tests or the python tests fail, it puts the old version back by itself and keeps the
+   new folder as `argus-desk.failed-<stamp>`; nothing is ever deleted. The last line is `UPGRADE OK <version>`
+   or `UPGRADE ROLLED BACK`.
+4. Restart Claude Code (`/exit`, then your launcher) and run `/desk`.
+
+Undo: `bash ~/argus-desk/upgrade.sh --rollback` restores the newest `argus-desk.prev-*`, then restart.
+Versions before 0.6.3 have no `upgrade.sh`: do the section 1 swap by hand once, after that use the script.
+
 ## 2. Check it is on
 
 Type `/desk`. You should see the Desk pane with "No drafts filed." If `/desk` is an unknown command,

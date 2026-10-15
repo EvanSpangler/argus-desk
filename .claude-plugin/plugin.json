@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -85,8 +85,8 @@
     "agentTools": {
       "type": "string",
       "title": "Agent desk tools",
-      "default": "hooks",
-      "description": "How the spawned agents reach file_draft, skip_ticket, desk_finding and desk_receipt: hooks (the mod answers them) or mcp (an MCP server shipped with the plugin, for a host where a hook does not answer inside agents)."
+      "default": "mcp",
+      "description": "How the spawned agents reach file_draft, skip_ticket, desk_finding and desk_receipt: mcp (an MCP server shipped with the plugin, served by a process; the default since 0.6.2, no settings edit needed) or hooks (the mod answers them in tool.call hooks; on some hosts a hook does not answer inside agents)."
     },
     "investigatorModel": {
       "type": "string",

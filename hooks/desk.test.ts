@@ -341,7 +341,7 @@ test('/desk query sets the search the poller sends, kept in the plugin store, an
   expect(String(show.text)).toMatch(/Search query: type:ticket status<pending assignee:25873958858140/)
 })
 
-test('agentTools=mcp attaches the desk tools to each agent type as an MCP server, so a call inside an agent is served by a process, not a hook', { options: { agentTools: 'mcp', stateDir: '/tmp/desk-mcp-test' } }, async ($, on) => {
+test('by default (agentTools=mcp) the desk tools ride on each agent type as an MCP server, so a call inside an agent is served by a process, not a hook', { options: { stateDir: '/tmp/desk-mcp-test' } }, async ($, on) => {
   const specs: any[] = []
   on('agent.register', async (_$: any, e: any) => { specs.push(e); return { value: { agent: `argus-desk:${e.name}` } } })
   fake(on, () => ({ ok: true, items: [], rows: [], next: null, busy: [] }))
@@ -357,7 +357,7 @@ test('agentTools=mcp attaches the desk tools to each agent type as an MCP server
   expect(inv.tools).toBeUndefined()
 })
 
-test('by default the agent types carry no MCP server and the hook-served desk tools answer', async ($, on) => {
+test('agentTools=hooks leaves the agent types without an MCP server and the hook-served desk tools answer', { options: { agentTools: 'hooks' } }, async ($, on) => {
   const specs: any[] = []
   on('agent.register', async (_$: any, e: any) => { specs.push(e); return { value: { agent: `argus-desk:${e.name}` } } })
   fake(on, () => ({ ok: true, id: 'f-1', items: [], rows: [], next: null, busy: [] }))

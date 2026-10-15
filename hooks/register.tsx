@@ -48,7 +48,8 @@ const opts = (o: Record<string, unknown>): Opts => ({
   docsTool: String(o.docsTool ?? 'enterprise_search'),
   docsSource: String(o.docsSource ?? 'wiz_docs_public'),
   docsHosts: String(o.docsHosts ?? 'docs.wiz.io'),
-  agentTools: String(o.agentTools ?? 'hooks') === 'mcp' ? 'mcp' : 'hooks',
+  // 2026-10-15: mcp by default since 0.6.2, so a host where hooks do not answer inside agents needs no settings edit.
+  agentTools: String(o.agentTools ?? 'mcp') === 'hooks' ? 'hooks' : 'mcp',
   investigatorModel: String(o.investigatorModel ?? 'sonnet'),
   adversaryModel: String(o.adversaryModel ?? 'opus'),
   drafterModel: String(o.drafterModel ?? 'opus'),

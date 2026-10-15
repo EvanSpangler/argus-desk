@@ -258,10 +258,10 @@ Sonnet, the adversary and drafter to Opus.
   says it had no proxy tool or that a desk tool was not answered means the desk was started outside a
   `/desk` command; type `/desk` and `/desk run N` again.
 - **The agents still report "no tool.call hook answered" for desk_receipt or file_draft.** On that host a
-  hook does not answer inside a spawned agent. Switch the agents to the MCP-served desk tools:
-  `bash ~/argus-desk/gate0.sh --mcp` (it sets the plugin option `agentTools` to `mcp` in your Claude settings,
-  under both the `argus-desk` and `argus-desk@inline` keys; `--hooks` switches back), restart `argus`, and run
-  the ticket again. `bash ~/argus-desk/gate0.sh --diag` prints how the plugin is loaded on the host (launcher,
+  hook does not answer inside a spawned agent. Since 0.6.2 the agents get the desk tools from the plugin's
+  own MCP server by default, so this needs no setting: check `bash ~/argus-desk/gate0.sh --diag` shows the
+  plugin's pluginConfigs without `"agentTools": "hooks"`; if an older install set it, `bash ~/argus-desk/gate0.sh
+  --mcp` clears it back (`--hooks` is the opt-out). Restart `argus` and run the ticket again. `bash ~/argus-desk/gate0.sh --diag` prints how the plugin is loaded on the host (launcher,
   env, settings, plugin list) and the agents recorded on each run, for the report. The tools then come from the plugin's own MCP server (`checks/desk_mcp.py`, one per agent
   type, the same record on disk); the main session keeps the hook-served ones. `/desk trace N` shows the
   agent as the author of each finding.

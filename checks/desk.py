@@ -415,6 +415,10 @@ class Desk:
                     agent[key + "_chars"] = len(str(body))
             rows = [a for a in run["agents"] if a["id"] != agent["id"]]
             prev = next((a for a in run["agents"] if a["id"] == agent["id"]), {})
+            if not prev and not agent.get("role"):
+                # an update for an agent this run never spawned (a stray turn.complete): kept, but named for what it is
+                agent.setdefault("role", "unknown")
+                agent.setdefault("label", agent["id"][:24])
             row = dict(prev, **{k: v for k, v in agent.items() if v is not None})
             row.setdefault("started", self.clock())
             if row.get("status") in ("completed", "failed", "killed"):
@@ -847,7 +851,7 @@ def render_audit(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")

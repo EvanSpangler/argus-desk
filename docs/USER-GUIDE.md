@@ -13,11 +13,15 @@ You need Claude Code 2.1.296 or later and `python3` on the workstation.
 
 1. Get the folder onto the workstation, at `~/argus-desk`. Either:
    - in a terminal: `git clone https://github.com/EvanSpangler/argus-desk ~/argus-desk`, or
-   - if the workstation cannot reach GitHub: download the repository zip in your browser, upload it to
-     the workstation (in Code OSS: right-click a folder in Explorer, **Upload...**), and unzip it so the
-     folder is `~/argus-desk`.
+   - if the workstation cannot reach GitHub (the Argus workstation has no outbound internet, so this is
+     the route there): download the repository zip in your browser, upload it to the workstation (in Code
+     OSS Explorer, right-click a folder under your home, not the home row itself, **Upload...**; the file
+     lands in that folder), then in a terminal:
+     `cd ~ && mv <folder>/argus-desk-main.zip . && { [ ! -e argus-desk ] || mv argus-desk argus-desk.prev; } && unzip -q -o argus-desk-main.zip && mv argus-desk-main argus-desk`.
+     Never delete an existing folder to make room; rename it. A zip copy is not a git checkout, so the
+     gate0 line `git` says `not-a-checkout`; that is expected.
 2. Check it, in a terminal: `bash ~/argus-desk/gate0.sh`. Every line starts with `GATE0`. You want
-   `validate ✔ Validation passed`, `plugin test 7 pass 0 fail` and `python tests OK`.
+   `validate ✔ Validation passed`, `plugin test 15 pass 0 fail` and `python tests OK`.
 3. Turn it on: `bash ~/argus-desk/gate0.sh --install`. This adds one line to the `env` block of
    `~/.claude/settings.json` and changes nothing else.
 4. Restart Claude Code (exit and start it again, or open a new terminal tab).
@@ -28,7 +32,10 @@ To try it for one session without installing, start Claude Code with
 ## 2. Check it is on
 
 Type `/desk`. You should see the Desk pane with "No drafts filed." If `/desk` is an unknown command,
-the mod did not load: see Troubleshooting.
+the mod did not load: see Troubleshooting. Type `/desk` once per session anyway: the desk only starts
+runs after a `/desk` command (a run pulled before that waits, and the Queue tab says so). Then
+`/desk poll`: it must name the open tickets or print the proxy's own answer, which is where a wrong
+proxy or endpoint name shows.
 
 ## 3. Daily use
 
@@ -57,8 +64,14 @@ Leave the session open. The desk does the pulling and the investigating; you do 
 3. **Receipts.** An agent can only cite what it actually read: a sentence verbatim from an official
    documentation page the session fetched (`docs`), or the customer's own words from the captured thread
    (`material`). A quote that is not there is refused. The draft's claims are checked against them.
+   Documentation is read through the session's docs search tool (option `docsTool`, default
+   `enterprise_search`, on the data source `docsSource`, default `wiz_docs_public`): every result is on the
+   record and kept as a page under each official URL it carries, so a docs receipt quotes the result and
+   cites one of those URLs. The agents run with every tool the session has; the gate holds on the proxy.
 4. **You read the trace, then decide.** `/desk` opens the pane. Four tabs, keys `1` to `4`, `j`/`k` to
-   scroll, `n` for the next draft:
+   scroll, `n` for the next draft. The keys work while the pane holds the focus: press ctrl+x then tab
+   (or click the pane); typed into the prompt they are just text. Without the focus, use the commands:
+   `/desk wall`, `/desk queue`, `/desk ticket N`, `/desk decide`, and `/desk trace N` for the trace as text.
    - **Wall**: every agent on every ticket, live: role, model, minutes running, its last tool call or
      sentence. This is where you see what it is working through.
    - **Queue**: the open set and where each ticket stands (`new`, `drafting`, `waiting`, `stale`, `sent`,
@@ -161,7 +174,7 @@ typed sign-off).
 `/desk stats` prints: drafts filed, how many were sent as filed, sent after a Modify, or denied, the wait
 from filing to your decision, posts through the gate and how many status transitions the next poll
 confirmed, the queue counts, and how often a HOLD was overruled. This is what the pilot is judged on.
-A run costs one context per agent (eight to fourteen per ticket: three investigators plus any sent back
+A run costs one context per agent (eight to seventeen per ticket: three investigators plus any sent back
 in, the adversary, the drafter, two reviewers per round); the investigators and reviewers default to
 Sonnet, the adversary and drafter to Opus.
 
@@ -178,8 +191,15 @@ Sonnet, the adversary and drafter to Opus.
   `--tools ""`, which hides it.
 - **`Not filed: already filed and undecided`.** That exact text is already waiting in the pane. Decide it.
 - **`Not filed: desk.py exit ...`.** `python3` is missing or failed. Run `python3 --version`.
-- **The poll line says `failed: no invoke_proxy tool`** or names an endpoint error. The session has no
-  `invoke_proxy`, or the endpoint names differ from the defaults: set the plugin's options.
+- **The poll line says `Poll failed: <proxy> <endpoint> answered: ...`** or `Polled 0 ... The proxy
+  answered: ...`. That is the proxy's own reply to the search the desk sent, with the proxy and endpoint
+  names it used. An HTTP 404 or "unknown endpoint" means the names differ from the defaults: set the
+  plugin's options (`/plugin` > argus-desk > configure) to the names your Argus lists for `invoke_proxy`.
+  A `{"results":[]}` means the search query matched nothing: check `searchQuery` against your assignee.
+- **The pane ignores the keys.** It does not hold the focus: press ctrl+x then tab, or use the tab commands.
+- **A run finished in seconds with no receipts.** Look at the Ticket tab or `/desk trace N`: an agent that
+  says it had no proxy tool or that a desk tool was not answered means the desk was started outside a
+  `/desk` command; type `/desk` and `/desk run N` again.
 - **Nothing gets pulled although tickets are open.** The pane shows `poll paused` (`/desk resume`), or a
   ticket is `drafting` or `waiting`: decide it, or `/desk pull N` to force another.
 - **Everything shows `thread: NOT captured`.** The model drafted without reading the comments. Ask it to

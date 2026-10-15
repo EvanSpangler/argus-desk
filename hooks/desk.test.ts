@@ -260,3 +260,52 @@ test('skip_ticket records the reason and frees the queue', async ($, on) => {
   expect(mark!.argv).toContain('skipped')
   expect(mark!.argv).toContain('customer answered their own question')
 })
+
+test('a poll that gets an error body back names the proxy, the endpoint and the proxy\'s own words instead of "Polled 0"', async ($, on) => {
+  fake(on, () => ({ ok: true, items: [], rows: [], next: null, busy: [] }))
+  let answer = '{"error":"HTTP 404: Client error \'404 Not Found\' for url \'https://zendesk-full.example/tickets/search\'"}'
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: {}, text: answer }))
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
+  const r = await $.command.run({ command: 'desk', args: 'poll' })
+  expect(String(r.text)).toMatch(/Poll failed: zendesk-full zendesk_search_tickets answered: .*HTTP 404/)
+  // an empty but healthy answer is reported with the proxy's words too, so a wrong query shows
+  answer = '{"results":[],"count":0}'
+  const r2 = await $.command.run({ command: 'desk', args: 'poll' })
+  expect(String(r2.text)).toMatch(/Polled 0 open ticket\(s\)\. The proxy answered: \{"results":\[\],"count":0\}/)
+})
+
+test('a documentation search is on the record and captured as a page per official URL, so a docs receipt can quote it', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [], rows: [] }))
+  on('tool.call', { tool: 'mcp__argus__enterprise_search' }, async () => ({ result: {}, text: 'Kubernetes connector: the Secrets Manager limit is 100 per account. Source: https://docs.wiz.io/docs/k8s-connector' }))
+  const r = await $.tool.call({ tool: 'mcp__argus__enterprise_search', query: 'secrets manager limit', data_source: 'wiz_docs_public' } as any)
+  expect(r.deny).toBeUndefined()
+  const page = calls.find(c => cmdOf(c) === 'page')
+  expect(page).toBeDefined()
+  expect(JSON.parse(page!.stdin!).source).toBe('https://docs.wiz.io/docs/k8s-connector')
+  expect(JSON.parse(page!.stdin!).body).toMatch(/limit is 100/)
+})
+
+test('the poller\'s pull spawns under the driver a /desk command created; /desk queue switches the tab without a key', async ($, on) => {
+  const clock = mock.clock(on)
+  const store: any[] = []
+  fake(on, r => {
+    const c = cmdOf(r)
+    if (c === 'sync') return { ok: true, rows: [NEXT], next: NEXT, busy: [] }
+    if (c === 'queue') return { ok: true, rows: [NEXT] }
+    if (c === 'trace') return RUN('new', store)
+    if (c === 'run') { const b = JSON.parse(r.stdin!); if (b.agent?.id) store.push(b.agent); return { ok: true } }
+    return { ok: true, items: [], rows: [] }
+  })
+  const spawns: any[] = []
+  on('agent.spawn', async (_$: any, e: any) => { spawns.push(e); return { agentId: `a${spawns.length}`, model: 'sonnet' } })
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: SEARCH, text: JSON.stringify(SEARCH) }))
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
+  // /desk resume is a command: it creates the driver; the poll on the clock then pulls, and the driver spawns
+  await $.command.run({ command: 'desk', args: 'resume' })
+  await clock.advance(5 * 60_000 + 10)
+  await clock.advance(4_000)
+  expect(spawns.map(s => s.description)).toEqual(['investigator #123457 inv1', 'investigator #123457 inv2', 'investigator #123457 inv3'])
+  const r = await $.command.run({ command: 'desk', args: 'queue' })
+  expect(String(r.text)).toMatch(/Desk: queue tab/)
+  expect(String(r.text)).toMatch(/ctrl\+x then tab/)
+})

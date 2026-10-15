@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -111,6 +111,18 @@
       "title": "Review rounds",
       "default": 2,
       "description": "How many times the drafter revises after reviewer objections before the draft goes to the operator (0 to 3)."
+    },
+    "docsTool": {
+      "type": "string",
+      "title": "Docs search tool",
+      "default": "enterprise_search",
+      "description": "The session tool the investigators use for documentation (its result is captured so a docs receipt can quote it); empty turns the docs leg off."
+    },
+    "docsSource": {
+      "type": "string",
+      "title": "Docs data source",
+      "default": "wiz_docs_public",
+      "description": "The data source the investigators are told to search for documentation."
     }
   },
   "author": {

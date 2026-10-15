@@ -67,6 +67,7 @@ export type DeskView = {
   poll: 'on' | 'paused' | 'off'
   lastPoll?: number
   pollError?: string
+  lastResult?: string
   tab: 'wall' | 'queue' | 'ticket' | 'decide'
   scroll: number
 }

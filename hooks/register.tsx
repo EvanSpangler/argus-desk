@@ -28,7 +28,7 @@ type Opts = {
   stateDir: string; python: string; outwardTool: string
   pollMinutes: number; readProxy: string; writeProxy: string; searchEndpoint: string; searchQuery: string
   commentsEndpoint: string; ticketEndpoint: string; updateEndpoint: string; sendStatus: string
-  docsHosts: string; investigatorModel: string; adversaryModel: string; drafterModel: string; reviewerModel: string; maxRounds: number
+  docsTool: string; docsSource: string; docsHosts: string; investigatorModel: string; adversaryModel: string; drafterModel: string; reviewerModel: string; maxRounds: number
 }
 
 const opts = (o: Record<string, unknown>): Opts => ({
@@ -44,6 +44,8 @@ const opts = (o: Record<string, unknown>): Opts => ({
   ticketEndpoint: String(o.ticketEndpoint ?? 'zendesk_get_ticket'),
   updateEndpoint: String(o.updateEndpoint ?? 'zendesk_update_ticket'),
   sendStatus: STATUSES.includes(String(o.sendStatus)) ? String(o.sendStatus) : 'pending',
+  docsTool: String(o.docsTool ?? 'enterprise_search'),
+  docsSource: String(o.docsSource ?? 'wiz_docs_public'),
   docsHosts: String(o.docsHosts ?? 'docs.wiz.io'),
   investigatorModel: String(o.investigatorModel ?? 'sonnet'),
   adversaryModel: String(o.adversaryModel ?? 'opus'),
@@ -184,11 +186,12 @@ async function decide($: any, o: Opts, md5: string, decision: 'send' | 'deny' | 
 // ---- the run: one investigation, a tree of subagents, awaited through the Agent tool so the turn that started
 // it holds until the drafter has filed (a `claude -p` session stays alive for it; a timer dispatch too).
 
-const toolNames = (o: Opts): string[] => [outwardName ?? `mcp__argus__${o.outwardTool}`, `mcp__argus-desk__${FINDING}`, `mcp__argus-desk__${RECEIPT}`, `mcp__argus-desk__${TOOL}`, `mcp__argus-desk__${SKIP}`]
+// 2026-10-15, workstation: a `tools` list on the agent type left the subagents without the proxy tool (its real name is only known
+// once the session lists its tools), so the types name none and inherit every tool the session has; the gate holds on the outward one.
 
 const readingRules = (o: Opts, ticket: string): string =>
   `Read with ${o.outwardTool}: proxy ${o.readProxy}, endpoint ${o.commentsEndpoint} with arguments {"ticket_id":"${ticket}"} for every comment, ` +
-  `endpoint ${o.ticketEndpoint} for the ticket, and the docs or product proxies for anything else. You may not post, comment, or change anything. ` +
+  `endpoint ${o.ticketEndpoint} for the ticket. For documentation call ${o.docsTool} with data source ${o.docsSource}; a docs receipt may cite only a page URL that appears in that result. You may not post, comment, or change anything. ` +
   `Every fact you will rely on must be receipted the moment you read it: call ${RECEIPT} with kind "docs" and the sentence verbatim from the ` +
   `page plus its URL, or kind "material" and the customer's words verbatim. A receipt that is refused means you did not actually read it; do not rely on it. ` +
   `Record what you conclude with ${FINDING} (kind hypothesis, evidence, counter), naming the receipt ids that carry it.`
@@ -366,8 +369,12 @@ const pending = new Set<string>()
 let driver: { cancel: () => void } | undefined
 let driving = false
 
-function startDriver($: any, o: Opts): void {
+function startDriver($: any, o: Opts, lineage: 'command' | 'hook' = 'hook'): void {
   if (driver) return
+  // 2026-10-15, workstation: a driver created in session.start spawned agents whose desk tool calls no hook answered
+  // ("no tool.call hook answered this call"), the same lineage fault as a spawn from turn.complete. Only a command's
+  // dispatch creates the driver; a hook only marks, and the next /desk command starts it.
+  if (lineage !== 'command') return
   driver = $.clock.every(2_000, () => {
     void (async () => {
       if (driving || !pending.size) return
@@ -385,8 +392,8 @@ function startDriver($: any, o: Opts): void {
 }
 
 /** Start the run on one ticket: mark it, set the phase, and leave the first spawn to the driver. */
-function pull($: any, o: Opts, ticket: string, why: string): void {
-  startDriver($, o)
+function pull($: any, o: Opts, ticket: string, why: string, lineage: 'command' | 'hook' = 'hook'): void {
+  startDriver($, o, lineage)
   $.clock.after(1, () => {
     void (async () => {
       await desk($, o, ['mark', '--ticket', ticket, '--state', 'drafting'])
@@ -412,26 +419,33 @@ async function findOutward($: any, o: Opts): Promise<string | undefined> {
 }
 
 /** One poll: the open set, folded into the queue; then the next ticket, if nothing is being worked. */
-async function tick($: any, o: Opts, force = false): Promise<{ polled: number; pulled?: string; error?: string }> {
+async function tick($: any, o: Opts, force = false): Promise<{ polled: number; pulled?: string; error?: string; head?: string }> {
   let text = ''
   try {
     const name = await findOutward($, o)
     const r = await $.tool.call({ tool: name, proxy: o.readProxy, endpoint: o.searchEndpoint, arguments: { query: o.searchQuery, sort_by: 'created_at', sort_order: 'asc' } })
-    if (r.deny || r.isError) return { polled: 0, error: String(r.deny ?? r.text ?? 'search failed').slice(0, 160) }
+    if (r.deny || r.isError) return { polled: 0, error: `${o.readProxy} ${o.searchEndpoint}: ${String(r.deny ?? r.text ?? 'search failed').replace(/\s+/g, ' ').slice(0, 200)}` }
     text = String(r.text ?? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result ?? '')))
   } catch (err) {
-    return { polled: 0, error: String(err).slice(0, 160) }
+    return { polled: 0, error: `${o.readProxy} ${o.searchEndpoint}: ${String(err).slice(0, 200)}` }
   }
+  const head = text.replace(/\s+/g, ' ').slice(0, 200)
   const tickets = ticketsIn(text)
+  // 2026-10-15, workstation: the proxy answered an error body as a normal result and the desk said "Polled 0". The proxy's
+  // own words, with the proxy and endpoint tried, are the result the operator needs.
+  if (!tickets.length && /"error"|HTTP \d{3}|not found|unauthori|forbidden|denied|invalid|unknown endpoint/i.test(text)) {
+    await update($, view, x => ({ ...x, lastPoll: Date.now(), pollError: head, lastResult: head }))
+    return { polled: 0, error: `${o.readProxy} ${o.searchEndpoint} answered: ${head}` }
+  }
   const v = await desk($, o, ['sync'], JSON.stringify({ tickets }))
-  await update($, view, x => ({ ...x, lastPoll: Date.now(), pollError: undefined }))
+  await update($, view, x => ({ ...x, lastPoll: Date.now(), pollError: undefined, lastResult: head }))
   const next = v.next as QueueRow | undefined
   if (v.ok && next && (force || (await read($, view)).poll === 'on')) {
     pull($, o, next.ticket, next.sla ? `SLA ${next.sla}` : next.state === 'reopened' ? 'the customer answered' : next.state === 'stale' ? 'pulled before, nothing filed' : `open ${Math.round(next.age_s / 60)} min`)
     return { polled: tickets.length, pulled: next.ticket }
   }
   await refresh($, o)
-  return { polled: tickets.length }
+  return { polled: tickets.length, head }
 }
 
 /** The tickets in a search result, whatever the proxy wraps them in. */
@@ -549,10 +563,9 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     await findOutward($, o)
-    const tools = toolNames(o)
     for (const role of ROLES) {
       try {
-        await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.`, tools, model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
+        await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.`, model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
       } catch {
         /* a host without agent types: the role prompt rides in the task and the gate still holds */
       }
@@ -562,7 +575,6 @@ export const register: Register = (on, options) => {
       await refresh($, o)
       if (e.surface === 'terminal') void $.ui.open({ id: PANE, title: 'Desk' })
       startPolling($, o)
-      startDriver($, o)
     }
     return next(e)
   })
@@ -607,6 +619,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'desk' }, async ($, e) => {
     const args = (e.args ?? '').trim()
+    startDriver($, o, 'command')
     if (/^stats\b/.test(args)) {
       const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'stats', '--text'], { timeoutMs: 60_000 })
       return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${r.stderr.slice(0, 300)}` }
@@ -624,7 +637,7 @@ export const register: Register = (on, options) => {
     }
     if (/^run\s+#?\d+$/.test(args)) {
       const t = args.replace(/^run\s+#?/, '')
-      pull($, o, t, 'run by the operator')
+      pull($, o, t, 'run by the operator', 'command')
       // Hold the turn until the run ends: a $ call in flight costs the hook nothing, and the host caps one process
       // at ten minutes, so the wait is a loop of them (up to ~45 min).
       let w: Record<string, unknown> = {}
@@ -643,21 +656,29 @@ export const register: Register = (on, options) => {
     }
     if (/^pull\s+#?\d+$/.test(args)) {
       const t = args.replace(/^pull\s+#?/, '')
-      pull($, o, t, 'pulled by the operator')
+      pull($, o, t, 'pulled by the operator', 'command')
       return { text: `Pulled #${t}: the run starts now; watch the Wall.` }
     }
     if (args === 'poll') {
       const t = await tick($, o, true)
-      return { text: t.error ? `Poll failed: ${t.error}` : `Polled ${t.polled} open ticket(s)${t.pulled ? `, pulled #${t.pulled}` : ''}.` }
+      return { text: t.error ? `Poll failed: ${t.error}` : `Polled ${t.polled} open ticket(s)${t.pulled ? `, pulled #${t.pulled}` : ''}.${t.polled ? '' : ` The proxy answered: ${t.head ?? '(empty)'}`}` }
     }
     if (args === 'pause' || args === 'resume') {
       await update($, view, v => ({ ...v, poll: args === 'pause' ? 'paused' : 'on' }))
       if (args === 'resume') startPolling($, o)
       return { text: args === 'pause' ? 'Polling paused; /desk resume to start it again.' : 'Polling on.' }
     }
+    if (/^(wall|queue|decide)$/.test(args) || /^ticket(\s+#?\d+)?$/.test(args)) {
+      const tab = args.split(/\s+/)[0] as DeskView['tab']
+      const t = args.replace(/^ticket\s+#?/, '')
+      await update($, view, v => ({ ...v, tab, scroll: 0, ...(tab === 'ticket' && /^\d+$/.test(t) ? { ticket: t } : {}) }))
+      await refresh($, o)
+      try { await $.ui.open({ id: PANE, title: 'Desk', focus: true }) } catch { /* a host without a pane: the tab is set for when one draws */ }
+      return { text: `Desk: ${tab} tab. The keys (1 to 4, j, k, n, s, v, m, d) work while the pane holds the focus: press ctrl+x then tab, or click it; /desk trace N prints the trace as text.` }
+    }
     const items = await refresh($, o)
     await $.ui.open({ id: PANE, title: 'Desk', focus: true })
-    return { text: items.length ? `${items.length} draft(s) waiting at the desk.` : 'Nothing waiting at the desk.' }
+    return { text: `${items.length ? `${items.length} draft(s) waiting at the desk.` : 'Nothing waiting at the desk.'}${pending.size ? ` ${pending.size} run(s) start now.` : ''}` }
   })
 
   // 1. filing: the drafter hands over the exact text and its citations; the desk checks and records it.
@@ -713,7 +734,20 @@ export const register: Register = (on, options) => {
   }).catch(() => ({ deny: 'argus-desk: the receipt was not minted, try again' }))
 
   // 2. the gate: an outward call passes only by spending an open grant on the exact text it carries.
+  // A documentation search (enterprise_search by default): the result is a call on the record and a page per official URL it
+  // carries, so a docs receipt can quote it. No outbound internet on the workstation; this is the docs leg there.
   on('tool.call', async ($, e, next) => {
+    if (o.docsTool && String(e.tool).includes(o.docsTool) && !String(e.tool).includes(o.outwardTool)) {
+      const ran = (await next(e)) as { text?: string; result?: unknown; isError?: boolean }
+      const agentId = (e as { agentId?: string }).agentId
+      const who = agentId ? active.get(agentId) : undefined
+      const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
+      const text = ran?.text ?? (typeof ran?.result === 'string' ? ran.result : ran?.result ? JSON.stringify(ran.result) : '')
+      if (agentId) await wallLine($, o, agentId, 'docs', JSON.stringify(args).slice(0, 100))
+      if (who) await desk($, o, ['call'], JSON.stringify({ ticket: who.ticket, agent: who.label, tool: String(e.tool), args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
+      if (text) for (const url of docsUrls(o, text)) await desk($, o, ['page'], JSON.stringify({ source: url, body: text }))
+      return ran
+    }
     if (!String(e.tool).includes(o.outwardTool)) return next(e)
     outwardName = String(e.tool)
     const agentId = (e as { agentId?: string }).agentId
@@ -801,7 +835,8 @@ export const register: Register = (on, options) => {
         }
       }
     } else if (v.tab === 'queue') {
-      add('q0', `poll ${v.poll}${v.lastPoll ? `, last ${Math.round((Date.now() - v.lastPoll) / 60000)} min ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}`, undefined, true)
+      add('q0', `poll ${v.poll}${v.lastPoll ? `, last ${Math.round((Date.now() - v.lastPoll) / 60000)} min ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, undefined, true)
+      if (v.lastResult && !v.pollError) add('q0r', `  proxy answered: ${cut(v.lastResult, width - 20)}`, undefined, true)
       if (!v.queue.length) add('q1', 'No open tickets seen.', undefined, true)
       for (const q of v.queue) add(`q-${q.ticket}`, `#${q.ticket} ${q.state}${q.sla ? ` SLA ${q.sla.slice(5, 16)}` : ''} ${Math.round(q.age_s / 60)}m  ${cut(q.subject ?? '', width - 36)}`, undefined, q.state === 'skipped' || q.state === 'sent')
     } else if (v.tab === 'ticket') {

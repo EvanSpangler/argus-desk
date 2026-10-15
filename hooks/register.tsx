@@ -309,18 +309,49 @@ async function advance($: any, o: Opts, ticket: string): Promise<void> {
 
 /** After Modify: one more drafter pass with the operator's note, then the usual review. */
 async function redraft($: any, o: Opts, ticket: string, md5: string, note: string): Promise<void> {
-  await desk($, o, ['run'], JSON.stringify({ ticket, phase: 'draft' }))
-  await spawnRole($, o, ticket, 'drafter', `redraft-${Date.now() % 1000}`, `Revise draft ${md5}. The operator's note: ${note || '(none)'}. File the new text with supersedes=${md5}.`, o.drafterModel)
+  await desk($, o, ['run'], JSON.stringify({ ticket, phase: 'adversary', agent: { id: `operator-${Date.now()}`, role: 'adversary', label: 'operator', status: 'completed', summary: `Modify: ${note || '(none)'}; revise draft ${md5} with supersedes=${md5}.` } }))
+  startDriver($, o)
+  pending.add(ticket)
 }
 
-/** Start the run on one ticket from a timer dispatch of its own. */
+/**
+ * Runs that need advancing, and the driver that advances them. Every spawn is made from the driver's own timer
+ * dispatch: a subagent spawned from inside a hook's dispatch (a turn.complete, through a timer it set) ran with
+ * none of this plugin's hooks answering its tool calls (seen 2026-10-15: "no tool.call hook answered"), while one
+ * spawned from a timer set by a command ran with all of them. So no hook spawns; hooks only mark, and the driver,
+ * started by a command or the session start, does the spawning.
+ */
+const pending = new Set<string>()
+let driver: { cancel: () => void } | undefined
+let driving = false
+
+function startDriver($: any, o: Opts): void {
+  if (driver) return
+  driver = $.clock.every(2_000, () => {
+    void (async () => {
+      if (driving || !pending.size) return
+      driving = true
+      try {
+        for (const ticket of [...pending]) {
+          pending.delete(ticket)
+          await advance($, o, ticket)
+        }
+      } finally {
+        driving = false
+      }
+    })().catch(() => { driving = false })
+  })
+}
+
+/** Start the run on one ticket: mark it, set the phase, and leave the first spawn to the driver. */
 function pull($: any, o: Opts, ticket: string, why: string): void {
+  startDriver($, o)
   $.clock.after(1, () => {
     void (async () => {
       await desk($, o, ['mark', '--ticket', ticket, '--state', 'drafting'])
       await desk($, o, ['run'], JSON.stringify({ ticket, phase: 'new' }))
       await desk($, o, ['event'], JSON.stringify({ ticket, agent: 'desk', kind: 'phase', text: `pulled (${why})` }))
-      await advance($, o, ticket)
+      pending.add(ticket)
     })().catch(() => undefined)
   })
 }
@@ -490,6 +521,7 @@ export const register: Register = (on, options) => {
       await refresh($, o)
       if (e.surface === 'terminal') void $.ui.open({ id: PANE, title: 'Desk' })
       startPolling($, o)
+      startDriver($, o)
     }
     return next(e)
   })
@@ -527,7 +559,7 @@ export const register: Register = (on, options) => {
       active.delete(id)
       await desk($, o, ['run'], JSON.stringify({ ticket: a.ticket, agent: { id, status, summary: text.slice(0, 600) } }))
       await update($, view, v => ({ ...v, wall: v.wall.map(w => (w.id === id ? { ...w, status, last: text.slice(0, 160) } : w)) }))
-      $.clock.after(1, () => void advance($, o, a.ticket).catch(() => undefined))
+      pending.add(a.ticket)
     }
     return next(e)
   })

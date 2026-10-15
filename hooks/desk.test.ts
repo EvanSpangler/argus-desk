@@ -145,13 +145,13 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
   expect(searches[0].endpoint).toBe('zendesk_search_tickets')
   const sync = calls.find(c => cmdOf(c) === 'sync')
   expect(JSON.parse(sync!.stdin!).tickets.map((t: any) => t.id)).toEqual(['123456', '123457'])
-  // the run starts from a timer dispatch: three investigators first
-  await clock.advance(5)
+  // the run starts from the driver's timer: three investigators first
+  await clock.advance(2_100)
   expect(calls.find(c => cmdOf(c) === 'mark')!.argv).toContain('drafting')
   expect(spawns.map(s => s.description)).toEqual(['investigator #123457 inv1', 'investigator #123457 inv2', 'investigator #123457 inv3'])
   expect(spawns[0].prompt).toMatch(/investigate Zendesk ticket #123457/)
   expect(spawns[0].prompt).toMatch(/desk_receipt/)
-  const finish = async (label: string, answer: string) => { const id = store.agents.find(a => a.label === label && a.status === 'running')!.id; await $.turn.complete({ agentId: id, answer, reason: 'answer', durationMs: 1, isAborted: false, turnId: `t-${id}` } as any); await clock.advance(5) }
+  const finish = async (label: string, answer: string) => { const id = store.agents.find(a => a.label === label && a.status === 'running')!.id; await $.turn.complete({ agentId: id, answer, reason: 'answer', durationMs: 1, isAborted: false, turnId: `t-${id}` } as any); await clock.advance(2_100) }
   await finish('inv1', 'cause: label'); await finish('inv2', 'evidence thin')
   expect(spawns.length).toBe(3, 'nothing moves until every investigator is done')
   await finish('inv3', 'history clean')

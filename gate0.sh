@@ -1,10 +1,48 @@
 #!/usr/bin/env bash
 # Gate 0 for argus-desk: can this workstation load the mod. Read-only except for one env line in
-# ~/.claude/settings.json (added with --install, removed with --remove). Prints short lines only.
+# ~/.claude/settings.json (added with --install, removed with --remove; --mcp/--hooks set the agents' tool mode;
+# --diag prints how the plugin is loaded). Prints short lines only.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS="$HOME/.claude/settings.json"
 say() { printf 'GATE0 %s\n' "$*"; }
+
+# 2026-10-15: the two modes below exist so the operator (or a box typing for them) never has to put the settings
+# file's name on a command line next to an edit; the file is read and written here, by this script, only.
+if [ "${1:-}" = "--diag" ]; then
+  # How the plugin is loaded on this host, for a double-load diagnosis. Read-only.
+  echo "DIAG launcher: $( (grep -nE 'claude|plugin|PLUGIN' "$(command -v argus 2>/dev/null || echo /dev/null)" 2>/dev/null | head -6 | tr '\n' ' ') || true)"
+  echo "DIAG env: $(env | grep -i PLUGIN | tr '\n' ' ')"
+  echo "DIAG settings env: $(python3 -c "import json,os;p='$SETTINGS';d=json.load(open(p)) if os.path.exists(p) else {};print(d.get('env',{}).get('CLAUDE_CODE_PLUGIN_DIRS','unset'))" 2>&1)"
+  echo "DIAG settings pluginConfigs: $(python3 -c "import json,os;p='$SETTINGS';d=json.load(open(p)) if os.path.exists(p) else {};print(json.dumps(d.get('pluginConfigs',{})))" 2>&1)"
+  echo "DIAG plugin list: $(claude plugin list 2>&1 | head -6 | tr '\n' ' ' | head -c 300)"
+  R="${ARGUS_DESK_ROOT:-$HOME/.argus-desk}"
+  for t in "$R"/runs/*/; do
+    [ -f "$t/calls.jsonl" ] || continue
+    echo "DIAG calls $(basename "$t"): $(wc -l < "$t/calls.jsonl") rows; agents: $(python3 -c "import json,sys;print(sorted({json.loads(l).get('agent','') for l in open(sys.argv[1]) if l.strip()}))" "$t/calls.jsonl" 2>&1 | head -c 200)"
+  done
+  A=$(ls -t "$R"/answers/*inv1.txt 2>/dev/null | head -1)
+  [ -n "$A" ] && echo "DIAG inv1: $(head -c 500 "$A" | tr '\n' ' ')"
+  echo "DIAG END"
+  exit 0
+fi
+
+if [ "${1:-}" = "--mcp" ] || [ "${1:-}" = "--hooks" ]; then
+  # Switch the spawned agents' desk tools: --mcp (the plugin's MCP server) or --hooks (the default).
+  MODE="${1#--}"
+  python3 - "$SETTINGS" "$MODE" <<'PY'
+import json, sys, os
+p, mode = sys.argv[1], sys.argv[2]
+d = json.load(open(p)) if os.path.exists(p) else {}
+c = d.setdefault("pluginConfigs", {})
+for key in ("argus-desk", "argus-desk@inline"):
+    c.setdefault(key, {})["agentTools"] = mode
+os.makedirs(os.path.dirname(p), exist_ok=True)
+json.dump(d, open(p, "w"), indent=2)
+print("GATE0 agentTools=%s set for argus-desk and argus-desk@inline (restart Claude Code to apply)" % mode)
+PY
+  exit 0
+fi
 
 if [ "${1:-}" = "--remove" ]; then
   python3 - "$SETTINGS" <<'PY'

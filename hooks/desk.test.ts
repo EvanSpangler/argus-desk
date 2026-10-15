@@ -61,9 +61,11 @@ test('fails closed: a write on any proxy, or a call with no endpoint, needs a gr
   expect(chat.deny).toMatch(/argus-desk/)
   const bare = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full' } as any)
   expect(bare.deny).toMatch(/argus-desk/)
+  expect(bare.deny).toMatch(/no comment body/)
   const read = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_search_tickets', arguments: '{"query":"status:open"}' } as any)
   expect(read.deny).toBeUndefined()
-  expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(2)
+  // the chat post carried a text body and went to the gate; the bare call carried none and never reached it
+  expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(1)
 })
 
 test('file_draft files through desk.py and tells the model to wait', async ($, on) => {
@@ -234,22 +236,31 @@ test('a granted post without the chosen status is refused with the grant left op
   const calls = fake(on, r => {
     if (cmdOf(r) !== 'consume') return { ok: true, items: [], rows: [] }
     consumes++
-    const flat = JSON.parse(r.stdin!).flat as string
-    return /"status":"pending"/.test(flat) ? { ok: true, md5: ITEM.md5, ticket: '123456', status: 'pending' } : { ok: false, code: 'status-missing', md5: ITEM.md5, status: 'pending' }
+    const body = JSON.parse(r.stdin!) as { status?: string; candidates: string[] }
+    expect(body.candidates).toEqual([DRAFT])
+    return body.status === 'pending' ? { ok: true, md5: ITEM.md5, ticket: '123456', status: 'pending' } : { ok: false, code: 'status-missing', md5: ITEM.md5, status: 'pending', given: body.status }
   })
   const seen: any[] = []
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async (_$: any, e: any) => {
     seen.push(e)
-    return e.endpoint === 'zendesk_get_ticket' ? { result: {}, text: '{"ticket":{"id":123456,"status":"pending"}}' } : { result: { posted: true }, text: '{"ok":true}' }
+    return e.endpoint === 'zendesk_get_ticket' ? { result: {}, text: '{"ticket":{"id":123456,"status":"pending","updated_at":"2026-10-15T03:00:00Z"}}' } : { result: { posted: true }, text: '{"ok":true}' }
   })
   const bare = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, comment: { body: DRAFT, public: true } } } as any)
   expect(bare.deny).toMatch(/status set to "pending"/)
+  expect(bare.deny).toMatch(/sets no status/)
   expect(seen.length).toBe(0)
+  // a status in a nested unrelated field is not the ticket's status
+  const nested = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, comment: { body: DRAFT, public: true, metadata: { status: 'pending' } } } } as any)
+  expect(nested.deny).toMatch(/status set to "pending"/)
   const full = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, ticket: { status: 'pending', comment: { body: DRAFT, public: true } } } } as any)
   expect(full.deny).toBeUndefined()
-  expect(consumes).toBe(2)
+  expect(consumes).toBe(3)
   expect(seen.map(e => e.endpoint)).toEqual(['zendesk_update_ticket', 'zendesk_get_ticket'])
-  expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(2)
+  // the readback's updated_at is recorded as the line a customer answer must cross before the ticket counts as reopened
+  const mark = calls.find(c => cmdOf(c) === 'mark' && c.argv.includes('--updated'))
+  expect(mark).toBeDefined()
+  expect(mark!.argv).toContain('2026-10-15T03:00:00Z')
+  expect(mark!.argv).toContain('sent')
 })
 
 test('skip_ticket records the reason and frees the queue', async ($, on) => {
@@ -283,6 +294,7 @@ test('a documentation search is on the record and captured as a page per officia
   expect(page).toBeDefined()
   expect(JSON.parse(page!.stdin!).source).toBe('https://docs.wiz.io/docs/k8s-connector')
   expect(JSON.parse(page!.stdin!).body).toMatch(/limit is 100/)
+  expect(JSON.parse(page!.stdin!).origin).toBe('search')
 })
 
 test('the poller\'s pull spawns under the driver a /desk command created; /desk queue switches the tab without a key', async ($, on) => {
@@ -356,4 +368,49 @@ test('by default the agent types carry no MCP server and the hook-served desk to
   expect(specs.every(s => s.mcpServers === undefined)).toBe(true)
   const r = await $.tool.call({ tool: 'mcp__argus-desk__desk_finding', ticket: '123456', kind: 'hypothesis', text: 'x' } as any)
   expect(String(r.result)).toMatch(/Recorded f-1 \(hypothesis\)/)
+})
+
+test('the gate reads the comment body, not every string: granted text in a tag does not carry an ungranted body', async ($, on) => {
+  const calls = fake(on, r => (cmdOf(r) === 'consume' ? { ok: false, tried: [], undecided: [ITEM.md5] } : { ok: true, items: [ITEM] }))
+  const r = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, ticket: { status: 'pending', tags: [DRAFT], comment: { body: 'Something the operator never saw, long enough to count.', public: true } } } } as any)
+  expect(r.deny).toMatch(/no text the operator has granted/)
+  const consume = calls.find(c => cmdOf(c) === 'consume')
+  expect(JSON.parse(consume!.stdin!).candidates).toEqual(['Something the operator never saw, long enough to count.'])
+  expect(JSON.parse(consume!.stdin!).status).toBe('pending')
+})
+
+test('a granted body beside a second body, or marked not public, is refused with the grant left open', async ($, on) => {
+  const calls = fake(on, r => (cmdOf(r) === 'consume' ? { ok: false, code: 'body-mismatch', md5: ITEM.md5 } : { ok: true, items: [ITEM] }))
+  let posted = 0
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => { posted++; return { result: { posted: true } } })
+  const two = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, ticket: { status: 'pending', comment: { body: DRAFT, html_body: '<p>other</p>', public: true } } } } as any)
+  expect(two.deny).toMatch(/another body text besides it/)
+  expect(JSON.parse(calls.find(c => cmdOf(c) === 'consume')!.stdin!).candidates).toEqual([DRAFT, '<p>other</p>'])
+  const internal = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, ticket: { status: 'pending', comment: { body: DRAFT, public: false } } } } as any)
+  expect(internal.deny).toMatch(/must be a public comment/)
+  expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(1, 'an internal note never reaches the gate')
+  expect(posted).toBe(0)
+})
+
+test('the record guard: a shell command or a file edit naming desk.py or the state directory is refused; other commands pass', async ($, on) => {
+  fake(on, () => ({ ok: true, items: [], rows: [] }))
+  const ran: string[] = []
+  on('tool.call', { tool: 'Bash' }, async (_$: any, e: any) => { ran.push(e.command); return { result: 'ok' } })
+  on('tool.call', { tool: 'Write' }, async (_$: any, e: any) => { ran.push(e.file_path); return { result: 'ok' } })
+  const grant = await $.tool.call({ tool: 'Bash', command: 'python3 ~/argus-desk/checks/desk.py --root ~/.argus-desk grant --md5 a1b2 --press-id x' } as any)
+  expect(grant.deny).toMatch(/only the desk may write/)
+  const ledger = await $.tool.call({ tool: 'Write', file_path: '/home/op/.argus-desk/ledger.jsonl', content: '{}' } as any)
+  expect(ledger.deny).toMatch(/only the desk may write/)
+  const mcp = await $.tool.call({ tool: 'Bash', command: 'echo | python3 checks/desk_mcp.py --root /tmp/x' } as any)
+  expect(mcp.deny).toMatch(/only the desk may write/)
+  const ls = await $.tool.call({ tool: 'Bash', command: 'ls -la ~/argus-desk/docs' } as any)
+  expect(ls.deny).toBeUndefined()
+  expect(ran).toEqual(['ls -la ~/argus-desk/docs'])
+})
+
+test('guardRecord=false lets a shell command name the desk (for working on the desk itself)', { options: { guardRecord: false } }, async ($, on) => {
+  fake(on, () => ({ ok: true, items: [], rows: [] }))
+  on('tool.call', { tool: 'Bash' }, async () => ({ result: 'ok' }))
+  const r = await $.tool.call({ tool: 'Bash', command: 'python3 -I checks/desk.py --root /tmp/t list' } as any)
+  expect(r.deny).toBeUndefined()
 })

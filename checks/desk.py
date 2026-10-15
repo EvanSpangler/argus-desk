@@ -12,7 +12,7 @@ Subcommands (JSON in on stdin where noted, JSON out on stdout, exit 0 unless the
   grant     --md5 --press-id                                   -> operator pressed Send
   deny      --md5 --reason                                     -> operator pressed Deny
   modify    --md5 --note                                       -> operator asked for a change (returned)
-  consume   stdin {candidates:[text], what}                    -> the send gate: spends an open grant
+  consume   stdin {candidates:[body text], what, status}       -> the send gate: spends an open grant
   capture   stdin {ticket, messages:[{id,who,at,text}], count} -> records the live thread + receipt
   stats                                                        -> the economics table
 """
@@ -31,7 +31,16 @@ for _h in os.environ.get("ARGUS_DESK_DOCS_HOSTS", "").split(","):
 FINDING_KINDS = ("hypothesis", "evidence", "counter", "objection", "answer", "summary")
 STATUSES = ("pending", "solved", "open", "on-hold")   # the Zendesk status a Send may set
 STALE_S = 30 * 60                                     # a pull with nothing filed after this is offered again
+SENT_GRACE_S = 120                                    # our own post moves updated_at; a move within this of the Send is ours
 DASH = re.compile("[–—]")
+
+
+def _iso_epoch(s):
+    """Epoch seconds of an ISO 8601 timestamp as Zendesk writes it (2026-10-15T01:00:00Z), else None."""
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
 TIMELINE = re.compile(r"\b(shortly|soon|asap|as soon as possible|by (?:end of|eod|tomorrow|monday|tuesday|wednesday|thursday|friday)|within (?:the )?(?:hour|day|\d+ (?:hours|days)))\b", re.I)
 
 
@@ -204,9 +213,8 @@ class Desk:
         return out
 
     # The floor that applies without the operator's exported rules: what the fleet blocks on every channel.
+    # (Dashes are the `dash` lint above, not a voice rule, so one dash is one hit.)
     BUILTIN_VOICE = [
-        {"id": "em-dash", "pattern": "\u2014", "severity": "block"},
-        {"id": "en-dash", "pattern": "\u2013", "severity": "block"},
         {"id": "absolutely-right", "pattern": "you(?:'re| are) absolutely right", "severity": "block"},
         {"id": "hope-finds-you-well", "pattern": "hope this (?:email|message|note) finds you well", "severity": "block"},
         {"id": "template-placeholder", "pattern": "\\[(?:name|customer|date|link|insert[^\\]]*)\\]|<(?:name|customer|link)>", "severity": "block"},
@@ -259,7 +267,7 @@ class Desk:
         if not text.strip():
             return {"ok": False, "reason": "draft is empty"}
         st = self.ledger.state(md5)
-        if st["state"] in ("pending", "open", "held"):
+        if st["state"] in ("pending", "open"):
             return {"ok": False, "reason": "already filed and undecided", "md5": md5}
         checks = self.checks(str(ticket), text)
         target = "Zendesk #%s public reply" % ticket
@@ -276,10 +284,14 @@ class Desk:
                 "warnings": checks["warnings"], "claims": checks["claims"], "thread": checks["thread"]}
 
     def list(self):
+        """The drafts waiting for a decision. A request undecided past the ledger's REQUEST_TTL_S (24 h) and
+        a grant past its 6 h life are written off first, so the desk shows what the guide says it shows."""
+        self.ledger.sweep()
+        events = self.ledger.events()
         items = []
         for md5, r in self._requests().items():
-            st = self.ledger.state(md5)
-            if st["state"] in ("pending", "open", "held"):
+            st = self.ledger.state(md5, events=events)
+            if st["state"] in ("pending", "open"):
                 items.append({"md5": md5, "ticket": r["ticket"], "state": st["state"], "source": r.get("source"),
                               "filed": r["ts"], "age_s": int(self.clock() - r["ts"]), "chars": r.get("chars"),
                               "checks": r["checks"], "text": r["text"], "supersedes": r.get("supersedes")})
@@ -323,7 +335,7 @@ class Desk:
         if not req:
             return {"ok": False, "reason": "unknown md5"}
         st = self.ledger.state(md5)
-        if st["state"] not in ("pending", "open", "held"):
+        if st["state"] not in ("pending", "open"):
             return {"ok": False, "reason": "not undecided: " + st["state"]}
         self.ledger._append({"event": "withdraw", "md5": md5, "by": OPERATOR, "reason": "modify: " + (note or "")})
         self._decide(md5, req, "modify", note)
@@ -343,30 +355,35 @@ class Desk:
                 return row.get("status")
         return None
 
-    def consume(self, candidates, what, flat=""):
-        """The send gate. Each candidate is a text the outward call carries; the first whose md5 has an open
-        grant is consumed. Nothing else gets through. `flat` is the whole call as JSON: the post must also
-        set the status the Send chose, or it is refused with the grant left open."""
+    def consume(self, candidates, what, status=None):
+        """The send gate. `candidates` are the comment bodies the outward call carries (the mod extracts them
+        from the body-like fields, nothing else). One of them must have an open grant, every other body in the
+        call must be that same text, and `status` (the ticket status the call sets) must be the one the Send
+        chose. Anything else is refused with the grant left open."""
         tried = []
-        for cand in candidates or []:
-            if not isinstance(cand, str):
-                continue
+        events = self.ledger.events()
+        bodies = [c for c in (candidates or []) if isinstance(c, str)]
+        for cand in bodies:
             for text in {cand, _norm_draft(cand)}:
                 md5 = md5_of(text)
-                st = self.ledger.state(md5)["state"]
+                st = self.ledger.state(md5, events=events)["state"]
                 if st == "unknown":
                     continue
                 tried.append({"md5": md5, "state": st})
                 if st == "open":
+                    others = [b for b in bodies if _norm_draft(b) != _norm_draft(text)]
+                    if others:
+                        return {"ok": False, "code": "body-mismatch", "md5": md5, "tried": tried,
+                                "reason": "the call carries %d other body text(s) besides the granted one" % len(others)}
                     need = self._required_status(md5)
-                    if need and not re.search(r'"status"\s*:\s*"%s"' % re.escape(need), flat or ""):
-                        return {"ok": False, "code": "status-missing", "md5": md5, "status": need, "tried": tried}
+                    if need and status != need:
+                        return {"ok": False, "code": "status-missing", "md5": md5, "status": need, "given": status, "tried": tried}
                     r = self.ledger.consume(md5, text, "argus", what, via="gate")
                     if r.get("ok"):
                         ticket = self._requests().get(md5, {}).get("ticket")
                         self._append(self.transitions_path, {"md5": md5, "ticket": ticket, "event": "posted", "status": need})
                         if ticket:
-                            self._mark(ticket, "sent", md5=md5, status=need)
+                            self._mark(ticket, "sent", md5=md5, status_set=need)
                         return {"ok": True, "md5": md5, "ticket": ticket, "status": need}
         pend = [i["md5"] for i in self.list()["items"]]
         return {"ok": False, "tried": tried, "undecided": pend}
@@ -396,6 +413,12 @@ class Desk:
         """Record a phase change or an agent's state. `agent` = {id, role, model, status, summary?, params?}."""
         run = self._run(ticket)
         if phase:
+            if phase == "new" and (run.get("agents") or run.get("rounds")):
+                # a ticket run again (after a Deny, or by hand): the earlier run is kept as history and the
+                # counters start over, so the new run gets its own review rounds
+                run.setdefault("history", []).append({"phase": run.get("phase"), "rounds": run.get("rounds", 0),
+                                                      "started": run.get("started"), "ended": self.clock(), "agents": run.get("agents", [])})
+                run.update(agents=[], rounds=0, started=self.clock())
             run["phase"], run["phase_at"] = phase, self.clock()
             if phase == "review":
                 run["rounds"] = run.get("rounds", 0) + 1
@@ -464,7 +487,9 @@ class Desk:
             page = self._page(source)
             if page is None:
                 return {"ok": False, "why": "page-not-captured", "source": source}
-            r = CR.mint_docs(self.receipts_path, ticket, source or "", quote, page, [quote], now)
+            # page_origin says what the captured body is: the page itself (fetch), or a docs search result that
+            # names this URL (search). The audit shows the difference; the quote check is the same.
+            r = CR.mint_docs(self.receipts_path, ticket, source or "", quote, page["body"], [quote], now, extra={"page_origin": page.get("origin")})
         elif kind == "material":
             rec = self._thread(ticket)
             inbound = "\n".join(m["text"] for m in (rec or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer")
@@ -528,11 +553,11 @@ class Desk:
             return {"id": None, "problem": "receipt not on file"}
         out = {"id": r["id"], "kind": r.get("kind"), "source": r.get("source") or r.get("url"), "quote": r.get("quote"),
                "minted": r.get("minted") or r.get("ts"), "by": by, "model": (agents.get(by) or {}).get("model"),
-               "prompt_sha": (agents.get(by) or {}).get("prompt_sha")}
+               "prompt_sha": (agents.get(by) or {}).get("prompt_sha"), "page_origin": r.get("page_origin")}
         src = out["source"]
         if r.get("kind") == "docs" and src:
             p = os.path.join(self.root, "pages", md5_of(src) + ".json")
-            out["captured"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p)} if os.path.exists(p) else None
+            out["captured"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p), "origin": r.get("page_origin")} if os.path.exists(p) else None
         elif r.get("kind") == "material":
             p = os.path.join(self.root, "threads", "%s.json" % ticket)
             out["captured"] = {"file": os.path.relpath(p, self.root), "sha": _file_sha(p)} if os.path.exists(p) else None
@@ -567,21 +592,24 @@ class Desk:
                                      "sha": _file_sha(os.path.join(pages, n)), "chars": len(pg.get("body", ""))})
         return out
 
-    def page(self, source, body):
-        """Keep the body of a page an agent fetched, so a docs receipt can be checked against it."""
+    def page(self, source, body, origin="fetch"):
+        """Keep the body an agent read under a documentation URL, so a docs receipt can be checked against it.
+        origin: "fetch" when the body is that page, "search" when it is a docs search result that names the URL
+        (the quote is then verified against the result, not the page; the receipt and the audit say so)."""
         if not source or not str(body or "").strip():
             return {"ok": False, "reason": "source and body"}
         os.makedirs(os.path.join(self.root, "pages"), exist_ok=True)
         with open(os.path.join(self.root, "pages", md5_of(source) + ".json"), "w", encoding="utf-8") as fh:
-            json.dump({"source": source, "body": str(body), "ts": self.clock()}, fh, ensure_ascii=False)
-        return {"ok": True, "source": source, "chars": len(str(body))}
+            json.dump({"source": source, "body": str(body), "origin": origin if origin in ("fetch", "search") else "search", "ts": self.clock()}, fh, ensure_ascii=False)
+        return {"ok": True, "source": source, "chars": len(str(body)), "origin": origin}
 
     def _page(self, source):
         p = os.path.join(self.root, "pages", md5_of(source or "") + ".json")
         if not os.path.exists(p):
             return None
         with open(p, encoding="utf-8") as fh:
-            return json.load(fh).get("body")
+            rec = json.load(fh)
+        return {"body": rec.get("body"), "origin": rec.get("origin") or "search"}
 
     def cite(self, ticket, citations):
         """Bind receipts to the sentences of a draft: each citation is {receipt, sentence}. A receipt the ticket
@@ -651,10 +679,22 @@ class Desk:
         self._save_queue(q)
         return row
 
+    def _answered_since_send(self, row, updated):
+        """A ticket we posted to counts as answered only when its updated_at moved past our own post: past the
+        updated_at the readback recorded (sent_updated), or, with no readback, more than SENT_GRACE_S after the
+        Send. Zendesk's search index lags, so a sent ticket that merely reappears unchanged stays `sent`."""
+        if not updated:
+            return False
+        if row.get("sent_updated"):
+            return updated > row["sent_updated"]
+        ts, sent_at = _iso_epoch(updated), row.get("sent_at")
+        return bool(ts and sent_at and ts > sent_at + SENT_GRACE_S)
+
     def sync(self, tickets):
         """Fold one poll of the open set into the queue. A ticket seen for the first time is `new`; one we
-        posted to that reappears with a newer update is `reopened`; one we posted to that left the open set
-        is `done`, the status transition confirmed; one that left without a post is `gone`."""
+        posted to that comes back after leaving, or that the customer updated since the post, is `reopened`;
+        one we posted to that left the open set is `done`, the status transition confirmed; one that left
+        without a post is `gone`."""
         now = self.clock()
         q = self._queue()
         seen = set()
@@ -669,8 +709,9 @@ class Desk:
             if not row:
                 q[tid] = dict(fields, first_seen=now, state="new", new_at=now)
                 continue
+            answered = row["state"] == "done" or (row["state"] == "sent" and self._answered_since_send(row, t.get("updated")))
             row.update({k: v for k, v in fields.items() if v is not None})
-            if row["state"] in ("sent", "done") and (row.get("updated") or "") > (row.get("sent_updated") or ""):
+            if answered:
                 row["state"], row["reopened_at"] = "reopened", now
             elif row["state"] == "gone":
                 row["state"], row["new_at"] = "new", now
@@ -820,7 +861,8 @@ def render_audit(a):
             cap = r.get("captured")
             L.append("      %s %s by %s (%s, prompt %s): \"%s\"" % (r["id"], r["kind"], r.get("by") or "?", r.get("model") or "?",
                                                                    (r.get("prompt_sha") or "?")[:12], (r.get("quote") or "")[:160]))
-            L.append("        source %s; captured %s" % (r.get("source"), ("%s sha %s" % (cap["file"], cap["sha"][:16])) if cap else "MISSING"))
+            how = "captured as a docs search result naming this URL, not the page" if cap and cap.get("origin") == "search" else "captured"
+            L.append("        source %s; %s %s" % (r.get("source"), how, ("%s sha %s" % (cap["file"], cap["sha"][:16])) if cap else "MISSING"))
     if a.get("objections"):
         L.append("OBJECTIONS ON RECORD")
         for f in a["objections"]:
@@ -860,6 +902,7 @@ def main(argv=None):
     ap.add_argument("--status", default="pending", help="status the granted post must set")
     ap.add_argument("--ticket")
     ap.add_argument("--state")
+    ap.add_argument("--updated", help="mark: the ticket's updated_at as read back after the post")
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--text", action="store_true", help="stats as text")
     a = ap.parse_args(argv)
@@ -880,13 +923,13 @@ def main(argv=None):
     elif a.cmd == "modify":
         out = d.modify(a.md5, a.note)
     elif a.cmd == "consume":
-        out = d.consume(body.get("candidates") or [], body.get("what") or "", body.get("flat") or "")
+        out = d.consume(body.get("candidates") or [], body.get("what") or "", body.get("status"))
     elif a.cmd == "sync":
         out = d.sync(body.get("tickets") or [])
     elif a.cmd == "queue":
         out = d.queue_view()
     elif a.cmd == "mark":
-        out = {"ok": True, "row": d._mark(a.ticket, a.state, note=a.note or None)} if a.ticket and a.state else {"ok": False, "reason": "--ticket and --state"}
+        out = {"ok": True, "row": d._mark(a.ticket, a.state, note=a.note or None, sent_updated=a.updated or None)} if a.ticket and a.state else {"ok": False, "reason": "--ticket and --state"}
     elif a.cmd == "run":
         out = d.run_update(body.get("ticket"), body.get("phase"), body.get("agent"))
     elif a.cmd == "call":
@@ -905,7 +948,7 @@ def main(argv=None):
     elif a.cmd == "receipt":
         out = d.receipt(body.get("ticket"), body.get("kind"), body.get("quote"), body.get("source"), body.get("by"))
     elif a.cmd == "page":
-        out = d.page(body.get("source"), body.get("body"))
+        out = d.page(body.get("source"), body.get("body"), body.get("origin") or "fetch")
     elif a.cmd == "cite":
         out = d.cite(body.get("ticket"), body.get("citations"))
     elif a.cmd == "trace":

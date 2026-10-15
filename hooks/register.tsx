@@ -29,6 +29,7 @@ type Opts = {
   pollMinutes: number; readProxy: string; writeProxy: string; searchEndpoint: string; searchQuery: string
   commentsEndpoint: string; ticketEndpoint: string; updateEndpoint: string; sendStatus: string
   docsTool: string; docsSource: string; docsHosts: string; agentTools: 'hooks' | 'mcp'; investigatorModel: string; adversaryModel: string; drafterModel: string; reviewerModel: string; maxRounds: number
+  guardRecord: boolean
 }
 
 const opts = (o: Record<string, unknown>): Opts => ({
@@ -53,6 +54,7 @@ const opts = (o: Record<string, unknown>): Opts => ({
   drafterModel: String(o.drafterModel ?? 'opus'),
   reviewerModel: String(o.reviewerModel ?? 'sonnet'),
   maxRounds: Math.max(0, Math.min(3, Number(o.maxRounds ?? 2) || 0)),
+  guardRecord: String(o.guardRecord ?? 'true') !== 'false',
 })
 
 // invoke_proxy as Argus shows it (2026-10-15): required proxy (an enum of 49 services) and endpoint (a name such
@@ -62,17 +64,42 @@ const READ_ENDPOINT = /^[a-z0-9]+_(get|list|search|read|show|fetch|count|describ
 
 const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'consent', 'requestMeta'])
 
-/** Every string an outward call carries, nested or not: the candidates for a granted md5. */
-const strings = (v: unknown, out: string[] = [], depth = 0): string[] => {
+/** The fields of an update that carry text to the customer. The gate reads these and nothing else: a granted
+ *  text in a tag, a subject or a custom field is not a granted post. */
+const BODY_KEY = /^(body|html_body|plain_body|text|message|content|comment|note|description)$/i
+
+/** The comment bodies an outward call carries, with whether the comment around each is marked not public. */
+const bodies = (v: unknown, out: Array<{ text: string; internal: boolean }> = [], depth = 0, internal = false): Array<{ text: string; internal: boolean }> => {
   if (depth > 6) return out
-  if (typeof v === 'string') {
-    if (v.length >= 20) out.push(v)
-  } else if (Array.isArray(v)) {
-    for (const x of v) strings(x, out, depth + 1)
+  if (Array.isArray(v)) {
+    for (const x of v) bodies(x, out, depth + 1, internal)
   } else if (v && typeof v === 'object') {
-    for (const [k, x] of Object.entries(v)) if (!RESERVED.has(k)) strings(x, out, depth + 1)
+    const o = v as Record<string, unknown>
+    const here = internal || o.public === false
+    for (const [k, x] of Object.entries(o)) {
+      if (RESERVED.has(k)) continue
+      if (typeof x === 'string') {
+        if (BODY_KEY.test(k) && x.trim()) out.push({ text: x, internal: here })
+      } else bodies(x, out, depth + 1, here)
+    }
   }
   return out
+}
+
+/** The ticket status an update sets: on the ticket object or at the top of the arguments, not in a nested field. */
+const statusOf = (args: Record<string, unknown>): string | undefined => {
+  const a = (args.arguments && typeof args.arguments === 'object' ? args.arguments : args) as Record<string, unknown>
+  const t = a.ticket && typeof a.ticket === 'object' ? (a.ticket as Record<string, unknown>) : undefined
+  const s = t?.status ?? a.status
+  return typeof s === 'string' ? s : undefined
+}
+
+/** The desk's own files, as a shell command or a file path would name them: the record only the desk may write. */
+const recordNames = (o: Opts): string[] => [o.stateDir.replace(/^~\//, '').replace(/\/+$/, ''), 'checks/desk.py', 'checks/desk_mcp.py', 'desk.py', 'desk_mcp.py']
+const GUARDED = /^(bash|write|edit|multiedit|notebookedit)$/i
+const namesRecord = (o: Opts, args: Record<string, unknown>): string | undefined => {
+  const text = [args.command, args.file_path, args.path, args.notebook_path].filter(x => typeof x === 'string').join('\n')
+  return recordNames(o).find(n => n && text.includes(n))
 }
 
 /** arguments may arrive as a JSON string; parse it so the reply text and the ticket id are visible. */
@@ -313,8 +340,9 @@ async function advance($: any, o: Opts, ticket: string): Promise<void> {
       await Promise.all(ANGLES.map((angle, i) => spawnRole($, o, ticket, 'investigator', `inv${i + 1}`, angle, o.investigatorModel)))
     } else if (phase === 'investigate' && !live('investigator') && of('investigator').length) {
       // the evidence floor: an investigator that completed with fewer receipts than the floor goes back in once,
-      // told what it recorded, before the adversary sees anything
-      const receipts = (label: string) => (t.events ?? []).filter(e => e.kind === 'receipt' && e.agent === label).length
+      // told what it recorded, before the adversary sees anything (receipts from an earlier run of the ticket do not count)
+      const since = run.started ?? 0
+      const receipts = (label: string) => (t.events ?? []).filter(e => e.kind === 'receipt' && e.agent === label && (e.ts ?? since) >= since).length
       const retry = of('investigator').filter(a => a.status === 'completed' && !a.label.endsWith('b') && receipts(a.label) < RECEIPT_FLOOR && !of('investigator').some(b => b.label === `${a.label}b`))
       if (retry.length) {
         await desk($, o, ['event'], JSON.stringify({ ticket, agent: 'desk', kind: 'phase', text: `below the evidence floor: ${retry.map(a => `${a.label} (${receipts(a.label)} receipts)`).join(', ')}; sending back in` }))
@@ -484,13 +512,25 @@ const ticketsIn = (text: string): Array<{ id: string; status?: string; sla?: str
     }))
 }
 
-/** After a granted post: read the ticket back and say whether the status moved. */
+/** The ticket's own status and updated_at in a readback, whatever the proxy wraps the ticket in. */
+const ticketFields = (text: string): { status?: string; updated?: string } => {
+  try {
+    const p = JSON.parse(text) as Record<string, unknown>
+    const t = (p.ticket && typeof p.ticket === 'object' ? p.ticket : p) as Record<string, unknown>
+    return { status: typeof t.status === 'string' ? t.status : undefined, updated: typeof t.updated_at === 'string' ? t.updated_at : undefined }
+  } catch {
+    return { status: text.match(/"status"\s*:\s*"([a-z-]+)"/)?.[1] }
+  }
+}
+
+/** After a granted post: read the ticket back, record its updated_at as the line a customer answer must cross,
+ *  and say whether the status moved. */
 async function verify($: any, o: Opts, toolName: string, ticket: string, status: string): Promise<void> {
   try {
     const r = await $.tool.call({ tool: toolName, proxy: o.readProxy, endpoint: o.ticketEndpoint, arguments: { ticket_id: ticket } })
     const text = String(r.text ?? JSON.stringify(r.result ?? ''))
-    const m = text.match(/"status"\s*:\s*"([a-z-]+)"/)
-    const now = m?.[1]
+    const { status: now, updated } = ticketFields(text)
+    if (updated) await desk($, o, ['mark', '--ticket', ticket, '--state', 'sent', '--updated', updated])
     if (now === status) {
       await refresh($, o, `#${ticket} posted, status ${status}`)
     } else {
@@ -511,7 +551,7 @@ const traceText = (t: Trace): string => {
     const rows = (t.findings ?? []).filter(f => f.kind === k)
     if (rows.length) out.push(`${k.toUpperCase()}:`, ...rows.map(f => `  - (${f.agent}) ${f.text}${f.receipts?.length ? ` <${f.receipts.join(',')}>` : ''}`))
   }
-  if (t.receipts?.length) out.push('RECEIPTS:', ...t.receipts.map(r => `  ${r.id} ${r.kind}${r.source ? ` ${r.source}` : ''}: "${r.quote.slice(0, 160)}"`))
+  if (t.receipts?.length) out.push('RECEIPTS:', ...t.receipts.map(r => `  ${r.id} ${r.kind}${r.source ? ` ${r.source}${r.page_origin === 'search' ? ' (search result)' : ''}` : ''}: "${r.quote.slice(0, 160)}"`))
   if (t.drafts?.length) {
     const d = t.drafts[t.drafts.length - 1]
     out.push(`DRAFT ${d.md5} ${d.checks.verdict}${d.checks.hits.length ? ` (${d.checks.hits.join(', ')})` : ''}:`, d.text)
@@ -776,80 +816,118 @@ export const register: Register = (on, options) => {
   // 2. the gate: an outward call passes only by spending an open grant on the exact text it carries.
   // A documentation search (enterprise_search by default): the result is a call on the record and a page per official URL it
   // carries, so a docs receipt can quote it. No outbound internet on the workstation; this is the docs leg there.
+  // The record guard: the grants and the chained record are written only by the desk through $.process.run. A shell
+  // command or a file edit from the model that names desk.py or the state directory could mint a grant or rewrite
+  // the record, so it is refused (option guardRecord=false turns this off, for working on the desk itself).
   on('tool.call', async ($, e, next) => {
-    if (o.docsTool && String(e.tool).includes(o.docsTool) && !String(e.tool).includes(o.outwardTool)) {
+    const tool = String(e.tool)
+    if (o.guardRecord && GUARDED.test(tool.replace(/^mcp__[^_]+__/, ''))) {
+      const hit = namesRecord(o, e as unknown as Record<string, unknown>)
+      if (hit) {
+        const who = active.get(String((e as { agentId?: string }).agentId ?? ''))
+        if (who) await desk($, o, ['event'], JSON.stringify({ ticket: who.ticket, agent: who.label, kind: 'guard', text: `${tool} refused: names ${hit}` }))
+        return { deny: `argus-desk: ${tool} names ${hit}, which only the desk may write (its grants and its record). The operator runs desk commands in a terminal, not through the model.` }
+      }
+    }
+    if (o.docsTool && tool.includes(o.docsTool) && !tool.includes(o.outwardTool)) {
       const ran = (await next(e)) as { text?: string; result?: unknown; isError?: boolean }
-      const agentId = (e as { agentId?: string }).agentId
-      const who = agentId ? active.get(agentId) : undefined
-      const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
-      const text = ran?.text ?? (typeof ran?.result === 'string' ? ran.result : ran?.result ? JSON.stringify(ran.result) : '')
-      if (agentId) await wallLine($, o, agentId, 'docs', JSON.stringify(args).slice(0, 100))
-      if (who) await desk($, o, ['call'], JSON.stringify({ ticket: who.ticket, agent: who.label, tool: String(e.tool), args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
-      if (text) for (const url of docsUrls(o, text)) await desk($, o, ['page'], JSON.stringify({ source: url, body: text }))
+      try {
+        const agentId = (e as { agentId?: string }).agentId
+        const who = agentId ? active.get(agentId) : undefined
+        const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
+        const text = ran?.text ?? (typeof ran?.result === 'string' ? ran.result : ran?.result ? JSON.stringify(ran.result) : '')
+        if (agentId) await wallLine($, o, agentId, 'docs', JSON.stringify(args).slice(0, 100))
+        if (who) await desk($, o, ['call'], JSON.stringify({ ticket: who.ticket, agent: who.label, tool, args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
+        // a search result is kept under each official URL it names, marked as a search result, not the page
+        if (text) for (const url of docsUrls(o, text)) await desk($, o, ['page'], JSON.stringify({ source: url, body: text, origin: 'search' }))
+      } catch {
+        /* the search ran; a failure to record it must not run it again */
+      }
       return ran
     }
-    if (!String(e.tool).includes(o.outwardTool)) return next(e)
-    outwardName = String(e.tool)
+    if (!tool.includes(o.outwardTool)) return next(e)
+    outwardName = tool
     const agentId = (e as { agentId?: string }).agentId
     const args = normalize(Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k))))
     if (!isOutward(args)) {
       // A read: let it run; capture comments as the live thread, and documentation pages for receipts.
       const ran = await next(e)
-      const ticket = ticketOf(args)
-      const text = (ran as { text?: string }).text
-      if (agentId) await wallLine($, o, agentId, 'read', `${String(args.proxy ?? '')} ${String(args.endpoint ?? '')} ${JSON.stringify(args.arguments ?? {}).slice(0, 100)}`)
-      // the call on the record, whole: who read what, with what arguments, and a hash of what came back
-      const who = agentId ? active.get(agentId) : undefined
-      if (ticket || who) await desk($, o, ['call'], JSON.stringify({ ticket: who?.ticket ?? ticket, agent: who?.label ?? 'main', tool: String(e.tool), args, result: text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny }))
-      if (ticket && text && /"comments"\s*:\s*\[/.test(text)) {
-        try {
-          const parsed = JSON.parse(text) as { comments?: Array<Record<string, unknown>>; count?: number }
-          const comments = parsed.comments ?? []
-          const messages = comments.map((c, i) => ({
-            id: String(c.id ?? i),
-            // Internal notes are staff: bots post several on every new ticket, and counting them as our replies held
-            // every draft on cadence (too-many). Only a public comment from our side is a reply.
-            who: c.public === false ? 'staff' : c.author_role === 'agent' || c.via_agent === true ? 'us' : 'customer',
-            at: typeof c.created_at === 'string' ? Date.parse(c.created_at) / 1000 : undefined,
-            text: String(c.plain_body ?? c.body ?? ''),
-          }))
-          await desk($, o, ['capture'], JSON.stringify({ ticket, messages, count: parsed.count ?? comments.length }))
-        } catch {
-          /* not a comments payload after all */
+      try {
+        const ticket = ticketOf(args)
+        const text = (ran as { text?: string }).text
+        if (agentId) await wallLine($, o, agentId, 'read', `${String(args.proxy ?? '')} ${String(args.endpoint ?? '')} ${JSON.stringify(args.arguments ?? {}).slice(0, 100)}`)
+        // the call on the record, whole: who read what, with what arguments, and a hash of what came back
+        const who = agentId ? active.get(agentId) : undefined
+        if (ticket || who) await desk($, o, ['call'], JSON.stringify({ ticket: who?.ticket ?? ticket, agent: who?.label ?? 'main', tool, args, result: text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny }))
+        if (ticket && text && /"comments"\s*:\s*\[/.test(text)) {
+          try {
+            const parsed = JSON.parse(text) as { comments?: Array<Record<string, unknown>>; count?: number }
+            const comments = parsed.comments ?? []
+            const messages = comments.map((c, i) => ({
+              id: String(c.id ?? i),
+              // Internal notes are staff: bots post several on every new ticket, and counting them as our replies held
+              // every draft on cadence (too-many). Only a public comment from our side is a reply.
+              who: c.public === false ? 'staff' : c.author_role === 'agent' || c.via_agent === true ? 'us' : 'customer',
+              at: typeof c.created_at === 'string' ? Date.parse(c.created_at) / 1000 : undefined,
+              text: String(c.plain_body ?? c.body ?? ''),
+            }))
+            await desk($, o, ['capture'], JSON.stringify({ ticket, messages, count: parsed.count ?? comments.length }))
+          } catch {
+            /* not a comments payload after all */
+          }
         }
+        if (text) {
+          // a URL the call itself named was fetched: the body is that page; one only named in the result is not
+          const asked = new Set(docsUrls(o, JSON.stringify(args)))
+          for (const url of docsUrls(o, JSON.stringify(args), text.slice(0, 4000))) await desk($, o, ['page'], JSON.stringify({ source: url, body: text, origin: asked.has(url) ? 'fetch' : 'search' }))
+        }
+      } catch {
+        /* the read ran; a failure to record it must not run it again */
       }
-      if (text) for (const url of docsUrls(o, JSON.stringify(args), text.slice(0, 4000))) await desk($, o, ['page'], JSON.stringify({ source: url, body: text }))
       return ran
     }
     const flat = JSON.stringify(args)
-    const r = await desk($, o, ['consume'], JSON.stringify({ candidates: strings(args), what: `${String(e.tool)} ${flat.slice(0, 120)}`, flat }))
     const who = agentId ? active.get(agentId) : undefined
+    const found = bodies(args)
+    const refuse = async (note: string, deny: string) => {
+      const t = who?.ticket ?? ticketOf(args)
+      if (t) await desk($, o, ['call'], JSON.stringify({ ticket: t, agent: who?.label ?? 'main', tool, args, ok: false, note }))
+      return { deny }
+    }
+    if (!found.length) return refuse('POST refused: no comment body', `argus-desk: this call would post to the customer and carries no comment body (a field named body, html_body or plain_body). Only a public comment whose body is the exact text the operator granted can go out. File the reply with ${TOOL} and wait for the operator's Send.`)
+    if (found.some(b => b.internal)) return refuse('POST refused: comment not public', 'argus-desk: the approved reply must be a public comment to the customer; this call marks it public: false. Repeat the call with public: true. The approval is still open.')
+    const r = await desk($, o, ['consume'], JSON.stringify({ candidates: found.map(b => b.text), what: `${tool} ${flat.slice(0, 120)}`, status: statusOf(args) }))
     const postTicket = (r.ticket as string | undefined) ?? who?.ticket ?? ticketOf(args)
     if (r.ok) {
       const ran = await next(e)
-      if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool: String(e.tool), args, result: (ran as { text?: string }).text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny, note: `POST granted ${String(r.md5)}` }))
-      await refresh($, o, `sent ${String(r.md5).slice(0, 8)}`)
-      if (r.ticket && r.status) await verify($, o, String(e.tool), String(r.ticket), String(r.status))
+      try {
+        if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool, args, result: (ran as { text?: string }).text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny, note: `POST granted ${String(r.md5)}` }))
+        await refresh($, o, `sent ${String(r.md5).slice(0, 8)}`)
+        if (r.ticket && r.status) await verify($, o, tool, String(r.ticket), String(r.status))
+      } catch {
+        /* the post ran and the grant is spent; a failure to record it must never run it again */
+      }
       return ran
     }
     if (r.code === 'status-missing') {
-      return {
-        deny:
-          `argus-desk: the operator approved this text with the ticket status set to "${String(r.status)}", and this call does not set it. ` +
-          `Repeat the call with the same text and status "${String(r.status)}" in the ticket update. The approval is still open.`,
-      }
+      return refuse(`POST refused: status-missing (wanted ${String(r.status)}, given ${String(r.given ?? 'none')})`,
+        `argus-desk: the operator approved this text with the ticket status set to "${String(r.status)}", and this call sets ${r.given ? `"${String(r.given)}"` : 'no status'} on the ticket. ` +
+        `Repeat the call with the same text and status "${String(r.status)}" on the ticket update. The approval is still open.`)
+    }
+    if (r.code === 'body-mismatch') {
+      return refuse('POST refused: body-mismatch', 'argus-desk: this call carries the granted text and another body text besides it. A granted post carries the granted text as its one comment body and nothing else to the customer. Repeat the call with only the approved text. The approval is still open.')
     }
     const undecided = (r.undecided as string[] | undefined) ?? []
-    if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool: String(e.tool), args, ok: false, note: `POST refused: ${String(r.code ?? r.reason ?? 'no grant')}` }))
-    return {
-      deny:
-        `argus-desk: this call would post to the customer and carries no text the operator has granted. ` +
-        (undecided.length ? `Waiting at the desk: ${undecided.map(m => m.slice(0, 8)).join(', ')}. ` : 'Nothing is filed. ') +
-        `File the exact reply with ${TOOL} and wait for the operator's Send.`,
-    }
+    return refuse(`POST refused: ${String(r.code ?? r.reason ?? 'no grant')}`,
+      `argus-desk: this call would post to the customer and carries no text the operator has granted. ` +
+      (undecided.length ? `Waiting at the desk: ${undecided.map(m => m.slice(0, 8)).join(', ')}. ` : 'Nothing is filed. ') +
+      `File the exact reply with ${TOOL} and wait for the operator's Send.`)
   }).catch(($, e, next) => {
-    if (!String(e.tool).includes(o.outwardTool)) return next.called ? next(e) : next(e)
-    return next.called ? next(e) : { deny: 'argus-desk: the gate could not decide, so the post is refused.' }
+    if (!String(e.tool).includes(o.outwardTool)) return next(e)
+    // Nothing after next(e) can throw above, so next.called here means the post ran: never run it again.
+    return next.called
+      ? { deny: 'argus-desk: the post ran and its grant is spent, but the desk could not record it. Do not repeat the post; tell the operator.' }
+      : { deny: 'argus-desk: the gate could not decide, so the post is refused.' }
   })
 
   // 3. the pane: Wall, Queue, Ticket, Decide.
@@ -892,7 +970,7 @@ export const register: Register = (on, options) => {
         }
         if (t.receipts?.length) {
           add('tr', 'RECEIPTS', 'green')
-          for (const r of t.receipts) add(`tr-${r.id}`, `  ${r.id.replace(/^rcpt:/, '')} ${r.kind}${r.source ? ` ${cut(r.source, 50)}` : ''}: "${cut(r.quote, width - 30)}"`, undefined, true)
+          for (const r of t.receipts) add(`tr-${r.id}`, `  ${r.id.replace(/^rcpt:/, '')} ${r.kind}${r.source ? ` ${cut(r.source, 50)}${r.page_origin === 'search' ? ' (search result)' : ''}` : ''}: "${cut(r.quote, width - 30)}"`, undefined, true)
         }
         if (t.claims?.length) {
           add('tc', 'CLAIMS IN THE DRAFT', 'green')

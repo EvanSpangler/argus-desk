@@ -1,0 +1,39 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: desk.py tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unit tests
+        working-directory: checks
+        run: python3 -W error::ResourceWarning -I -m unittest discover -s tests -v
+      - name: byte-compile every module
+        run: python3 -m compileall -q checks
+
+  plugin:
+    name: plugin validate and hook tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: validate
+        run: claude plugin validate .
+      - name: hook tests
+        run: claude plugin test .

@@ -42,7 +42,7 @@ export type WallAgent = {
 
 export type RunAgent = { id: string; agentId?: string; role: string; label: string; model?: string; status: string; params?: string; summary?: string; started: number; ended?: number }
 export type Finding = { id: string; agent: string; role: string; kind: string; text: string; receipts?: string[]; about?: string | null; ts?: number }
-export type Receipt = { id: string; kind: string; ticket: string; quote: string; source?: string; bound?: string[]; minted?: string }
+export type Receipt = { id: string; kind: string; ticket: string; quote: string; source?: string; bound?: string[]; minted?: string; page_origin?: 'fetch' | 'search' }
 export type Claim = { text: string; classes?: string[]; receipts?: string[]; problems?: string[]; echo?: boolean }
 
 export type Trace = {

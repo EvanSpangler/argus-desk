@@ -1,4 +1,5 @@
 import os, sys, json, tempfile, unittest
+from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import desk as D
 
@@ -13,7 +14,6 @@ def mk():
     c = Clock()
     return D.Desk(root, clock=c), c
 
-FLAT = '{"endpoint":"zendesk_update_ticket","arguments":{"ticket":{"status":"pending","comment":{"body":"..."}}}}'
 DRAFT = "Hi Sam,\n\nThe broker for this connector is disabled, so the connector reports unhealthy. Re-enable the broker in the portal under Settings > Connectors, then run a fresh scan.\n\nPlease send a fresh support package after that.\n\nThanks!\n"
 
 class DeskTests(unittest.TestCase):
@@ -25,8 +25,8 @@ class DeskTests(unittest.TestCase):
         self.assertEqual(d.consume([DRAFT], "post")["ok"], False, "no grant yet")
         g = d.grant(md5, "press-1"); self.assertTrue(g["ok"], g)
         self.assertEqual(d.list()["items"][0]["state"], "open")
-        self.assertTrue(d.consume(["unrelated text", DRAFT], "post", FLAT)["ok"])
-        self.assertFalse(d.consume([DRAFT], "post again", FLAT)["ok"], "one grant, one send")
+        self.assertTrue(d.consume([DRAFT], "post", "pending")["ok"])
+        self.assertFalse(d.consume([DRAFT], "post again", "pending")["ok"], "one grant, one send")
         self.assertEqual(d.list()["items"], [])
 
     def test_edited_text_does_not_ride_on_the_grant(self):
@@ -104,19 +104,19 @@ class DeskTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertEqual(len(run(["list"])["items"]), 1)
         self.assertTrue(run(["grant", "--md5", r["md5"], "--press-id", "p"])["ok"])
-        self.assertTrue(run(["consume"], json.dumps({"candidates": [DRAFT], "what": "POST comments", "flat": FLAT}))["ok"])
+        self.assertTrue(run(["consume"], json.dumps({"candidates": [DRAFT], "what": "POST comments", "status": "pending"}))["ok"])
         self.assertEqual(run(["stats"])["decisions"]["send"], 1)
 
     def test_grant_status_must_be_on_the_posting_call(self):
         d, c = mk()
         md5 = d.file("123456", DRAFT)["md5"]
         self.assertTrue(d.grant(md5, "press-1", status="solved")["ok"])
-        r = d.consume([DRAFT], "post", '{"arguments":{"comment":{"body":"x"}}}')
+        r = d.consume([DRAFT], "post", None)
         self.assertEqual(r.get("code"), "status-missing"); self.assertEqual(r["status"], "solved")
         self.assertEqual(d.list()["items"][0]["state"], "open", "the grant is left open")
-        r = d.consume([DRAFT], "post", '{"arguments":{"status":"pending"}}')
+        r = d.consume([DRAFT], "post", "pending")
         self.assertEqual(r.get("code"), "status-missing", "the wrong status is not the status")
-        r = d.consume([DRAFT], "post", '{"arguments":{"status": "solved"}}')
+        r = d.consume([DRAFT], "post", "solved")
         self.assertTrue(r["ok"]); self.assertEqual(r["status"], "solved"); self.assertEqual(r["ticket"], "123456")
         self.assertEqual(d._queue()["123456"]["state"], "sent")
         self.assertFalse(d.grant(md5, "press-2", status="closed")["ok"], "unknown status refused")
@@ -131,7 +131,7 @@ class DeskTests(unittest.TestCase):
         self.assertIsNone(d.queue_view()["next"], "one ticket at a time")
         md5 = d.file("12", DRAFT)["md5"]
         self.assertEqual(d.queue_view()["rows"][0]["state"], "waiting")
-        d.grant(md5, "p1"); d.consume([DRAFT], "post", FLAT)
+        d.grant(md5, "p1"); d.consume([DRAFT], "post", "pending")
         self.assertEqual(d._queue()["12"]["state"], "sent")
         v = d.queue_view(); self.assertEqual(v["next"]["ticket"], "11", "oldest next")
         # the next poll: 12 is pending now and 13 was taken by someone else
@@ -182,10 +182,6 @@ class DeskTests(unittest.TestCase):
         self.assertEqual(len(t["drafts"]), 1)
         self.assertTrue(any(cl.get("receipts") for cl in t["claims"]), t["claims"])
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AuditTests(unittest.TestCase):
     def test_chain_verifies_and_breaks_on_edit(self):
         d, c = mk()
@@ -202,9 +198,11 @@ class AuditTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(d.root, a["answer_file"])))
         self.assertNotIn("prompt", a)
         p = os.path.join(d.root, "runs", "7", "events.jsonl")
-        rows = open(p).read().splitlines()
+        with open(p) as fh:
+            rows = fh.read().splitlines()
         rows[0] = rows[0].replace("invoke_proxy", "something_else")
-        open(p, "w").write("\n".join(rows) + "\n")
+        with open(p, "w") as fh:
+            fh.write("\n".join(rows) + "\n")
         v = d.verify()
         self.assertFalse(v["ok"])
         self.assertIn("hash mismatch", v["files"]["runs/7/events.jsonl"]["problem"])
@@ -230,3 +228,101 @@ class AuditTests(unittest.TestCase):
         self.assertIn("RECORD INTEGRITY: every chained file verifies", txt)
         self.assertTrue(any(e["kind"] == "overrule" for e in d._rows(os.path.join(d.root, "runs", "8", "events.jsonl"))))
         self.assertEqual(d.audit(ticket="8")["md5"], r["md5"])
+
+
+class RemediationTests(unittest.TestCase):
+    """v0.6: the bugs the review found, each pinned."""
+
+    def test_sent_ticket_still_in_the_open_set_stays_sent(self):
+        # Zendesk's search index lags: the ticket we just posted to shows up unchanged on the next poll
+        d, c = mk()
+        d.sync([{"id": 12, "status": "open", "updated": "2026-10-15T02:00:00Z"}])
+        md5 = d.file("12", DRAFT)["md5"]; d.grant(md5, "p1")
+        self.assertTrue(d.consume([DRAFT], "post", "pending")["ok"])
+        self.assertEqual(d._queue()["12"]["status_set"], "pending")
+        c.t += 300
+        v = d.sync([{"id": 12, "status": "open", "updated": "2026-10-15T02:00:00Z"}])
+        self.assertEqual(d._queue()["12"]["state"], "sent", "unchanged updated_at is not a customer answer")
+        self.assertIsNone(v["next"])
+        # our own post moved updated_at by a few seconds: still ours
+        v = d.sync([{"id": 12, "status": "open", "updated": datetime.fromtimestamp(T0 + 5, timezone.utc).isoformat()}])
+        self.assertEqual(d._queue()["12"]["state"], "sent")
+        # the customer answers well after the Send
+        v = d.sync([{"id": 12, "status": "open", "updated": datetime.fromtimestamp(T0 + 3600, timezone.utc).isoformat()}])
+        self.assertEqual(d._queue()["12"]["state"], "reopened")
+        self.assertEqual(v["next"]["ticket"], "12")
+
+    def test_readback_updated_at_is_the_line_for_reopened(self):
+        d, c = mk()
+        d.sync([{"id": 13, "status": "open", "updated": "2026-10-15T02:00:00Z"}])
+        md5 = d.file("13", DRAFT)["md5"]; d.grant(md5, "p1"); d.consume([DRAFT], "post", "pending")
+        d._mark("13", "sent", sent_updated="2026-10-15T02:00:30Z")     # what the readback after the post saw
+        d.sync([{"id": 13, "status": "open", "updated": "2026-10-15T02:00:30Z"}])
+        self.assertEqual(d._queue()["13"]["state"], "sent")
+        d.sync([{"id": 13, "status": "open", "updated": "2026-10-15T02:00:31Z"}])
+        self.assertEqual(d._queue()["13"]["state"], "reopened")
+        # a done ticket (it left the open set) that comes back is reopened whatever its timestamps
+        d._mark("13", "sent"); d.sync([]); self.assertEqual(d._queue()["13"]["state"], "done")
+        self.assertEqual(d._rows(d.transitions_path)[-1]["status"], "pending", "the confirmed row carries the status set")
+        d.sync([{"id": 13, "status": "open"}])
+        self.assertEqual(d._queue()["13"]["state"], "reopened")
+
+    def test_running_a_ticket_again_starts_its_own_rounds(self):
+        d, c = mk()
+        d.run_update("5", phase="new", agent={"id": "a1", "role": "investigator", "label": "inv1", "model": "sonnet", "status": "completed"})
+        d.run_update("5", phase="review"); d.run_update("5", phase="review")
+        self.assertEqual(d._run("5")["rounds"], 2)
+        d.run_update("5", phase="new")
+        run = d._run("5")
+        self.assertEqual((run["rounds"], run["agents"], run["phase"]), (0, [], "new"))
+        self.assertEqual(len(run["history"]), 1)
+        self.assertEqual(run["history"][0]["agents"][0]["label"], "inv1")
+
+    def test_gate_refuses_a_second_body_and_a_status_elsewhere(self):
+        d, c = mk()
+        md5 = d.file("7", DRAFT)["md5"]; d.grant(md5, "p1")
+        r = d.consume(["Something the operator never saw.", DRAFT], "post", "pending")
+        self.assertEqual(r.get("code"), "body-mismatch")
+        self.assertEqual(d.list()["items"][0]["state"], "open", "nothing spent")
+        r = d.consume([DRAFT, DRAFT.strip()], "post", "pending")
+        self.assertTrue(r["ok"], "the same text twice (body and plain body) is one body")
+
+    def test_undecided_draft_is_written_off_after_the_ttl(self):
+        d, c = mk()
+        d.file("1", DRAFT)
+        self.assertEqual(len(d.list()["items"]), 1)
+        c.t += D.CL.REQUEST_TTL_S + 1
+        self.assertEqual(d.list()["items"], [])
+        self.assertEqual(d.ledger.events()[-1]["event"], "expire")
+        md5 = d.file("1", DRAFT)["md5"]
+        self.assertTrue(d.grant(md5, "p")["ok"]); c.t += D.CL.GRANT_TTL_S + 1
+        self.assertEqual(d.list()["items"], [])
+        self.assertFalse(d.consume([DRAFT], "post", "pending")["ok"], "a lapsed grant does not post")
+
+    def test_docs_receipt_names_where_the_captured_body_came_from(self):
+        d, c = mk()
+        D.CR.POLICY["docs_hosts"].append("docs.example.org")
+        body = "Result 1: The connector requires outbound access on port 443. Source: https://docs.example.org/a"
+        d.page("https://docs.example.org/a", body, origin="search")
+        r = d.receipt("3", "docs", "The connector requires outbound access on port 443", "https://docs.example.org/a", by="inv1")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual([x for x in D.CR.load(d.receipts_path) if x["id"] == r["id"]][0]["page_origin"], "search")
+        sent = "The connector requires outbound access on port 443."
+        d.file("3", "Hi,\n\n" + sent + "\n")
+        d.cite("3", [{"receipt": r["id"], "sentence": sent}])
+        a = d.audit(ticket="3")
+        chain = [s_ for s_ in a["sentences"] if s_["receipts"]][0]["receipts"][0]
+        self.assertEqual(chain["captured"]["origin"], "search")
+        self.assertIn("docs search result naming this URL", D.render_audit(a))
+        d.page("https://docs.example.org/b", "Broker health\n\nRe-enable the broker to restore scanning.\n")
+        r2 = d.receipt("3", "docs", "Re-enable the broker to restore scanning", "https://docs.example.org/b")
+        self.assertEqual([x for x in D.CR.load(d.receipts_path) if x["id"] == r2["id"]][0]["page_origin"], "fetch")
+
+    def test_one_dash_is_one_hit(self):
+        d, c = mk()
+        r = d.file("4", "Hi,\n\nThe broker is off \u2014 turn it on.\n")
+        self.assertEqual([h for h in r["hits"] if "dash" in h], ["dash"])
+
+
+if __name__ == "__main__":
+    unittest.main()

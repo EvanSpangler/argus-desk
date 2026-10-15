@@ -21,7 +21,7 @@ You need Claude Code 2.1.296 or later and `python3` on the workstation.
      Never delete an existing folder to make room; rename it. A zip copy is not a git checkout, so the
      gate0 line `git` says `not-a-checkout`; that is expected.
 2. Check it, in a terminal: `bash ~/argus-desk/gate0.sh`. Every line starts with `GATE0`. You want
-   `validate ✔ Validation passed`, `plugin test 18 pass 0 fail` and `python tests OK`.
+   `validate ✔ Validation passed`, `plugin test 22 pass 0 fail` and `python tests OK`.
 3. Turn it on: `bash ~/argus-desk/gate0.sh --install`. This adds one line to the `env` block of
    `~/.claude/settings.json` and changes nothing else.
 4. Restart Claude Code (exit and start it again, or open a new terminal tab).
@@ -66,8 +66,11 @@ Leave the session open. The desk does the pulling and the investigating; you do 
    (`material`). A quote that is not there is refused. The draft's claims are checked against them.
    Documentation is read through the session's docs search tool (option `docsTool`, default
    `enterprise_search`, on the data source `docsSource`, default `wiz_docs_public`): every result is on the
-   record and kept as a page under each official URL it carries, so a docs receipt quotes the result and
-   cites one of those URLs. The agents run with every tool the session has; the gate holds on the proxy.
+   record and kept under each official URL it carries, so a docs receipt quotes the result and cites one of
+   those URLs. Such a receipt is marked `(search result)` on the trace and in the audit: the quote was
+   checked against the search result that names the URL, not against the page itself. A receipt on a page
+   the agent fetched by its URL through the proxy carries no mark. The agents run with every tool the
+   session has; the gate holds on the proxy.
 4. **You read the trace, then decide.** `/desk` opens the pane. Four tabs, keys `1` to `4`, `j`/`k` to
    scroll, `n` for the next draft. The keys work while the pane holds the focus: press ctrl+x then tab
    (or click the pane); typed into the prompt they are just text. Without the focus, use the commands:
@@ -94,8 +97,11 @@ A Send lasts 6 hours. A draft nobody decides is dropped after 24 hours.
 
 6. **The transition is checked twice.** Right after the post the desk reads the ticket back and the pane
    says `#N posted, status pending`; if the status did not move, it says so and the model is told to set
-   it. On the next poll the ticket has left the open set, which the queue records as the transition
-   confirmed. If the customer answers, the ticket comes back as `reopened` and is pulled first.
+   it. The readback also records the ticket's `updated_at` after our post. On the next poll the ticket has
+   left the open set, which the queue records as the transition confirmed. Zendesk's search index lags by
+   a few minutes, so a ticket we just posted to may still show in the open set once or twice: it stays
+   `sent` until its `updated_at` moves past the readback (or, with no readback, more than two minutes past
+   the Send). If the customer answers, the ticket comes back as `reopened` and is pulled first.
 
 ## 3a. Accountability: the record behind a reply
 
@@ -109,8 +115,14 @@ integrity check. The records live under `~/.argus-desk`: `runs/N/events.jsonl` (
 `calls.jsonl` (every call), `prompts/<agent>.txt`, `answers/<agent>.txt`, `threads/N.json` and `pages/`
 (what was read), `receipts.jsonl`, `requests.jsonl`, `decisions.jsonl`, `transitions.jsonl`. Every record
 the desk writes is chained (`prev`, `h`: a sha256 over the previous hash and the row); `/desk verify` walks
-every chained file and names the first broken link, so an edited or deleted record shows. A refused receipt
-is on the tail too, with the quote the agent claimed and why it was refused.
+every chained file and names the first broken link, so a record edited, dropped or inserted by hand shows.
+The chain has no secret: a rewrite of a whole file that recomputes every hash passes `verify`, so the chain
+is a check against accidents and casual edits, not proof against someone with the desk's own code and write
+access to `~/.argus-desk`. If that matters for your audit, copy the `h` of the last row of each file
+somewhere the workstation cannot write (the `/desk verify` output in the transcript does), and compare. A
+refused receipt is on the tail too, with the quote the agent claimed and why it was refused. A ticket run
+again (after a Deny, or by hand) keeps its earlier run under `history` in `runs/N/run.json` and starts its
+own review rounds.
 
 Hand controls: `/desk run N`, `/desk trace N` (the trace as text in the transcript), `/desk audit N`,
 `/desk verify`, `/desk poll`,
@@ -125,49 +137,91 @@ cite are `docsHosts`.
 
 Any call the model makes through `invoke_proxy` that is not plainly a read (an endpoint named `..._get`,
 `_list`, `_search`, `_read`, `_show`, `_fetch`, `_count` or `_describe`) is treated as outward, on every
-proxy, Zendesk or not. An outward call goes through only if it carries text you sent from the pane, and
-that Send is then spent. Otherwise the model gets:
+proxy, Zendesk or not. An outward call goes through only if its comment body (a field named `body`,
+`html_body`, `plain_body`, `text`, `message`, `content`, `comment`, `note` or `description`) is exactly the
+text you sent from the pane, and that Send is then spent. Text anywhere else in the call (a tag, a subject,
+a custom field) does not count. Otherwise the model gets:
 
 > argus-desk: this call would post to the customer and carries no text the operator has granted.
 
-This holds even when Claude Code runs with permission prompts switched off.
+The post is also refused, with the approval left open, when:
 
-The post must also set the status your Send chose. A post that carries the approved text without the
-status is refused with the approval left open, and the model is told to repeat the call with the status.
+- it carries a second body text beside the granted one (for example an `html_body` that differs);
+- the comment is marked `public: false` (an internal note is not the reply you approved);
+- the ticket `status` it sets is not the one your Send chose. The status is read from the ticket object
+  or the top of the arguments, not from a nested field. The model is told to repeat the call with the
+  status.
 
 The match is exact. If the text is changed after your Send, even only reformatted, the post is refused
 and the model has to file it again. One known case: copying a reply out of the Zendesk composer drops
 numbered-list markers ("1. ", "2. "), so the copied text no longer matches.
 
+**What the gate protects against, and what it does not.** The gate runs as a hook on the model's tool
+calls, so it holds whether or not Claude Code's own permission prompts are on: a reply the model never
+filed, or that you did not grant, or that was edited after the grant, cannot go out through the proxy by
+mistake. It is not a control against a model that sets out to route around it. The grants and the record
+are files under `~/.argus-desk`, written by `checks/desk.py`, and the model's shell could run that script
+or edit those files. The desk therefore refuses a `Bash`, `Write` or `Edit` call that names `desk.py`,
+`desk_mcp.py` or the state directory (option `guardRecord`, on by default; the refusal is on the tail of
+the run as a `guard` line). That closes the plain routes; it does not make the workstation a sandbox. Run
+desk commands yourself in a terminal, never by asking the model to.
+
 ## 5. What a HOLD means
 
 A HOLD is advice for you, not a block. You can still press Send.
+
+The draft's own text:
 
 | Code | Meaning |
 |---|---|
 | `dash` | The draft contains an en or em dash. |
 | `timeline-commitment` | It promises a time ("shortly", "by tomorrow", "within 2 days"). |
+| `voice:<rule>` | A block rule from your voice rules matched ("absolutely right", a template placeholder, AI self-reference, a vendor or model name, a typed sign-off). Warn rules appear as warnings. |
+
+The thread it answers:
+
+| Code | Meaning |
+|---|---|
+| `thread-not-live`, `capture-missing` | No live read of this ticket's comments. |
 | `capture-stale`, `thread-stale` | The comments were read more than 15 minutes before filing. Ask the model to re-read them. |
 | `unrecorded-comment` | The ticket has more comments than the model read. |
-| `thread-not-live`, `capture-missing` | No live read of this ticket's comments. |
 | `too-soon` | We replied publicly less than 4 hours ago. |
 | `too-many` | Two or more of our public replies in the last 12 hours. |
 | `repeat-ask` | It asks the customer again while our last question is still unanswered. |
-| `announced-reversal` | It contradicts something we already told the customer. |
-| `question-not-answered` | The customer asked something the draft does not address. |
-| `uncovered` | A factual sentence has no receipt. |
-| `receipt-unrelated`, `weak-evidence`, `partial-binding` | The receipt bound to a sentence does not say what the sentence says. |
+| `announced-reversal` | It announces a reversal of something we already told the customer ("my last message", "correction:"). |
+
+The customer's open questions since our last reply are listed on the Decide tab as `customer asked:`; they
+are for you to check, not a HOLD code (the thread reviewer raises an objection for each one the draft
+leaves unanswered).
+
+The claims it makes. Every checkable sentence (an instruction, a cause, a status, a product behaviour, a
+statement about the customer's setup, or a sentence naming a setting, file, version or quantity) needs a
+receipt that says what it says: official documentation or a recorded test for product behaviour, the
+customer's own material for their setup, both legs for a cause.
+
+| Code | Meaning |
+|---|---|
+| `uncovered` | A checkable sentence has no receipt bound to it (the drafter cites each sentence with `file_draft`, or the receipt's quote is the sentence). |
+| `receipt-stale` | Its only receipts are older than 24 hours. |
+| `receipt-unrelated` | The receipt shares no content words with the sentence. |
+| `quote-does-not-support` | The receipt covers less than half of the sentence's content words. |
+| `partial-binding` | Several of the sentence's words are in neither the quote nor the cited fragment. |
+| `element-not-in-evidence` | A setting, path, version or quantity the sentence names is not in the quote. |
+| `instruction-needs-docs-or-test`, `behaviour-needs-docs-or-test` | A step or a product behaviour is backed only by the customer's material. |
 | `cause-needs-product-leg-and-material` | A cause is asserted with only one of its two legs (docs mechanism, customer's own data). |
+| `conditional-paraphrase` | The sentence says "only if", "unless", "requires" and the docs quote does not. |
+| `polarity-not-in-quote` | The sentence is negative ("does not", "cannot") and the quote is not. |
+| `hedged-claim` | A receipted sentence still hedges ("may", "likely", "appears to"): verified means say it plainly. |
 | `unconfirmed-wording` | "I suspect", "unconfirmed" or similar: a claim is verified or cut. |
-| `echo-only` | Every credited sentence only restates the customer. |
-| `voice:<rule>` | A block rule from your voice rules matched (dashes, "absolutely right", placeholders, a typed sign-off, a vendor or model name). Warn rules appear as warnings. |
+| `snippet-untested` | A code block has no test receipt recording that it was run. |
+| `echo-only` | Every sentence that would be credited only restates the customer. |
 
 Warnings (shown, never a HOLD): `no-thread-captured`, and `voice:<rule>` for warn-level voice rules.
 
 Your voice rules live in `<stateDir>/voice-rules.json` (`{"rules": [{"id", "pattern", "severity":
 "block|warn", "channels": ["all"]}]}`), exported from your own lint; without the file a built-in floor
-applies (the dashes, "you're absolutely right", template placeholders, AI self-reference, vendor names, a
-typed sign-off).
+applies ("you're absolutely right", template placeholders, AI self-reference, vendor names, a typed
+sign-off). Dashes are the separate `dash` check, so one dash is one hit.
 
 ## 6. Numbers
 
@@ -212,5 +266,12 @@ Sonnet, the adversary and drafter to Opus.
   agent as the author of each finding.
 - **Nothing gets pulled although tickets are open.** The pane shows `poll paused` (`/desk resume`), or a
   ticket is `drafting` or `waiting`: decide it, or `/desk pull N` to force another.
+- **The model says `argus-desk: Bash names .argus-desk, which only the desk may write`.** The record guard
+  (section 4). The model was asked, or decided, to run a desk command or touch the state directory; do that
+  yourself in a terminal. To work on the desk's own code from inside a session, set the option
+  `guardRecord` to false for that session.
+- **A ticket we just answered shows as `reopened` and is pulled again.** Its `updated_at` moved past the
+  readback after our post, which means someone touched it after us. If it was a bot or a colleague, not the
+  customer, `/desk` shows the run and you can Deny the new draft; the `sent` line stays on the record.
 - **Everything shows `thread: NOT captured`.** The model drafted without reading the comments. Ask it to
   read the ticket's comments, then file again.

@@ -31,7 +31,7 @@ else
   say "argus launcher: not on PATH"
 fi
 V=$(cd "$HERE" && claude plugin validate . 2>&1)
-say "validate $(echo "$V" | grep -o -E '✔.*|✘.*' | tail -1)"
+say "validate $(echo "$V" | grep -o -E '[✔√✓].*|[✘×✗].*' | tail -1)"
 echo "$V" | grep -i -E "policy|refus|not allowed|disabled" | head -3 | sed 's/^/GATE0 validate note: /'
 T=$(cd "$HERE" && timeout 300 claude plugin test . 2>&1)
 say "plugin test $(echo "$T" | grep -E '^ *[0-9]+ (pass|fail)' | tr '\n' ' ')"

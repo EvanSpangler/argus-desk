@@ -1,6 +1,6 @@
 {
   "name": "argus-desk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A review desk inside Claude Code: every outward reply is filed, checked against the live thread, and sent only on the operator's Send; Deny and Modify are recorded for the economics.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -129,6 +129,12 @@
       "title": "Docs data source",
       "default": "wiz_docs_public",
       "description": "The data source the investigators are told to search for documentation."
+    },
+    "guardRecord": {
+      "type": "boolean",
+      "title": "Guard the record",
+      "default": true,
+      "description": "Refuse a Bash, Write or Edit call from the model that names desk.py or the state directory, so a grant or the chained record can be written only by the desk. Turn off only to work on the desk itself."
     }
   },
   "author": {

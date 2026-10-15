@@ -144,8 +144,9 @@ def prose_of(page):
     return "\n".join(keep)
 
 
-def mint_docs(path, ticket, url, quote, page_body, claims, now):
-    """Refuse unless the quote sits verbatim in the PROSE of a page the harness fetched from an allowed host."""
+def mint_docs(path, ticket, url, quote, page_body, claims, now, extra=None):
+    """Refuse unless the quote sits verbatim in the PROSE of a page the harness fetched from an allowed host.
+    `extra` is merged into the row: the desk records where the captured body came from (page_origin)."""
     host = re.sub(r"^https?://", "", url).split("/")[0]
     if host not in POLICY["docs_hosts"]:
         return {"ok": False, "why": "docs-host-not-official"}
@@ -156,6 +157,7 @@ def mint_docs(path, ticket, url, quote, page_body, claims, now):
     row = {"id": "rcpt:docs-" + hashlib.sha256((url + quote).encode()).hexdigest()[:8], "kind": "docs",
            "ticket": str(ticket), "minted": now.isoformat(), "source": url, "quote": quote,
            "body_sha": hashlib.sha256(page_body.encode()).hexdigest(), "bound": list(claims)}
+    row.update({k: v for k, v in (extra or {}).items() if v is not None})
     _append(path, row)
     return {"ok": True, "id": row["id"]}
 

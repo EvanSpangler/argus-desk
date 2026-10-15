@@ -88,15 +88,18 @@ Leave the session open. The desk does the pulling and the investigating; you do 
    checked against the search result that names the URL, not against the page itself. A receipt on a page
    the agent fetched by its URL through the proxy carries no mark. The agents run with every tool the
    session has; the gate holds on the proxy.
-4. **You read the proof, then decide.** `/desk` opens three panes: **Review**, **Tickets** and **Wall**.
-   They are panes of Claude Code's own, so the tab bar above them switches views (click a tab, or Tab onto
-   it and Enter), and the keys `1` to `3` do the same from inside any of them.
+4. **You read the proof, then decide.** `/desk` opens the Desk pane with three views: **Review**,
+   **Tickets** and **Wall**. Its first line names them, the one showing in brackets (`1: [Review]   2: Tickets
+   3: Wall`); the keys `1` to `3` switch. (Before 0.8.1 each view was a pane of its own, and Claude Code
+   refuses to move the keyboard from one pane to another, so `1` to `3` did nothing on a real terminal.)
 
-   A pane takes the keyboard after ctrl+x then tab, or a click on it; until then its second line reads
+   The pane takes the keyboard after ctrl+x then tab, or a click on it; until then its second line reads
    `keys off` and says so. Every key that does something is drawn on the pane as a button with its key
-   (`z: zoom into the row`), so the rows of buttons are the key list: nothing works that is not on screen.
-   Tab and the arrows walk the rows, Enter acts on the row under the ring, Esc hands the keys back to the
-   prompt. Every pane has `f: find` (type, Enter narrows the rows to what matches) and `c: clear`.
+   (`z: zoom into the row`), on bars at the top of the view, so the key list is on screen when a view opens:
+   nothing works that is not drawn. Tab walks the rows, the arrows scroll, Enter acts on the row under the
+   ring, Esc hands the keys back to the prompt. A row cut at the pane's edge shows `+`; Enter on it shows the
+   whole text (a customer message, an objection). Every view has `f: find` (type, Enter narrows the rows to
+   what matches and hands the keys back to the view) and `c: clear`.
    - **Review** is the proof tree behind the selected draft, the record made navigable. Its sections:
      ISSUES (everything open: reviewer objections, sentences with no receipt or a problem, thread checks,
      a ticket updated after the thread was recorded), ASK (the customer's open questions, the ask as the
@@ -122,17 +125,22 @@ Leave the session open. The desk does the pulling and the investigating; you do 
      tool call or sentence. Enter tails that agent; `b: back`. This is where you watch the work.
 
    The same tree as text: `/desk show` (the selected draft), `/desk show <ticket>`, `/desk show <md5>`,
-   with a node id after it for one branch (`/desk show 147802 reply`), and `desk.py tree --text` from a
+   with a node id after it for one branch (`/desk show 123456 reply`), and `desk.py tree --text` from a
    shell.
 5. **Press one of the buttons** (or its key):
-   - **Send, pending** (`s`): approves this exact text with the ticket going to Pending. The model is told
-     to post it with that status in the same update, and the post goes through once.
+   - **Send, pending** (`s`): approves this exact text with the ticket going to Pending. The model is handed
+     the text and told to post it with that status in the same update, and the post goes through once.
    - **Send, solved** (`v`): the same, with the ticket going to Solved.
    - **Modify** (`m`): type one line and press Return. The drafter revises with your note and files the new
-     text; the reviewer looks again; it comes back to Decide. Your note is kept as an objection on the trace.
+     text; the reviewer looks again; it comes back to Review. Your note is kept as an objection on the trace.
    - **Deny** (`d`): type why. Nothing posts; the reason is recorded on the trace.
 
-A Send lasts 6 hours. A draft nobody decides is dropped after 24 hours.
+   Modify and Deny put the cursor in their field, with a `cancel` button beside it (Tab, Enter) that leaves
+   the draft undecided. After any decision the next draft opens with the ring on its first row, not on Send.
+
+A Send lasts 6 hours. A draft nobody decides is dropped after 24 hours. A ticket has one draft at the desk: a
+redraft or a new run's draft withdraws the ticket's older undecided one (the ledger says which replaced it), and
+a Send on the older one is refused.
 
 6. **The transition is checked twice.** Right after the post the desk reads the ticket back and the pane
    says `#N posted, status pending`; if the status did not move, it says so and the model is told to set
@@ -293,7 +301,8 @@ Sonnet, the adversary and drafter to Opus.
   query to your Zendesk user id with `/desk query type:ticket status<pending assignee:<id>` (kept for every
   session on the workstation; `/desk query` shows it, `/desk query default` restores the option).
 - **The pane ignores the keys.** Its second line reads `keys off`: press ctrl+x then tab, or click the pane. A
-  field with the cursor in it (the filter, a Modify note) takes every key until Esc. Without the keys, the pane
+  field with the cursor in it (a Modify note, a Deny reason) takes every key until Enter; Tab reaches its
+  `cancel` button, which leaves the draft undecided. Esc hands the keyboard back to the prompt. Without the keys, the pane
   commands (`/desk review`, `/desk tickets`, `/desk wall`, `/desk show`) still work.
 - **A run finished in seconds with no receipts.** Look at RUN in the Review pane, `/desk show N run`, or `/desk trace N`: an agent that
   says it had no proxy tool or that a desk tool was not answered means the desk was started outside a

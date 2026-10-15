@@ -101,6 +101,21 @@ def build(desk, md5=None, ticket=None, send=None):
     findings = desk._rows(os.path.join(rd, "findings.jsonl"))
     events = desk._rows(os.path.join(rd, "events.jsonl"))
     calls = desk._rows(os.path.join(rd, "calls.jsonl"))
+    # A rerun keeps appending to the ticket's records, so the draft's own run is the window it was filed in: from the
+    # start before its filing to the next start. Without it a new draft carried every earlier run's objections as open.
+    history = [h for h in run.get("history", []) if h.get("started")]
+    starts = sorted({h["started"] for h in history} | ({run["started"]} if run.get("started") else set()))
+    filed = req.get("ts") or 0
+    lo = max((t for t in starts if t <= filed), default=None)
+    hi = min((t for t in starts if t > filed), default=None)
+    inside = lambda r: (lo is None or (r.get("ts") or 0) >= lo) and (hi is None or (r.get("ts") or 0) < hi)
+    findings, events, calls = [r for r in findings if inside(r)], [r for r in events if inside(r)], [r for r in calls if inside(r)]
+    past = next((h for h in history if h["started"] == lo), None)
+    if past is not None:
+        run = dict(run, agents=past.get("agents", []), rounds=past.get("rounds", 0), phase=past.get("phase"))
+    elif lo is None and hi is not None:
+        # filed before the first run the record kept: its agents were not recorded
+        run = dict(run, agents=[], rounds=0, phase="not recorded")
     receipts = {r["id"]: r for r in CR.load(desk.receipts_path) if r["ticket"] == str(ticket)}
     minted_by = {}
     for e in events:

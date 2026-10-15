@@ -13,13 +13,16 @@ import type { DeskItem, DeskView, QueueRow, Trace, TreeNode, TreeResult, WallAge
 //   5. the gate      an outward call passes only by spending a grant on the exact text, with the status chosen.
 // State and checks live in checks/desk.py (stdlib Python), one process per call; the mod is the binding.
 
-const PANES = { review: 'desk-review', tickets: 'desk-tickets', wall: 'desk-wall' } as const
-type View = keyof typeof PANES
+// One engine pane holds the three views. The engine refuses `ui.open({ focus })` while the person holds a pane, so a key
+// pressed inside one pane can never raise another: with a pane per view, 1 to 3 did nothing on a real terminal (the
+// plugin test host does not model the refusal). The panes 0.8.0 opened are closed on the way in.
+const PANE = 'desk'
+const OLD_PANES = ['desk-review', 'desk-tickets', 'desk-wall']
+type View = 'review' | 'tickets' | 'wall'
 const VIEWS: View[] = ['review', 'tickets', 'wall']
 const TITLES: Record<View, string> = { review: 'Review', tickets: 'Tickets', wall: 'Wall' }
 /** Old names still typed by habit or by the model. */
 const ALIASES: Record<string, View> = { decide: 'review', queue: 'tickets', ticket: 'tickets' }
-const viewOf = (requestId: string): View | undefined => VIEWS.find(v => PANES[v] === requestId)
 /** The element the focus ring holds in each pane, from ui.focus: what a hotkey acts on (p pulls the ticket under the ring). */
 const ring = new Map<string, string>()
 const TOOL = 'file_draft'
@@ -204,15 +207,54 @@ async function desk($: any, o: Opts, args: string[], stdin?: string): Promise<Re
   }
 }
 
-async function openView($: any, v: View, focus = true): Promise<void> {
+let oldClosed = false
+/** The row the ring lands on when a view opens: the tree's first row, the selected ticket's, the first agent's. */
+function firstRow(v: DeskView, which: View): string | undefined {
+  const f = (v.filter?.[which] ?? '').trim().toLowerCase()
+  const has = (...parts: Array<string | undefined>) => !f || parts.some(p => p && p.toLowerCase().includes(f))
+  if (which === 'review') {
+    const zoomId = (v.zoom ?? [])[(v.zoom ?? []).length - 1]
+    const root = v.tree?.ok ? v.tree.tree : undefined
+    if (!root) return undefined
+    const n = zoomId ? findNode(root, zoomId) : root
+    const c = n?.children.find(x => !f || hasMatch(x, f))
+    return c ? nodeKey(c.id) : undefined
+  }
+  if (which === 'tickets') {
+    const rows = v.queue.filter(q => has(q.ticket, q.subject, q.state))
+    const t = rows.find(q => q.ticket === v.ticket) ?? rows[0]
+    return t ? `ticket:${t.ticket}` : undefined
+  }
+  if (v.tail) return 'back'
+  const a = v.wall.find(w => has(w.ticket, w.role, w.label, w.last, w.status))
+  return a ? `agent:${a.id}` : undefined
+}
+
+/** Show one view in the desk pane: the view is state, so a key pressed inside the pane switches it with no focus move.
+ *  A press passes its requestId, and the ring moves to the view's first row: left on the key pressed, Enter pressed it again. */
+async function openView($: any, v: View, focus = true, requestId?: string): Promise<void> {
+  await update($, view, x => ({ ...x, which: v }))
+  if (requestId) {
+    const key = firstRow(await read($, view), v)
+    if (key) await $.ui.focus({ requestId, key }).catch(() => undefined)
+  }
   try {
-    await $.ui.open({ id: PANES[v], title: TITLES[v], ...(focus ? { focus: true } : {}) })
+    if (!oldClosed) {
+      oldClosed = true
+      for (const id of OLD_PANES) await $.ui.close({ id }).catch(() => undefined)
+    }
+    await $.ui.open({ id: PANE, title: 'Desk', ...(focus ? { focus: true } : {}) })
   } catch {
     /* a host without panes: the state is set for when one draws */
   }
 }
-async function openAll($: any): Promise<void> {
-  for (const v of VIEWS) await openView($, v, false)
+/** Open the pane on the view it last showed, without asking for the keys. */
+async function openDesk($: any): Promise<void> {
+  try {
+    await $.ui.open({ id: PANE, title: 'Desk' })
+  } catch {
+    /* as above */
+  }
 }
 
 /** The agents running now, by id: which ticket and role each belongs to, for the wall and the receipts. */
@@ -284,14 +326,16 @@ async function decide($: any, o: Opts, md5: string, decision: 'send' | 'deny' | 
     }
     await refresh($, o, `granted ${md5.slice(0, 8)}, status ${status}`)
     void $.prompt.submit({ text:
-      `The operator approved draft ${md5} for #${item.ticket}. Post exactly that text now, unchanged, as a public comment with ` +
-      `${o.outwardTool} (proxy ${o.writeProxy}, endpoint ${o.updateEndpoint}), and in the same call set the ticket status to "${status}". ` +
-      `The gate refuses the post if the status is missing.` }).catch(() => undefined)
+      // the text itself: a subagent drafted it, so this session may never have seen it (and after a restart it has seen nothing)
+      `The operator approved draft ${md5} for #${item.ticket}. Post exactly the text between the two marker lines below, unchanged, ` +
+      `as a public comment with ${o.outwardTool} (proxy ${o.writeProxy}, endpoint ${o.updateEndpoint}), and in the same call set the ticket ` +
+      `status to "${status}". The marker lines are not part of it. The gate refuses the post if the text differs or the status is missing.\n` +
+      `----- BEGIN APPROVED DRAFT ${md5.slice(0, 8)} -----\n${item.text}\n----- END APPROVED DRAFT ${md5.slice(0, 8)} -----` }).catch(() => undefined)
   } else if (decision === 'deny') {
     await desk($, o, ['deny', '--md5', md5, '--reason', note])
     await desk($, o, ['finding'], JSON.stringify({ ticket: item.ticket, agent: 'operator', role: 'operator', kind: 'objection', text: `Denied: ${note || '(no reason)'}`, about: md5 }))
     await refresh($, o, `denied ${md5.slice(0, 8)}`)
-    void $.prompt.submit({ text: `The operator denied draft ${md5} for #${item.ticket}${note ? `: ${note}` : ''}. Do not post it. Run /desk run ${item.ticket} to investigate again with that objection on record, or say what the ticket needs instead.` }).catch(() => undefined)
+    void $.prompt.submit({ text: `The operator denied draft ${md5} for #${item.ticket}${note ? `: ${note}` : ''}. Do not post it. Tell the operator in one line that \`/desk run ${item.ticket}\` investigates again with that objection on record (it is the operator's command; you cannot run it), or say what the ticket needs instead.` }).catch(() => undefined)
   } else {
     await desk($, o, ['modify', '--md5', md5, '--note', note])
     await desk($, o, ['finding'], JSON.stringify({ ticket: item.ticket, agent: 'operator', role: 'operator', kind: 'objection', text: `Modify: ${note || '(no note)'}`, about: md5 }))
@@ -299,6 +343,24 @@ async function decide($: any, o: Opts, md5: string, decision: 'send' | 'deny' | 
     $.clock.after(1, () => void redraft($, o, item.ticket, md5, note).catch(() => undefined))
   }
   await update($, view, v => ({ ...v, mode: 'list', selected: undefined }))
+  // the next draft opens with the ring on its first row: left where the engine puts it, the ring sat on Send, and the
+  // Enter that submitted a Deny's reason, pressed once more, would have sent the next draft
+  await ringToFirstRow($)
+}
+
+/** The ring onto the Review's first row, now and again once the engine has re-seated it: when the field that held the
+ *  ring is gone, the engine moves the ring to the nearest element (a decision key) after this call has run. */
+async function ringToFirstRow($: any): Promise<void> {
+  const go = async () => {
+    const key = firstRow(await read($, view), 'review')
+    if (key) await $.ui.focus({ requestId: PANE, key }).catch(() => undefined)
+  }
+  await go()
+  try {
+    $.clock.after(150, () => void go())
+  } catch {
+    /* a host without a clock: the first move stands */
+  }
 }
 
 // ---- the run: one investigation, a tree of subagents, awaited through the Agent tool so the turn that started
@@ -731,7 +793,7 @@ export const register: Register = (on, options) => {
     if (e.isInteractive) {
       await update($, view, v => ({ ...v, poll: o.pollMinutes > 0 ? 'on' : 'off' }))
       await refresh($, o)
-      if (e.surface === 'terminal') void openAll($)
+      if (e.surface === 'terminal') void openDesk($)
       startPolling($, o)
     }
     return next(e)
@@ -853,12 +915,10 @@ export const register: Register = (on, options) => {
       const t = args.replace(/^ticket\s+#?/, '')
       await update($, view, v => ({ ...v, tail: undefined, ...(word === 'ticket' && /^\d+$/.test(t) ? { ticket: t, open: [...new Set([...(v.open ?? []), t])] } : {}) }))
       await refresh($, o)
-      await openAll($)
       await openView($, which)
-      return { text: `Desk: ${TITLES[which]}. The pane takes the keys after ctrl+x then tab, or a click; every key is drawn as a button on it. 1 to 3 switch panes, Tab and the arrows walk the rows, Enter opens one, f finds.` }
+      return { text: `Desk: ${TITLES[which]}. The pane takes the keys after ctrl+x then tab, or a click; every key is drawn as a button on it. 1 to 3 switch views, Tab walks the rows, the arrows scroll, Enter opens one, f finds.` }
     }
     const items = await refresh($, o)
-    await openAll($)
     await openView($, 'review')
     return { text: `${items.length ? `${items.length} draft(s) waiting at the desk.` : 'Nothing waiting at the desk.'}${pending.size ? ` ${pending.size} run(s) start now.` : ''}` }
   })
@@ -1040,25 +1100,22 @@ export const register: Register = (on, options) => {
 
   // 3. the pane: Wall, Queue, Ticket, Decide.
   on('ui.focus', ($, e, next) => {
-    if (e.element && viewOf(e.requestId)) ring.set(e.requestId, e.element)
+    if (e.element && e.requestId === PANE) ring.set(e.requestId, e.element)
     return next(e)
   })
 
-  for (const which of VIEWS) on('ui.render', { component: 'Pane', requestId: PANES[which] }, ($, e) => drawPane($, o, e, which))
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => drawPane($, o, e, (await read($, view)).which ?? 'review'))
 }
 
-// ---- the pane: four views, each a pane of the engine's own, so its tab bar switches them (a click, or Tab onto a tab and
-// Enter) and the keys 1 to 4 do the same from any view. Every row is a control the focus ring walks: Tab and the arrows move,
-// Enter opens. Each view has a filter field (f, type, Enter) and names its keys on its own second line; while the pane does
-// not hold the keyboard the line says so and how to take it. The engine scrolls the body and keeps the ring in view, so the
-// pane keeps no scroll of its own.
-
-// ---- the panes: Review (the proof tree behind the selected draft), Tickets (the queue; a row opens to its thread, run
-// and drafts) and Wall (every agent live). Panes of the engine's own, so its tab bar switches them and 1 to 3 do the same
-// from inside any pane. The operator's rule: every key that does something is drawn as a labelled button (`z: zoom`);
-// nothing works that is not on screen. Arrows, Tab, Enter and Esc are the engine's: they walk the rows and act on one.
+// ---- the views: Review (the proof tree behind the selected draft), Tickets (the queue; a row opens to its thread, run
+// and drafts) and Wall (every agent live). Three views in one pane, so 1 to 3 switch them from inside it (see PANE).
+// Every row is a control the focus ring walks: Tab moves the ring, Enter opens, the arrows scroll; the engine keeps the
+// ring in view. The operator's rule: every key that does something is drawn as a labelled button (`z: zoom`), on bars
+// above the rows so they show when a view opens; nothing works that is not on screen. Arrows, Tab, Enter and Esc are the engine's: they walk the rows and act on one.
 
 const KEYS_OFF = 'keys off: press ctrl+x then tab, or click the pane, to take the keys'
+/** Every bar of keys: a gap between the buttons, wrapping onto the next row rather than running off the pane. */
+const BAR = { flexWrap: 'wrap', columnGap: 3 } as const
 const DEFAULT_OPEN = ['issues', 'reply']
 
 const nodeKey = (id: string) => `n:${id}`
@@ -1091,12 +1148,12 @@ async function loadTree($: any, o: Opts, md5: string, node?: string): Promise<Tr
 }
 
 /** Make one draft the Review's: selected, its tree loaded, the pane opened. */
-async function selectDraft($: any, o: Opts, md5: string, open = true): Promise<void> {
+async function selectDraft($: any, o: Opts, md5: string, open = true, requestId?: string): Promise<void> {
   const v = await read($, view)
   const item = v.items.find(i => i.md5 === md5)
   await update($, view, x => ({ ...x, selected: md5, ticket: item?.ticket ?? x.ticket, mode: 'list' }))
   await refresh($, o)
-  if (open) await openView($, 'review')
+  if (open) await openView($, 'review', true, requestId)
 }
 
 /** Expand the path down to a node, leave any zoom, and put the ring on it. */
@@ -1135,31 +1192,41 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
   const cut = (t: string, n = width - 4) => t.replace(/\s+/g, ' ').slice(0, n)
   const ago = (t: number) => `${Math.max(0, Math.round((Date.now() - t) / 60000))}m`
   const match = (...parts: Array<string | undefined>) => !f || parts.some(p => p && p.toLowerCase().includes(f))
-  const setFilter = (text: string) => void update($, view, x => ({ ...x, filter: { ...(x.filter ?? {}), [which]: text.trim() } }))
+  // the filter applies on Enter, and the ring leaves the field for the first row left: in the field, every key is text
+  const setFilter = (text: string, requestId?: string) => void update($, view, x => ({ ...x, filter: { ...(x.filter ?? {}), [which]: text.trim() } })).then(async () => {
+    const key = requestId ? firstRow(await read($, view), which) : undefined
+    if (key) await $.ui.focus({ requestId, key }).catch(() => undefined)
+  })
   const sel = v.items.find(i => i.md5 === v.selected) ?? v.items[0]
+  /** Modify and Deny ask for one line: the field opens and takes the ring. */
+  const askFor = async (requestId: string, mode: 'modify' | 'deny') => {
+    await update($, view, x => ({ ...x, selected: sel.md5, mode }))
+    await $.ui.focus({ requestId, key: mode === 'modify' ? 'modify-note' : 'deny-reason' }).catch(() => undefined)
+  }
   let first = true
   const focusFirst = () => { if (!first) return {}; first = false; return { autoFocus: true as const } }
 
   const nav = (
-    <Box key="nav">
+    <Box key="nav" {...BAR}>
       {VIEWS.map((id, i) => (
-        <Button key={`go-${id}`} plain hotkey={String(i + 1)} dimColor={id !== which} onPress={() => void openView($, id)}>{TITLES[id]}</Button>
+        <Button key={`go-${id}`} plain hotkey={String(i + 1)} dimColor={id !== which} onPress={(p: any) => void openView($, id, true, p.requestId)}>{id === which ? `[${TITLES[id]}]` : TITLES[id]}</Button>
       ))}
-      <Text dimColor>  {v.items.length} waiting, {active.size} agents, poll {v.poll}{v.notice ? `  (${v.notice})` : ''}</Text>
+      <Text dimColor>{v.items.length} waiting, {active.size} agents, poll {v.poll}{v.notice ? `  (${v.notice})` : ''}</Text>
     </Box>
   )
   const keysOff = focused ? null : <Text key="keys-off" color="yellow">{KEYS_OFF}</Text>
   const finder = (
-    <Box key="finder">
+    <Box key="finder" columnGap={1}>
       <Button key="find" plain hotkey="f" onPress={(p: any) => void $.ui.focus({ requestId: p.requestId, key: 'filter' }).catch(() => undefined)}>find</Button>
-      <Text dimColor> </Text>
-      <Input key="filter" placeholder="type, then Enter, to narrow the rows" value={v.filter?.[which] ?? ''} submitLabel="narrow" onSubmit={(txt: string) => setFilter(txt)} />
-      {f ? <Button key="clear" plain hotkey="c" onPress={() => setFilter('')}>clear</Button> : null}
+      <Input key="filter" placeholder="type, then Enter, to narrow the rows" value={v.filter?.[which] ?? ''} submitLabel="narrow" onSubmit={(txt: string, p: any) => setFilter(txt, p?.requestId)} />
+      {f ? <Button key="clear" plain hotkey="c" onPress={(p: any) => setFilter('', p.requestId)}>clear</Button> : null}
     </Box>
   )
   const body: any[] = []
+  /** The view's keys, drawn above its rows so they are on screen when the view opens, whatever the length of the rows. */
+  const keys: any[] = []
   const text = (key: string, t: string, color?: string, dim?: boolean) => body.push(<Text key={key} color={color} dimColor={dim}>{t}</Text>)
-  const row = (key: string, t: string, press: () => void, color?: string, dim?: boolean) =>
+  const row = (key: string, t: string, press: (p?: any) => void, color?: string, dim?: boolean) =>
     body.push(<Button key={key} plain dimColor={dim} {...focusFirst()} onPress={press}>{color ? <Text color={color}>{t}</Text> : t}</Button>)
 
   if (which === 'review') {
@@ -1180,10 +1247,16 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
       const walk = (n: TreeNode, depth: number) => {
         if (f && !hasMatch(n, f)) return
         const open = Boolean(f) || n.id === zoomId || expanded.has(n.id)
-        const glyph = n.children.length ? (open ? '-' : '+') : '·'
+        // a row cut to the pane's width opens to its whole text: a customer message, an objection, a sentence
+        const room = width - 6 - depth * 2
+        const isCut = n.label.replace(/\s+/g, ' ').length > room
+        const hidden = (n.body ?? v.bodies?.[n.id] ?? '').trim()
+        const glyph = n.children.length || isCut || (hidden && !n.label.includes(hidden)) || n.body_file ? (open ? '-' : '+') : '·'
         const dim = n.state === 'answered' || n.state === 'asserts-nothing' || n.state === 'overruled'
-        row(nodeKey(n.id), `${'  '.repeat(depth)}${glyph} ${cut(n.label, width - 6 - depth * 2)}`, () => void toggleNode($, o, n), n.color, dim)
+        row(nodeKey(n.id), `${'  '.repeat(depth)}${glyph} ${cut(n.label, room)}`, () => void toggleNode($, o, n), n.color, dim)
         if (!open) return
+        // the whole text in a box indented under its row, so its wrapped lines keep the row's indent
+        if (isCut) body.push(<Box key={`l:${n.id}`} flexDirection="column" paddingLeft={(depth + 2) * 2}>{n.label.split('\n').map((l, i) => <Text key={`l:${n.id}:${i}`}>{l || ' '}</Text>)}</Box>)
         const b = (n.body ?? v.bodies?.[n.id] ?? '').trim()
         if (b && !n.label.includes(b)) for (const [i, l] of b.split('\n').entries()) text(`b:${n.id}:${i}`, `${'  '.repeat(depth + 2)}${l || ' '}`, undefined, true)
         for (const c of n.children) walk(c, depth + 1)
@@ -1191,37 +1264,50 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
       const root = zoomId ? findNode(tree, zoomId) : undefined
       if (root) walk(root, 0)
       else for (const c of tree.children) walk(c, 0)
-      body.push(
-        <Box key="r-nav">
+      keys.push(
+        <Box key="r-nav" {...BAR}>
           <Button key="zoom" plain hotkey="z" onPress={(p: any) => { const id = acted(v, p.requestId); if (id && id !== zoomId) void update($, view, x => ({ ...x, zoom: [...(x.zoom ?? []), id], expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), id])] })) }}>zoom into the row</Button>
           <Button key="up" plain hotkey="u" onPress={() => void update($, view, x => ({ ...x, zoom: (x.zoom ?? []).slice(0, -1) }))}>up</Button>
           <Button key="expand-all" plain hotkey="x" onPress={(p: any) => { const id = acted(v, p.requestId); const n = id ? findNode(tree, id) : undefined; if (n) void update($, view, x => ({ ...x, expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), ...descendants(n)])] })) }}>expand all beneath</Button>
           <Button key="follow" plain hotkey="g" onPress={(p: any) => { const id = acted(v, p.requestId); const n = id ? findNode(tree, id) : undefined; if (n?.target) void reveal($, n.target, p.requestId) }}>go to what the row is about</Button>
         </Box>,
       )
-      body.push(
-        <Box key="r-jump">
+      keys.splice(0, 0,
+        <Box key="r-jump" {...BAR}>
           <Button key="jump-issues" plain hotkey="i" onPress={(p: any) => void reveal($, 'issues', p.requestId)}>issues</Button>
           <Button key="jump-ask" plain hotkey="t" onPress={(p: any) => void reveal($, 'ask:thread', p.requestId)}>thread</Button>
           <Button key="jump-reply" plain hotkey="r" onPress={(p: any) => void reveal($, 'reply', p.requestId)}>reply</Button>
           <Button key="jump-run" plain hotkey="w" onPress={(p: any) => void reveal($, 'run', p.requestId)}>who did what</Button>
-          <Button key="open-ticket" plain hotkey="o" onPress={() => { void update($, view, x => ({ ...x, ticket: sel.ticket, open: [...new Set([...(x.open ?? []), sel.ticket])] })); void openView($, 'tickets') }}>the ticket</Button>
+          <Button key="open-ticket" plain hotkey="o" onPress={(p: any) => { void update($, view, x => ({ ...x, ticket: sel.ticket, open: [...new Set([...(x.open ?? []), sel.ticket])] })).then(() => openView($, 'tickets', true, p.requestId)) }}>the ticket</Button>
           {v.items.length > 1 ? <Button key="next" plain hotkey="n" onPress={() => { const i = v.items.findIndex(it => it.md5 === sel.md5); void selectDraft($, o, v.items[(i + 1) % v.items.length].md5, false) }}>next draft</Button> : null}
         </Box>,
       )
     }
     if (sel) {
       const open = v.tree?.open ?? 0
-      if (v.mode === 'list') body.push(
-        <Box key="r-decide">
+      if (v.mode === 'list') keys.unshift(
+        <Box key="r-decide" {...BAR}>
           <Button key="send" plain hotkey="s" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`)}>Send, {o.sendStatus}{open ? ` (${open} open)` : ''}</Button>
           <Button key="solve" plain hotkey="v" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`, 'solved')}>Send, solved</Button>
-          <Button key="modify" plain hotkey="m" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'modify' }))}>Modify</Button>
-          <Button key="deny" plain hotkey="d" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'deny' }))}>Deny</Button>
+          <Button key="modify" plain hotkey="m" onPress={(p: any) => void askFor(p.requestId, 'modify')}>Modify</Button>
+          <Button key="deny" plain hotkey="d" onPress={(p: any) => void askFor(p.requestId, 'deny')}>Deny</Button>
         </Box>,
       )
-      if (v.mode === 'modify') body.push(<Input key="modify-note" label="what to change" placeholder="one line for the drafter; Esc keeps the draft as it is" autoFocus submitLabel="return" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'modify', txt, p.requestId)} />)
-      if (v.mode === 'deny') body.push(<Input key="deny-reason" label="why" placeholder="recorded with the deny" autoFocus submitLabel="deny" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'deny', txt, p.requestId)} />)
+      // the field takes the ring as it opens, so the words typed are the note, not the view's keys; cancel (Tab, Enter) leaves
+      // the draft undecided. Esc hands the keys back to the prompt and the field stays, with its cancel beside it.
+      const cancel = <Button key="cancel" plain onPress={() => void update($, view, x => ({ ...x, mode: 'list' })).then(() => ringToFirstRow($))}>cancel, keep the draft undecided</Button>
+      if (v.mode === 'modify') keys.unshift(
+        <Box key="r-ask" {...BAR}>
+          <Input key="modify-note" label="what to change" placeholder="one line for the drafter, then Enter" autoFocus submitLabel="return" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'modify', txt, p.requestId)} />
+          {cancel}
+        </Box>,
+      )
+      if (v.mode === 'deny') keys.unshift(
+        <Box key="r-ask" {...BAR}>
+          <Input key="deny-reason" label="why" placeholder="recorded with the deny, then Enter" autoFocus submitLabel="deny" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'deny', txt, p.requestId)} />
+          {cancel}
+        </Box>,
+      )
     }
   } else if (which === 'tickets') {
     text('q0', `poll ${v.poll}${v.lastPoll ? `, last ${ago(v.lastPoll)} ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, undefined, true)
@@ -1239,18 +1325,19 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
       text(`run:${q.ticket}`, `    run: ${q.run ? `phase ${q.run.phase}, rounds ${q.run.rounds ?? 0}, agents ${q.run.agents ?? 0}` : 'none'}`, undefined, true)
       const drafts = v.items.filter(i => i.ticket === q.ticket)
       if (!drafts.length) text(`d0:${q.ticket}`, '    drafts: none waiting', undefined, true)
-      for (const i of drafts) row(`draft:${i.md5}`, `    draft ${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m  ${cut(i.text, width - 44)}`, () => void selectDraft($, o, i.md5))
+      // one line per draft, cut to the pane: a long HOLD list wrapped the row into the next one
+      for (const i of drafts) row(`draft:${i.md5}`, `    ${cut(`draft ${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m  ${i.text}`, width - 8)}`, (p: any) => void selectDraft($, o, i.md5, true, p?.requestId))
     }
     const under = (requestId: string): string | undefined => {
       const k = ring.get(requestId)
       const t = k?.startsWith('ticket:') ? k.slice(7) : k?.startsWith('draft:') ? v.items.find(i => i.md5 === k.slice(6))?.ticket : undefined
       return t ?? v.ticket
     }
-    body.push(
-      <Box key="q-actions">
+    keys.push(
+      <Box key="q-actions" {...BAR}>
         <Button key="pull" plain hotkey="p" onPress={(p: any) => { const id = under(p.requestId); if (id) pull($, o, id, 'pulled by the operator at the desk') }}>pull the ticket under the ring</Button>
         <Button key="reread" plain hotkey="r" onPress={(p: any) => { const id = under(p.requestId); if (id) void $.prompt.submit({ text: `Read every comment on ticket #${id} again now with ${o.outwardTool} (proxy ${o.readProxy}, endpoint ${o.commentsEndpoint}, arguments {"ticket_id":"${id}"}), so the desk records the thread afresh. Do not post anything.` }).catch(() => undefined) }}>re-read its thread</Button>
-        <Button key="open-review" plain hotkey="o" onPress={(p: any) => { const id = under(p.requestId); const d = v.items.find(i => i.ticket === id); if (d) void selectDraft($, o, d.md5) }}>its draft in Review</Button>
+        <Button key="open-review" plain hotkey="o" onPress={(p: any) => { const id = under(p.requestId); const d = v.items.find(i => i.ticket === id); if (d) void selectDraft($, o, d.md5, true, p.requestId) }}>its draft in Review</Button>
       </Box>,
     )
   } else {
@@ -1285,6 +1372,7 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
       {nav}
       {keysOff}
       {finder}
+      {keys}
       {body}
     </Box>
   )

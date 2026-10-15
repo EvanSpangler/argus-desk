@@ -84,6 +84,8 @@ export type Trace = {
 }
 
 export type DeskView = {
+  /** The view the desk pane shows. */
+  which?: 'review' | 'tickets' | 'wall'
   items: DeskItem[]
   queue: QueueRow[]
   wall: WallAgent[]

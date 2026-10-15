@@ -325,6 +325,13 @@ class Desk:
         if prior:
             row["edit"] = {"from": supersedes, "chars_before": prior.get("chars"), "distance": _distance(prior.get("text", ""), text)}
         self._append(self.requests_path, row)
+        # The newest draft on a ticket is the one at the desk. Left pending, an older one (the draft a redraft names, or a
+        # whole earlier run's) stayed beside it, counted as waiting and open to a Send: two replies to one customer.
+        # A Modify has withdrawn its draft already; a redraft round and a rerun had not.
+        for old, r in self._requests().items():
+            if old != md5 and r["ticket"] == str(ticket) and self.ledger.state(old)["state"] == "pending":
+                why = "superseded by " if old == supersedes else "replaced by the newer draft "
+                self.ledger._append({"event": "withdraw", "md5": old, "by": by, "reason": why + md5})
         return {"ok": True, "md5": md5, "ticket": str(ticket), "verdict": checks["verdict"], "hits": checks["hits"],
                 "warnings": checks["warnings"], "claims": checks["claims"], "thread": checks["thread"]}
 
@@ -333,8 +340,14 @@ class Desk:
         a grant past its 6 h life are written off first, so the desk shows what the guide says it shows."""
         self.ledger.sweep()
         events = self.ledger.events()
+        requests = self._requests()
+        # records from before 0.8.1 left older drafts pending beside the newest on their ticket: only the newest filed is
+        # shown, and once it is decided the older ones are not offered in its place
+        newest = {r["ticket"]: md5 for md5, r in requests.items()}
         items = []
-        for md5, r in self._requests().items():
+        for md5, r in requests.items():
+            if newest.get(r["ticket"]) != md5:
+                continue
             st = self.ledger.state(md5, events=events)
             if st["state"] in ("pending", "open"):
                 items.append({"md5": md5, "ticket": r["ticket"], "state": st["state"], "source": r.get("source"),
@@ -350,6 +363,11 @@ class Desk:
             return {"ok": False, "reason": "unknown md5"}
         if status not in STATUSES:
             return {"ok": False, "reason": "status must be one of %s" % ", ".join(STATUSES)}
+        reqs = list(self._requests().items())
+        mine = next((i for i, (m, _) in enumerate(reqs) if m == md5), None)
+        later = [m for m, r in reqs[mine + 1:] if r["ticket"] == req["ticket"]] if mine is not None else []
+        if later:
+            return {"ok": False, "reason": "superseded by %s, the newer draft on #%s" % (later[-1][:8], req["ticket"])}
         # The press is the operator's own act at the terminal; the harness, not the model, raised it.
         src = CL.DictSource({press_id: {"from_operator": True, "automated": False, "ts": now, "body": "go %s" % md5}})
         r = self.ledger.grant_by_message(md5, press_id, src, OPERATOR)

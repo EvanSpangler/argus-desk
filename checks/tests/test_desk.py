@@ -50,9 +50,44 @@ class DeskTests(unittest.TestCase):
         self.assertEqual(s["edit_distance"]["n"], 1)
         self.assertEqual(s["wait_s"]["median"], 30)
 
+    def test_a_redraft_takes_the_place_of_the_draft_it_supersedes(self):
+        d, c = mk()
+        a = d.file("4", DRAFT)["md5"]
+        b = d.file("4", DRAFT.replace("Thanks!", "Thank you!"), supersedes=a)["md5"]
+        self.assertEqual([i["md5"] for i in d.list()["items"]], [b], "only the newest draft waits")
+        self.assertEqual(d.ledger.state(a)["state"], "withdrawn")
+        g = d.grant(a, "p-old")
+        self.assertFalse(g["ok"]); self.assertIn("superseded by", g["reason"])
+        self.assertTrue(d.grant(b, "p-new")["ok"])
+
+    def test_a_rerun_draft_replaces_the_earlier_runs_draft_on_the_ticket(self):
+        d, c = mk()
+        a = d.file("6", DRAFT)["md5"]
+        other = d.file("7", DRAFT + "PS.\n")["md5"]
+        b = d.file("6", DRAFT.replace("Thanks!", "Thank you!"))["md5"]
+        self.assertEqual(sorted(i["md5"] for i in d.list()["items"]), sorted([other, b]))
+        self.assertEqual(d.ledger.state(a)["state"], "withdrawn")
+        self.assertEqual(d.ledger.state(other)["state"], "pending", "another ticket's draft is left alone")
+        self.assertFalse(d.grant(a, "p")["ok"])
+
+    def test_superseded_drafts_filed_before_the_withdraw_stay_off_the_desk(self):
+        # records written before 0.8.1 left the superseded draft pending in the ledger
+        d, c = mk()
+        a = d.file("5", DRAFT)["md5"]
+        b = D.md5_of(D._norm_draft(DRAFT + "x\n"))
+        d.ledger.request(b, DRAFT + "x\n", "Zendesk #5 public reply", "argus", kind="send")
+        d._append(d.requests_path, {"md5": b, "ticket": "5", "source": "argus", "supersedes": a, "chars": 1,
+                                    "checks": {"verdict": "clear", "hits": [], "warnings": []}, "text": DRAFT + "x\n"})
+        self.assertEqual(d.ledger.state(a)["state"], "pending")
+        self.assertEqual([i["md5"] for i in d.list()["items"]], [b])
+        self.assertFalse(d.grant(a, "p")["ok"])
+        # the newest denied, the older one is not offered in its place
+        d.deny(b, "rerun it")
+        self.assertEqual([i["md5"] for i in d.list()["items"]], [])
+
     def test_press_id_is_single_spend(self):
         d, c = mk()
-        a = d.file("3", DRAFT)["md5"]; b = d.file("3", DRAFT + "x\n")["md5"]
+        a = d.file("3", DRAFT)["md5"]; b = d.file("33", DRAFT + "x\n")["md5"]
         self.assertTrue(d.grant(a, "same-press")["ok"])
         self.assertFalse(d.grant(b, "same-press")["ok"])
 

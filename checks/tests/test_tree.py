@@ -36,6 +36,24 @@ def ids(node):
     return [c["id"] for c in node["children"]]
 
 class TreeTests(unittest.TestCase):
+    def test_a_rerun_draft_carries_only_its_own_runs_findings(self):
+        d, c, T, md5, k = seed()
+        c.t += 3600
+        d.run_update(T, phase="new", agent={"id": "b1", "role": "investigator", "label": "inv1", "model": "sonnet", "status": "completed", "params": "docs-first"})
+        c.t += 60
+        o2 = d.finding(T, "rev", "reviewer", "objection", "A second run's objection about its own draft")
+        c.t += 60
+        new = d.file(T, DRAFT.replace("Thanks!", "Thank you!"))["md5"]
+        tn = DT.build(d, new)
+        open_new = [n["id"] for n in DT.find(tn["tree"], "issues")["children"] if n["id"].startswith("issue:f-")]
+        self.assertEqual(open_new, ["issue:" + o2["id"]], "the earlier run's objection is not the new draft's")
+        self.assertEqual([a["id"] for a in tn["tree"]["children"] if a["id"] == "run"], ["run"])
+        # the first draft still shows its own run: its objection, its agents
+        to = DT.build(d, md5)
+        open_old = [n["id"] for n in DT.find(to["tree"], "issues")["children"] if n["id"].startswith("issue:f-")]
+        self.assertEqual(open_old, ["issue:" + k["o1"]])
+        self.assertIn("inv3", json.dumps(DT.find(to["tree"], "run")))
+
     def test_sentences_carry_legs_receipts_findings_and_arguments(self):
         d, c, T, md5, k = seed()
         t = DT.build(d, md5)

@@ -1,6 +1,7 @@
 # The desk interface: design
 
-Status: BUILT in 0.8.0, 2026-10-15 (three panes; Send at the operator's discretion, the overrule logged as today, no reason
+Status: BUILT in 0.8.0, 2026-10-15, revised in 0.8.1 after the first session at a real terminal (three views in one
+pane, see section 4; Send at the operator's discretion, the overrule logged as today, no reason
 required; provenance marks, no grades). Standing rule from the operator: every navigation key and action is visible
 and labelled on screen, drawn as the engine draws a hotkey button (`z: zoom`); arrows, and Esc, Enter and Space
 where their meaning is plain, are the only unlabelled keys. The 0.7.0 pane (four panes,
@@ -47,7 +48,7 @@ the Review pane, and `/desk show M [ID]` as text (the route for a session withou
 reading over the shoulder). The model is testable in Python with no terminal.
 
 ```
-draft a21f140c for #147802                      (root: ticket, md5, state, filed, by, supersedes)
+draft a21f140c for #123456                      (root: ticket, md5, state, filed, by, supersedes)
 |- ISSUES (3 open)                              first, always; empty reads "nothing open"
 |  |- objection revB: "the second paragraph asserts the connector retries; the receipt says it reconnects"
 |  |     state open   -> zooms to REPLY sentence 4
@@ -93,19 +94,24 @@ operator sent with it open; the decision names it). The desk never closes an obj
 
 ## 4. Panes and keys
 
-Three panes, the engine's own, switched by its tab bar or 1 to 3 from inside any pane:
+Three views in one pane, switched by 1 to 3 from inside it. 0.8.0 made each view a pane of the engine's own; the
+engine refuses `ui.open({ focus })` while the person holds a pane, so 1 to 3 could never raise another pane, and the
+plugin test host does not model that refusal. In 0.8.1 the view is the pane's own state; the first line names the
+three, the one showing in brackets:
 
 - **1 Review**: the tree above for the selected draft, with the decisions.
 - **2 Tickets**: the queue, one row per ticket; a row expands to its thread, its runs and its drafts.
 - **3 Wall**: every agent live, one row each; Enter tails one (what 0.7.0 built).
 
-Every pane: the second line reads `keys off: ctrl+x then tab, or click the pane` until it holds the
-keyboard. Every key that does something is drawn as a labelled button on the pane (`z: zoom`, `u: up`); the
-action rows ARE the key list, and nothing works that is not drawn. Tab and the arrows walk the rows, Enter
-acts on the row under the ring. `f: find` puts the cursor in the field (type, Enter narrows to matching nodes
+Every view: the second line reads `keys off: ctrl+x then tab, or click the pane` until it holds the
+keyboard. Every key that does something is drawn as a labelled button (`z: zoom`, `u: up`) on bars at the top of
+the view, wrapping with a gap between buttons; the bars ARE the key list, and nothing works that is not drawn. Below
+the rows they were off screen on a long tree, and as one unwrapped row they ran together and past the pane's edge.
+Tab walks the rows, the arrows scroll (the engine's keys), Enter acts on the row under the ring; a view opens with
+the ring on its first row, and a decision leaves it on the next draft's first row, never on Send. `f: find` puts the cursor in the field (type, Enter narrows to matching nodes
 shown with their ancestors), `c: clear` empties it.
 
-Review pane keys:
+Review keys:
 
 ```
 enter  expand or collapse the node under the ring
@@ -122,7 +128,7 @@ Send is the operator's call whatever ISSUES holds: a Send with issues open is re
 them, as today, and no reason is asked (decided 2026-10-15). The Send button's label says how many are open
 (`s: Send, pending (2 open)`) so the press is informed.
 
-Breadcrumb line, always first: `#147802  draft a21f140c  > REPLY > sentence 4` with the draft's state and age.
+Breadcrumb line, always first: `#123456  draft a21f140c  > REPLY > sentence 4` with the draft's state and age.
 
 Wireframe, Review pane, 100 columns, zoomed to a sentence:
 
@@ -130,7 +136,7 @@ Wireframe, Review pane, 100 columns, zoomed to a sentence:
 1: Review  2: Tickets  3: Wall     2 waiting, 0 agents, poll on
 enter: open  z: zoom  u: up  x: all  i: issues  g: follow  s v m d: decide  f: find
 find [                                  ]
-#147802  draft a21f140c  clear  filed 18:51  > REPLY > sentence 1
+#123456  draft a21f140c  clear  filed 18:51  > REPLY > sentence 1
 [docs+material] The connector reports unhealthy when the broker is disabled.
 - receipt r1  docs  https://docs.wiz.io/docs/connector-health  (fetched page)
     "When the broker is disabled, the connector reports unhealthy until it is re-enabled."
@@ -146,12 +152,12 @@ find [                                  ]
 [ s Send, pending ]  v Send, solved   m Modify   d Deny   o ticket   n next
 ```
 
-Tickets pane: rows `#n state SLA age subject`; Enter expands the row in place to `thread (n of m recorded,
+Tickets view: rows `#n state SLA age subject`; Enter expands the row in place to `thread (n of m recorded,
 age)`, `runs (phase, rounds, agents)`, `drafts (md5, marks, state)`; Enter on a draft opens it in Review;
 `p` pulls the ticket under the ring; `r` re-reads the thread (asks the model to list the comments again, so
 the record is fresh before a Send).
 
-Wall pane: as 0.7.0.
+Wall view: as 0.7.0.
 
 ## 5. What changes beneath
 
@@ -162,8 +168,8 @@ Wall pane: as 0.7.0.
 - `desk.py grant --overrule "<why>"`: the reason stored on the decision with the ids of the issues open at
   the press; `audit --text` prints it under the decision.
 - `/desk show M [node]`: the tree as text, same JSON.
-- The mod: one `ui.render` per pane; the Review pane holds expand state and the breadcrumb in `$.state`;
-  a `ui.focus` hook keeps the ring per pane so `z`, `x`, `g`, `p` act on the row under it.
+- The mod: one `ui.render` for the Desk pane, the view in `$.state` beside the Review's expand state and
+  breadcrumb; a `ui.focus` hook keeps the ring so `z`, `x`, `g`, `p` act on the row under it.
 - Issue targets: every ISSUES child carries a node id; `g` zooms there.
 
 Not changed: the gate, the grant, the record, the agents, the checks. The desk's rules stay where they are;

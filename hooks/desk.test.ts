@@ -103,7 +103,7 @@ test('the pane shows the draft with its checks and the three decisions on every 
   fake(on, () => ({ ok: true, items: [ITEM] }))
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
   for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ plugin: 'argus-desk', surface, component: 'Pane', requestId: 'desk-review', props: { title: 'Review', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
+    const ui = await $.ui.mount({ plugin: 'argus-desk', surface, component: 'Pane', requestId: 'desk', props: { title: 'Desk', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
     expect(await ui.find({ type: 'Text', text: /1 waiting/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /did not build/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /NOT captured/ })).toBeDefined()
@@ -120,12 +120,21 @@ test('Send grants through desk.py and wakes the model to post; Deny records the 
   const prompts: string[] = []
   on('prompt.submit', async (_$: any, e: any) => { prompts.push(e.text); return { text: e.text } })
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
-  const ui = await $.ui.mount({ plugin: 'argus-desk', surface: 'terminal', component: 'Pane', requestId: 'desk-review', props: { title: 'Review', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
+  const ui = await $.ui.mount({ plugin: 'argus-desk', surface: 'terminal', component: 'Pane', requestId: 'desk', props: { title: 'Desk', isFocused: true, bodyColumns: 100, placement: 'dock' } } as any)
   await ui.press({ key: 'send' })
   const grant = calls.find(c => cmdOf(c) === 'grant')
   expect(grant).toBeDefined()
   expect(grant!.argv).toContain(ITEM.md5)
   expect(prompts.some(p => /approved draft a1b2c3d4/.test(p))).toBe(true)
+  // the prompt carries the text: the session that posts may never have seen the draft a subagent filed
+  expect(prompts.find(p => /approved draft a1b2c3d4/.test(p))).toContain(ITEM.text)
+  // cancel leaves the draft undecided and brings the decisions back
+  await ui.press({ key: 'deny' })
+  expect(await ui.find({ key: 'send' })).toBeUndefined()
+  await ui.press({ key: 'cancel' })
+  expect(await ui.find({ key: 'deny-reason' })).toBeUndefined()
+  expect(await ui.find({ key: 'send' })).toBeDefined()
+  expect(calls.some(c => cmdOf(c) === 'deny')).toBe(false)
   await ui.press({ key: 'deny' })
   await ui.input({ key: 'deny-reason', text: 'wrong ask' })
   const deny = calls.find(c => cmdOf(c) === 'deny')
@@ -344,7 +353,7 @@ test('the poller\'s pull spawns under the driver a /desk command created; /desk 
   const r = await $.command.run({ command: 'desk', args: 'queue' })
   expect(String(r.text)).toMatch(/Desk: Tickets/)
   expect(String(r.text)).toMatch(/ctrl\+x then tab/)
-  expect(opened).toContain('desk-tickets!')
+  expect(opened).toContain('desk!')
 })
 
 test('/desk query sets the search the poller sends, kept in the plugin store, and the poll line names it', async ($, on) => {
@@ -460,31 +469,56 @@ const treeFake = (r: Run) => {
   return { ok: true, items: [ITEM] }
 }
 
-test('each view is a pane of its own: 1 to 3 open the others with the focus, and a pane without the keys says how to take them', async ($, on) => {
+test('the three views share one pane: 1 to 3 switch the view inside it, the panes 0.8.0 opened are closed, and a pane without the keys says how to take them', async ($, on) => {
   const opened: string[] = []
+  const closed: string[] = []
   on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })
+  on('ui.close', async (_$: any, e: any, next: any) => { closed.push(e.id); return next(e) })
   fake(on, treeFake)
   await $.command.run({ command: 'desk', args: '' })
-  expect(opened).toEqual(['desk-review', 'desk-tickets', 'desk-wall', 'desk-review!'])
-  const off = await mountPane($, 'desk-review', false)
+  expect(opened).toEqual(['desk!'])
+  expect(closed).toEqual(['desk-review', 'desk-tickets', 'desk-wall'])
+  const off = await mountPane($, 'desk', false)
   expect(await off.find({ type: 'Text', text: /keys off: press ctrl\+x then tab/ })).toBeDefined()
   await off.unmount()
-  const ui = await mountPane($, 'desk-review')
+  const ui = await mountPane($, 'desk')
   expect(await ui.find({ type: 'Text', text: /keys off/ })).toBeUndefined()
+  expect((await ui.find({ key: 'go-review' }))!.text).toBe('[Review]')
+  expect(await ui.find({ key: 'send' })).toBeDefined()
+  // the switch is the pane's own state: no focus has to move, so the engine has nothing to refuse
   await ui.press({ key: 'go-tickets' })
-  expect(opened[opened.length - 1]).toBe('desk-tickets!')
+  expect((await ui.find({ key: 'go-tickets' }))!.text).toBe('[Tickets]')
+  expect(await ui.find({ key: 'pull' })).toBeDefined()
+  expect(await ui.find({ key: 'send' })).toBeUndefined()
+  await ui.press({ key: 'go-wall' })
+  expect(await ui.find({ type: 'Text', text: /No agents yet/ })).toBeDefined()
+  await ui.press({ key: 'go-review' })
+  expect(await ui.find({ key: 'send' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the keys are drawn above the rows, on bars that wrap with a gap between buttons', async ($, on) => {
+  fake(on, treeFake)
+  await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
+  const ui = await mountPane($, 'desk')
+  const order = (await ui.findAll({ type: 'Button' })).map((b: any) => String(b.key))
+  for (const k of ['send', 'jump-issues', 'zoom']) expect(order.indexOf(k)).toBeLessThan(order.indexOf('n:issues'))
+  expect(order.indexOf('send')).toBeLessThan(order.indexOf('jump-issues'))
+  const bars = await Promise.all(['nav', 'r-decide', 'r-jump', 'r-nav'].map(key => ui.find({ key })))
+  for (const b of bars) expect(b.props).toMatchObject({ flexWrap: 'wrap', columnGap: 3 })
   await ui.unmount()
 })
 
 test('the Review pane is the proof tree: rows expand, bodies load on demand, zoom and up move the root, an issue leads to its sentence, find narrows', async ($, on) => {
   const calls = fake(on, treeFake)
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
-  const ui = await mountPane($, 'desk-review')
+  const ui = await mountPane($, 'desk')
   expect(await ui.find({ type: 'Text', text: /draft a1b2c3d4 for #123456/ })).toBeDefined()
   // ISSUES and REPLY open by default, the rest closed
   expect(await ui.find({ key: 'n:issue:s1:uncovered' })).toBeDefined()
   expect(await ui.find({ key: 'n:reply:s1' })).toBeDefined()
   expect(await ui.find({ key: 'n:run:inv1' })).toBeUndefined()
+  expect((await ui.find({ key: 'n:reply:s0' }))!.text).toMatch(/· \[-\] Hi Sam,/)
   // every key is a drawn button
   for (const k of ['zoom', 'up', 'expand-all', 'follow', 'jump-issues', 'jump-ask', 'jump-reply', 'jump-run', 'open-ticket', 'send', 'solve', 'modify', 'deny', 'find']) expect(await ui.find({ key: k })).toBeDefined()
   expect((await ui.find({ key: 'send' }))!.text).toMatch(/Send, pending \(1 open\)/)
@@ -516,13 +550,32 @@ test('the Review pane is the proof tree: rows expand, bodies load on demand, zoo
   await ui.unmount()
 })
 
+test('a row cut to the pane width opens to its whole text, so a long customer message can be read in full', async ($, on) => {
+  const LONG = 'customer 10-14 13:14: ' + 'I think there is a misunderstanding about what we are asking. '.repeat(4) + 'END-OF-MESSAGE'
+  const tree = { ...TREE, tree: { ...TREE.tree, children: [{ id: 'ask', label: 'ASK', children: [{ id: 'ask:m1', label: LONG, children: [] }] }] } }
+  fake(on, r => (cmdOf(r) === 'tree' ? tree : cmdOf(r) === 'queue' ? { ok: true, rows: ROWS } : { ok: true, items: [ITEM] }))
+  await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
+  const ui = await mountPane($, 'desk')
+  await ui.press({ key: 'n:ask' })
+  const r = await ui.find({ key: 'n:ask:m1' })
+  expect(r!.text).toMatch(/^\s+\+ customer/)
+  expect(r!.text).not.toMatch(/END-OF-MESSAGE/)
+  await ui.press({ key: 'n:ask:m1' })
+  expect(await ui.find({ type: 'Text', text: /END-OF-MESSAGE/ })).toBeDefined()
+  // a row shown whole has nothing more to open
+  expect((await ui.find({ key: 'n:ask' }))!.text).toMatch(/^- ASK/)
+  await ui.press({ key: 'n:ask:m1' })
+  expect(await ui.find({ type: 'Text', text: /END-OF-MESSAGE/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('a Tickets row opens to its thread, run and drafts; Enter on a draft puts it in Review; the filter narrows rows', async ($, on) => {
   fake(on, treeFake)
   const opened: string[] = []
   on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)
   await $.command.run({ command: 'desk', args: 'tickets' })
-  const q = await mountPane($, 'desk-tickets')
+  const q = await mountPane($, 'desk')
   expect(await q.find({ key: 'ticket:123457' })).toBeDefined()
   expect(await q.find({ key: 'ticket:123456' })).toBeDefined()
   expect(await q.find({ key: `draft:${ITEM.md5}` })).toBeUndefined()
@@ -536,7 +589,8 @@ test('a Tickets row opens to its thread, run and drafts; Enter on a draft puts i
   expect(await q.find({ key: 'ticket:123457' })).toBeUndefined()
   await q.press({ key: 'clear' })
   await q.press({ key: `draft:${ITEM.md5}` })
-  expect(opened[opened.length - 1]).toBe('desk-review!')
+  expect(opened[opened.length - 1]).toBe('desk!')
+  expect(await q.find({ key: 'send' })).toBeDefined()
   await q.unmount()
 })
 
@@ -548,7 +602,8 @@ test('the Wall lists every agent as a row; Enter tails one, b comes back', async
   await $.command.run({ command: 'desk', args: 'pull 123457' })
   await clock.advance(2_100)
   expect(spawns.length).toBe(3)
-  const w = await mountPane($, 'desk-wall')
+  await $.command.run({ command: 'desk', args: 'wall' })
+  const w = await mountPane($, 'desk')
   expect(await w.find({ type: 'Text', text: /#123457/ })).toBeDefined()
   const rows = await w.findAll({ type: 'Button', text: /\* investigator inv/ })
   expect(rows.map((r: any) => r.text.slice(0, 19))).toEqual(['* investigator inv1', '* investigator inv2', '* investigator inv3'])

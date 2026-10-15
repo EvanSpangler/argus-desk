@@ -707,6 +707,8 @@ export const register: Register = (on, options) => {
     const a = e as unknown as { ticket?: string; kind?: string; quote?: string; source?: string; agentId?: string }
     const who = active.get(String(a.agentId ?? ''))
     const r = await desk($, o, ['receipt'], JSON.stringify({ ticket: String(a.ticket ?? ''), kind: String(a.kind ?? ''), quote: String(a.quote ?? ''), source: a.source, by: who?.label }))
+    // a refused receipt is on the record too: the agent claimed to have read something the capture does not hold
+    if (a.agentId && !r.ok) await wallLine($, o, a.agentId, 'receipt-refused', `${String(a.kind)} ${String(r.why ?? r.reason)}: "${String(a.quote ?? '').slice(0, 120)}"${a.source ? ` (${String(a.source)})` : ''}`)
     return { result: r.ok ? `Receipt ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}. Only a sentence you actually read, verbatim, can be receipted${r.why === 'page-not-captured' ? '; fetch the page through the proxy first' : ''}.` }
   }).catch(() => ({ deny: 'argus-desk: the receipt was not minted, try again' }))
 

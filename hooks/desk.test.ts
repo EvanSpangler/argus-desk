@@ -1,4 +1,4 @@
-import { test, expect } from 'claude-code/testing'
+import { test, expect, mock } from 'claude-code/testing'
 
 // The desk's state lives in desk.py; here a fake answers $.process.run so the mod's own logic is what runs.
 type Run = { argv: readonly string[]; stdin?: string }
@@ -11,7 +11,7 @@ const fake = (on: any, answer: (r: Run) => Record<string, unknown>) => {
   })
   return calls
 }
-const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats'].includes(String(a)))
+const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark'].includes(String(a)))
 
 const DRAFT = 'Hi Sam,\n\nThe broker is disabled, so the connector reports unhealthy. Re-enable it under Settings > Connectors.\n\nThanks!\n'
 const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state: 'pending', filed: 1, age_s: 120, chars: 120, text: DRAFT,
@@ -108,4 +108,86 @@ test('Send grants through desk.py and wakes the model to post; Deny records the 
   expect(deny).toBeDefined()
   expect(deny!.argv).toContain('wrong ask')
   await ui.unmount()
+})
+
+const SEARCH = { results: [{ id: 123456, status: 'open', subject: 'Scan stuck', updated_at: '2026-10-15T01:00:00Z' }, { id: 123457, status: 'new', subject: 'SLA one', sla_next_breach_at: '2026-10-15T09:00:00Z', updated_at: '2026-10-15T02:00:00Z' }], count: 2 }
+const NEXT = { ticket: '123457', state: 'new', sla: '2026-10-15T09:00:00Z', age_s: 5 }
+
+test('/desk poll searches the open set through the outward tool, folds it into the queue and pulls the next ticket', async ($, on) => {
+  const clock = mock.clock(on)
+  const calls = fake(on, r => (cmdOf(r) === 'sync' ? { ok: true, rows: [NEXT], next: NEXT, busy: [] } : cmdOf(r) === 'queue' ? { ok: true, rows: [NEXT] } : { ok: true, items: [] }))
+  const prompts: string[] = []
+  on('prompt.submit', async (_$: any, e: any) => { prompts.push(e.text); return { text: e.text } })
+  const searches: any[] = []
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async (_$: any, e: any) => { searches.push(e); return { result: SEARCH, text: JSON.stringify(SEARCH) } })
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 1 } } as any)
+  searches.length = 0
+  const r = await $.command.run({ command: 'desk', args: 'poll' })
+  expect(String(r.text)).toMatch(/Polled 2/)
+  expect(String(r.text)).toMatch(/pulled #123457/)
+  expect(searches[0].endpoint).toBe('zendesk_search_tickets')
+  expect(searches[0].proxy).toBe('zendesk-full')
+  const sync = calls.find(c => cmdOf(c) === 'sync')
+  expect(sync).toBeDefined()
+  const tickets = JSON.parse(sync!.stdin!).tickets
+  expect(tickets.map((t: any) => t.id)).toEqual(['123456', '123457'])
+  expect(tickets[1].sla).toBe('2026-10-15T09:00:00Z')
+  const mark = calls.find(c => cmdOf(c) === 'mark')
+  expect(mark).toBeDefined()
+  expect(mark!.argv).toContain('123457')
+  expect(mark!.argv).toContain('drafting')
+  await clock.advance(5)
+  expect(prompts.join(' || ')).toMatch(/#123457[^|]*file_draft[^|]*skip_ticket/)
+  // the gate saw the search as a read: no consume
+  expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(0)
+})
+
+test('the poller runs on the clock while polling is on, and not while paused', async ($, on) => {
+  const clock = mock.clock(on)
+  fake(on, r => (cmdOf(r) === 'sync' ? { ok: true, rows: [], next: null, busy: [] } : { ok: true, items: [], rows: [] }))
+  let searches = 0
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => { searches++; return { result: { results: [] }, text: '{"results":[]}' } })
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 1 } } as any)
+  searches = 0
+  await $.command.run({ command: 'desk', args: 'resume' })
+  await clock.advance(5 * 60_000 + 10)
+  expect(searches).toBe(1)
+  await $.command.run({ command: 'desk', args: 'pause' })
+  await clock.advance(5 * 60_000)
+  expect(searches).toBe(1)
+  await $.command.run({ command: 'desk', args: 'resume' })
+  await clock.advance(5 * 60_000)
+  expect(searches).toBe(2)
+})
+
+test('a granted post without the chosen status is refused with the grant left open; with it, the post runs and the status is read back', async ($, on) => {
+  let consumes = 0
+  const calls = fake(on, r => {
+    if (cmdOf(r) !== 'consume') return { ok: true, items: [], rows: [] }
+    consumes++
+    const flat = JSON.parse(r.stdin!).flat as string
+    return /"status":"pending"/.test(flat) ? { ok: true, md5: ITEM.md5, ticket: '123456', status: 'pending' } : { ok: false, code: 'status-missing', md5: ITEM.md5, status: 'pending' }
+  })
+  const seen: any[] = []
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async (_$: any, e: any) => {
+    seen.push(e)
+    return e.endpoint === 'zendesk_get_ticket' ? { result: {}, text: '{"ticket":{"id":123456,"status":"pending"}}' } : { result: { posted: true }, text: '{"ok":true}' }
+  })
+  const bare = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, comment: { body: DRAFT, public: true } } } as any)
+  expect(bare.deny).toMatch(/status set to "pending"/)
+  expect(seen.length).toBe(0)
+  const full = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-write', endpoint: 'zendesk_update_ticket', arguments: { ticket_id: 123456, ticket: { status: 'pending', comment: { body: DRAFT, public: true } } } } as any)
+  expect(full.deny).toBeUndefined()
+  expect(consumes).toBe(2)
+  expect(seen.map(e => e.endpoint)).toEqual(['zendesk_update_ticket', 'zendesk_get_ticket'])
+  expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(2)
+})
+
+test('skip_ticket records the reason and frees the queue', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [], rows: [] }))
+  const r = await $.tool.call({ tool: 'mcp__argus-desk__skip_ticket', ticket: '123456', reason: 'customer answered their own question' } as any)
+  expect(String(r.result)).toMatch(/needs no reply/)
+  const mark = calls.find(c => cmdOf(c) === 'mark')
+  expect(mark!.argv).toContain('skipped')
+  expect(mark!.argv).toContain('customer answered their own question')
 })

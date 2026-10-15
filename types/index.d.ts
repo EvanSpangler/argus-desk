@@ -20,11 +20,24 @@ export type DeskItem = {
   supersedes?: string | null
 }
 
+export type QueueRow = {
+  ticket: string
+  state: 'new' | 'reopened' | 'drafting' | 'waiting' | 'stale' | 'sent' | 'done' | 'gone' | 'skipped'
+  sla?: string | null
+  subject?: string
+  age_s: number
+  status?: string
+}
+
 export type DeskView = {
   items: DeskItem[]
+  queue: QueueRow[]
   selected?: string
   mode: 'list' | 'deny' | 'modify'
   notice?: string
+  poll: 'on' | 'paused' | 'off'
+  lastPoll?: number
+  pollError?: string
 }
 
 declare module 'claude-code' {

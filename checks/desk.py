@@ -23,6 +23,8 @@ import claim_receipts as CR
 import thread_review as TR
 
 OPERATOR = "operator"
+STATUSES = ("pending", "solved", "open", "on-hold")   # the Zendesk status a Send may set
+STALE_S = 30 * 60                                     # a pull with nothing filed after this is offered again
 DASH = re.compile("[–—]")
 TIMELINE = re.compile(r"\b(shortly|soon|asap|as soon as possible|by (?:end of|eod|tomorrow|monday|tuesday|wednesday|thursday|friday)|within (?:the )?(?:hour|day|\d+ (?:hours|days)))\b", re.I)
 
@@ -43,6 +45,8 @@ class Desk:
         self.requests_path = os.path.join(root, "requests.jsonl")
         self.receipts_path = os.path.join(root, "receipts.jsonl")
         self.decisions_path = os.path.join(root, "decisions.jsonl")
+        self.transitions_path = os.path.join(root, "transitions.jsonl")
+        self.queue_path = os.path.join(root, "queue.json")
 
     # ---- storage helpers
     def _rows(self, path):
@@ -150,17 +154,21 @@ class Desk:
         items.sort(key=lambda i: i["filed"])
         return {"ok": True, "items": items}
 
-    def grant(self, md5, press_id):
+    def grant(self, md5, press_id, status="pending"):
         now = self.clock()
         req = self._requests().get(md5)
         if not req:
             return {"ok": False, "reason": "unknown md5"}
+        if status not in STATUSES:
+            return {"ok": False, "reason": "status must be one of %s" % ", ".join(STATUSES)}
         # The press is the operator's own act at the terminal; the harness, not the model, raised it.
         src = CL.DictSource({press_id: {"from_operator": True, "automated": False, "ts": now, "body": "go %s" % md5}})
         r = self.ledger.grant_by_message(md5, press_id, src, OPERATOR)
         if r.get("ok"):
             self._decide(md5, req, "send", press_id)
-        return dict(r, md5=md5)
+            # The Send carries the status the posting call must set; the gate checks the call for it.
+            self._append(self.transitions_path, {"md5": md5, "ticket": req["ticket"], "event": "granted", "status": status})
+        return dict(r, md5=md5, status=status)
 
     def deny(self, md5, reason):
         req = self._requests().get(md5)
@@ -191,9 +199,16 @@ class Desk:
                                            "hits": req["checks"]["hits"], "source": req.get("source"),
                                            "supersedes": req.get("supersedes"), "edit": req.get("edit")})
 
-    def consume(self, candidates, what):
+    def _required_status(self, md5):
+        for row in reversed(self._rows(self.transitions_path)):
+            if row.get("md5") == md5 and row.get("event") == "granted":
+                return row.get("status")
+        return None
+
+    def consume(self, candidates, what, flat=""):
         """The send gate. Each candidate is a text the outward call carries; the first whose md5 has an open
-        grant is consumed. Nothing else gets through."""
+        grant is consumed. Nothing else gets through. `flat` is the whole call as JSON: the post must also
+        set the status the Send chose, or it is refused with the grant left open."""
         tried = []
         for cand in candidates or []:
             if not isinstance(cand, str):
@@ -205,11 +220,97 @@ class Desk:
                     continue
                 tried.append({"md5": md5, "state": st})
                 if st == "open":
+                    need = self._required_status(md5)
+                    if need and not re.search(r'"status"\s*:\s*"%s"' % re.escape(need), flat or ""):
+                        return {"ok": False, "code": "status-missing", "md5": md5, "status": need, "tried": tried}
                     r = self.ledger.consume(md5, text, "argus", what, via="gate")
                     if r.get("ok"):
-                        return {"ok": True, "md5": md5}
+                        ticket = self._requests().get(md5, {}).get("ticket")
+                        self._append(self.transitions_path, {"md5": md5, "ticket": ticket, "event": "posted", "status": need})
+                        if ticket:
+                            self._mark(ticket, "sent", md5=md5, status=need)
+                        return {"ok": True, "md5": md5, "ticket": ticket, "status": need}
         pend = [i["md5"] for i in self.list()["items"]]
         return {"ok": False, "tried": tried, "undecided": pend}
+
+    # ---- the queue: open tickets the poller saw, and where each one stands
+    def _queue(self):
+        if not os.path.exists(self.queue_path):
+            return {}
+        with open(self.queue_path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _save_queue(self, q):
+        tmp = self.queue_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(q, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.queue_path)
+
+    def _mark(self, ticket, state, **extra):
+        q = self._queue()
+        row = q.setdefault(str(ticket), {"first_seen": self.clock(), "state": "new"})
+        row["state"] = state
+        row[state + "_at"] = self.clock()
+        row.update({k: v for k, v in extra.items() if v is not None})
+        self._save_queue(q)
+        return row
+
+    def sync(self, tickets):
+        """Fold one poll of the open set into the queue. A ticket seen for the first time is `new`; one we
+        posted to that reappears with a newer update is `reopened`; one we posted to that left the open set
+        is `done`, the status transition confirmed; one that left without a post is `gone`."""
+        now = self.clock()
+        q = self._queue()
+        seen = set()
+        for t in tickets or []:
+            tid = str(t.get("id") or "").strip()
+            if not tid:
+                continue
+            seen.add(tid)
+            row = q.get(tid)
+            fields = {"status": t.get("status"), "sla": t.get("sla"), "subject": (t.get("subject") or "")[:120],
+                      "updated": t.get("updated"), "last_seen": now}
+            if not row:
+                q[tid] = dict(fields, first_seen=now, state="new", new_at=now)
+                continue
+            row.update({k: v for k, v in fields.items() if v is not None})
+            if row["state"] in ("sent", "done") and (row.get("updated") or "") > (row.get("sent_updated") or ""):
+                row["state"], row["reopened_at"] = "reopened", now
+            elif row["state"] == "gone":
+                row["state"], row["new_at"] = "new", now
+        for tid, row in q.items():
+            if tid in seen or row["state"] in ("done", "gone", "skipped"):
+                continue
+            if row["state"] == "sent":
+                row["state"], row["done_at"] = "done", now
+                row["transition"] = "confirmed"
+                self._append(self.transitions_path, {"md5": row.get("md5"), "ticket": tid, "event": "confirmed", "status": row.get("status_set")})
+            else:
+                row["state"], row["gone_at"] = "gone", now
+        self._save_queue(q)
+        return self.queue_view()
+
+    def queue_view(self):
+        now = self.clock()
+        q = self._queue()
+        waiting = {i["ticket"] for i in self.list()["items"]}
+        rows = []
+        for tid, row in q.items():
+            st = row["state"]
+            if tid in waiting:
+                st = "waiting"
+            elif st == "drafting" and now - row.get("drafting_at", now) > STALE_S:
+                st = "stale"
+            rows.append({"ticket": tid, "state": st, "sla": row.get("sla"), "subject": row.get("subject"),
+                         "age_s": int(now - row.get("first_seen", now)), "status": row.get("status")})
+        busy = [r for r in rows if r["state"] in ("drafting", "waiting")]
+        pullable = [r for r in rows if r["state"] in ("new", "reopened", "stale")]
+        pullable.sort(key=lambda r: (r["sla"] is None, r["sla"] or "", -r["age_s"]))
+        order = {"waiting": 0, "drafting": 1, "stale": 2, "reopened": 3, "new": 4, "sent": 5, "skipped": 6, "done": 7, "gone": 8}
+        rows.sort(key=lambda r: (order.get(r["state"], 9), r["sla"] is None, r["sla"] or "", -r["age_s"]))
+        nxt = None if busy else (pullable[0] if pullable else None)
+        return {"ok": True, "rows": rows, "next": nxt, "busy": [r["ticket"] for r in busy],
+                "counts": {k: sum(1 for r in rows if r["state"] == k) for k in order}}
 
     def capture(self, ticket, messages, count):
         now = self.clock()
@@ -239,7 +340,13 @@ class Desk:
                 hit_counts[h] = hit_counts.get(h, 0) + 1
         held_then = {k: sum(1 for d in dec if d["verdict"] == "hold" and d["decision"] == k) for k in ("send", "deny", "modify")}
         clear_then = {k: sum(1 for d in dec if d["verdict"] == "clear" and d["decision"] == k) for k in ("send", "deny", "modify")}
+        tr = self._rows(self.transitions_path)
+        posted = sum(1 for t in tr if t["event"] == "posted")
+        confirmed = sum(1 for t in tr if t["event"] == "confirmed")
+        q = self._queue()
         return {"ok": True, "filed": len(reqs), "decided": n, "decisions": by,
+                "transitions": {"posted": posted, "confirmed": confirmed},
+                "queue": {k: sum(1 for r in q.values() if r["state"] == k) for k in ("new", "drafting", "sent", "done", "gone", "skipped")},
                 "sent_as_filed": sent_as_filed, "sent_after_edit": sent_after_edit,
                 "wait_s": {"median": _pct(waits, 0.5), "p90": _pct(waits, 0.9)},
                 "edit_distance": {"median": _pct(dist, 0.5), "n": len(dist)},
@@ -275,6 +382,8 @@ def stats_text(s):
         lines.append("wait to decision: median %ss, p90 %ss" % (s["wait_s"]["median"], s["wait_s"]["p90"]))
     if s["edit_distance"]["n"]:
         lines.append("edit distance on refiled drafts: median %s words (n=%d)" % (s["edit_distance"]["median"], s["edit_distance"]["n"]))
+    lines.append("posts through the gate %d, status transition confirmed by the next poll %d" % (s["transitions"]["posted"], s["transitions"]["confirmed"]))
+    lines.append("queue: %s" % ", ".join("%s %d" % kv for kv in s["queue"].items()))
     lines.append("checks held %d of %d filed; hits: %s" % (s["check_holds"], s["filed"], ", ".join("%s %d" % kv for kv in sorted(s["hit_counts"].items())) or "none"))
     lines.append("decisions on held drafts: %s; on clear drafts: %s" % (
         ", ".join("%s %d" % kv for kv in s["decision_by_verdict"]["hold"].items()),
@@ -284,18 +393,21 @@ def stats_text(s):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
     ap.add_argument("--reason", default="")
     ap.add_argument("--note", default="")
+    ap.add_argument("--status", default="pending", help="status the granted post must set")
+    ap.add_argument("--ticket")
+    ap.add_argument("--state")
     ap.add_argument("--text", action="store_true", help="stats as text")
     a = ap.parse_args(argv)
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
     d = Desk(os.path.expanduser(a.root))
     body = {}
-    if a.cmd in ("file", "consume", "capture"):
+    if a.cmd in ("file", "consume", "capture", "sync"):
         raw = sys.stdin.read()
         body = json.loads(raw) if raw.strip() else {}
     if a.cmd == "file":
@@ -303,13 +415,19 @@ def main(argv=None):
     elif a.cmd == "list":
         out = d.list()
     elif a.cmd == "grant":
-        out = d.grant(a.md5, a.press_id or ("press-%d" % int(time.time() * 1000)))
+        out = d.grant(a.md5, a.press_id or ("press-%d" % int(time.time() * 1000)), a.status)
     elif a.cmd == "deny":
         out = d.deny(a.md5, a.reason)
     elif a.cmd == "modify":
         out = d.modify(a.md5, a.note)
     elif a.cmd == "consume":
-        out = d.consume(body.get("candidates") or [], body.get("what") or "")
+        out = d.consume(body.get("candidates") or [], body.get("what") or "", body.get("flat") or "")
+    elif a.cmd == "sync":
+        out = d.sync(body.get("tickets") or [])
+    elif a.cmd == "queue":
+        out = d.queue_view()
+    elif a.cmd == "mark":
+        out = {"ok": True, "row": d._mark(a.ticket, a.state, note=a.note or None)} if a.ticket and a.state else {"ok": False, "reason": "--ticket and --state"}
     elif a.cmd == "capture":
         out = d.capture(body.get("ticket"), body.get("messages"), body.get("count"))
     else:

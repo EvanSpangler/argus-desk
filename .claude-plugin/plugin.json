@@ -16,6 +16,60 @@
       "default": "python3",
       "description": "Interpreter for the checks (stdlib only)."
     },
+    "pollMinutes": {
+      "type": "number",
+      "title": "Poll every (minutes)",
+      "default": 5,
+      "description": "How often the desk searches for open tickets and pulls the next one; 0 turns polling off."
+    },
+    "readProxy": {
+      "type": "string",
+      "title": "Read proxy",
+      "default": "zendesk-full",
+      "description": "invoke_proxy proxy for ticket reads (search, ticket, comments)."
+    },
+    "writeProxy": {
+      "type": "string",
+      "title": "Write proxy",
+      "default": "zendesk-write",
+      "description": "invoke_proxy proxy the model is told to post through."
+    },
+    "searchEndpoint": {
+      "type": "string",
+      "title": "Search endpoint",
+      "default": "zendesk_search_tickets",
+      "description": "invoke_proxy endpoint that searches tickets."
+    },
+    "searchQuery": {
+      "type": "string",
+      "title": "Search query",
+      "default": "type:ticket status<pending assignee:me",
+      "description": "Zendesk search for the tickets the desk should work. status<pending is new and open."
+    },
+    "commentsEndpoint": {
+      "type": "string",
+      "title": "Comments endpoint",
+      "default": "zendesk_list_comments",
+      "description": "invoke_proxy endpoint that lists a ticket's comments."
+    },
+    "ticketEndpoint": {
+      "type": "string",
+      "title": "Ticket endpoint",
+      "default": "zendesk_get_ticket",
+      "description": "invoke_proxy endpoint that reads one ticket."
+    },
+    "updateEndpoint": {
+      "type": "string",
+      "title": "Update endpoint",
+      "default": "zendesk_update_ticket",
+      "description": "invoke_proxy endpoint that posts a comment and sets the status."
+    },
+    "sendStatus": {
+      "type": "string",
+      "title": "Status on Send",
+      "default": "pending",
+      "description": "The ticket status the Send button sets with the reply: pending, solved, open or on-hold."
+    },
     "outwardTool": {
       "type": "string",
       "title": "Outward tool name",

@@ -13,6 +13,7 @@ def mk():
     c = Clock()
     return D.Desk(root, clock=c), c
 
+FLAT = '{"endpoint":"zendesk_update_ticket","arguments":{"ticket":{"status":"pending","comment":{"body":"..."}}}}'
 DRAFT = "Hi Sam,\n\nThe broker for this connector is disabled, so the connector reports unhealthy. Re-enable the broker in the portal under Settings > Connectors, then run a fresh scan.\n\nPlease send a fresh support package after that.\n\nThanks!\n"
 
 class DeskTests(unittest.TestCase):
@@ -24,8 +25,8 @@ class DeskTests(unittest.TestCase):
         self.assertEqual(d.consume([DRAFT], "post")["ok"], False, "no grant yet")
         g = d.grant(md5, "press-1"); self.assertTrue(g["ok"], g)
         self.assertEqual(d.list()["items"][0]["state"], "open")
-        self.assertTrue(d.consume(["unrelated text", DRAFT], "post")["ok"])
-        self.assertFalse(d.consume([DRAFT], "post again")["ok"], "one grant, one send")
+        self.assertTrue(d.consume(["unrelated text", DRAFT], "post", FLAT)["ok"])
+        self.assertFalse(d.consume([DRAFT], "post again", FLAT)["ok"], "one grant, one send")
         self.assertEqual(d.list()["items"], [])
 
     def test_edited_text_does_not_ride_on_the_grant(self):
@@ -91,8 +92,51 @@ class DeskTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertEqual(len(run(["list"])["items"]), 1)
         self.assertTrue(run(["grant", "--md5", r["md5"], "--press-id", "p"])["ok"])
-        self.assertTrue(run(["consume"], json.dumps({"candidates": [DRAFT], "what": "POST comments"}))["ok"])
+        self.assertTrue(run(["consume"], json.dumps({"candidates": [DRAFT], "what": "POST comments", "flat": FLAT}))["ok"])
         self.assertEqual(run(["stats"])["decisions"]["send"], 1)
+
+    def test_grant_status_must_be_on_the_posting_call(self):
+        d, c = mk()
+        md5 = d.file("123456", DRAFT)["md5"]
+        self.assertTrue(d.grant(md5, "press-1", status="solved")["ok"])
+        r = d.consume([DRAFT], "post", '{"arguments":{"comment":{"body":"x"}}}')
+        self.assertEqual(r.get("code"), "status-missing"); self.assertEqual(r["status"], "solved")
+        self.assertEqual(d.list()["items"][0]["state"], "open", "the grant is left open")
+        r = d.consume([DRAFT], "post", '{"arguments":{"status":"pending"}}')
+        self.assertEqual(r.get("code"), "status-missing", "the wrong status is not the status")
+        r = d.consume([DRAFT], "post", '{"arguments":{"status": "solved"}}')
+        self.assertTrue(r["ok"]); self.assertEqual(r["status"], "solved"); self.assertEqual(r["ticket"], "123456")
+        self.assertEqual(d._queue()["123456"]["state"], "sent")
+        self.assertFalse(d.grant(md5, "press-2", status="closed")["ok"], "unknown status refused")
+
+    def test_sync_orders_the_pull_and_confirms_the_transition(self):
+        d, c = mk()
+        v = d.sync([{"id": 11, "status": "open", "updated": "2026-10-15T01:00:00Z"},
+                    {"id": 12, "status": "new", "sla": "2026-10-15T09:00:00Z", "updated": "2026-10-15T02:00:00Z"},
+                    {"id": 13, "status": "open", "updated": "2026-10-15T03:00:00Z"}])
+        self.assertEqual(v["next"]["ticket"], "12", "the SLA chip first")
+        d._mark("12", "drafting")
+        self.assertIsNone(d.queue_view()["next"], "one ticket at a time")
+        md5 = d.file("12", DRAFT)["md5"]
+        self.assertEqual(d.queue_view()["rows"][0]["state"], "waiting")
+        d.grant(md5, "p1"); d.consume([DRAFT], "post", FLAT)
+        self.assertEqual(d._queue()["12"]["state"], "sent")
+        v = d.queue_view(); self.assertEqual(v["next"]["ticket"], "11", "oldest next")
+        # the next poll: 12 is pending now and 13 was taken by someone else
+        v = d.sync([{"id": 11, "status": "open", "updated": "2026-10-15T01:00:00Z"}])
+        q = d._queue()
+        self.assertEqual(q["12"]["state"], "done"); self.assertEqual(q["12"]["transition"], "confirmed")
+        self.assertEqual(q["13"]["state"], "gone")
+        self.assertEqual(d.stats()["transitions"], {"posted": 1, "confirmed": 1})
+        # the customer answers: 12 is open again with a newer update
+        v = d.sync([{"id": 12, "status": "open", "updated": "2026-10-15T05:00:00Z"}])
+        self.assertEqual(d._queue()["12"]["state"], "reopened")
+        self.assertEqual(v["next"]["ticket"], "12", "a reopened ticket outranks a new one")
+        # a pull nobody filed on goes stale and is offered again
+        d._mark("11", "drafting"); c.t += D.STALE_S + 1
+        self.assertIn(d.queue_view()["next"]["ticket"], ("11", "12"))
+        self.assertEqual([r["state"] for r in d.queue_view()["rows"] if r["ticket"] == "11"], ["stale"])
+
 
 if __name__ == "__main__":
     unittest.main()

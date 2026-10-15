@@ -354,6 +354,36 @@ class RemediationTests(unittest.TestCase):
             json.dump({"source": "https://docs.example.org/old", "body": "Old pages are still read by the desk.", "origin": "fetch", "ts": 1}, fh)
         self.assertTrue(d.receipt("6", "docs", "Old pages are still read by the desk", "https://docs.example.org/old")["ok"])
 
+    def test_torn_run_record_is_set_aside_not_fatal(self):
+        # 2026-10-15: a run.json with a raw NUL (a shared tmp file truncated under another writer) made every later
+        # desk command on that ticket raise in json.load; the ticket was wedged until a human removed the file.
+        d, c = mk()
+        rd = os.path.join(d.root, "runs", "8"); os.makedirs(rd)
+        with open(os.path.join(rd, "run.json"), "w") as fh:
+            fh.write('{"ticket": "8", "phase": "investigate", "agents": [{"label": "inv1", "x": "a\x00\x00b"}]}')
+        r = d.wait("8", timeout_s=0.3, poll_s=0.1)
+        self.assertEqual(r["phase"], "new", r)
+        self.assertTrue([n for n in os.listdir(rd) if n.startswith("run.json.corrupt-")], os.listdir(rd))
+        self.assertEqual(d.trace("8")["run"]["phase"], "new")
+
+    def test_concurrent_writers_never_leave_a_torn_record(self):
+        import threading
+        d, c = mk()
+        path = os.path.join(d.root, "runs", "7", "run.json")
+        errors = []
+        def w(tag):
+            try:
+                for i in range(60):
+                    D.write_json(path, {"ticket": "7", "phase": "investigate", "pad": tag * 3000, "i": i}, indent=1)
+                    D.read_json(path, quarantine=False)
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+        ts = [threading.Thread(target=w, args=(t,)) for t in ("a", "b", "c", "d")]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(errors, [])
+        self.assertEqual(D.read_json(path, quarantine=False)["ticket"], "7")
+        self.assertFalse([n for n in os.listdir(os.path.dirname(path)) if n.endswith(".tmp")], "no temp file left behind")
+
     def test_one_dash_is_one_hit(self):
         d, c = mk()
         r = d.file("4", "Hi,\n\nThe broker is off \u2014 turn it on.\n")

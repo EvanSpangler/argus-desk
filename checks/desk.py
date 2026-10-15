@@ -16,7 +16,7 @@ Subcommands (JSON in on stdin where noted, JSON out on stdout, exit 0 unless the
   capture   stdin {ticket, messages:[{id,who,at,text}], count} -> records the live thread + receipt
   stats                                                        -> the economics table
 """
-import argparse, hashlib, json, os, re, sys, time
+import argparse, hashlib, json, os, re, sys, tempfile, time
 from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import confirm_ledger as CL
@@ -63,6 +63,44 @@ def _safe(name):
 def sha_of(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
+
+
+def write_json(path, obj, **kw):
+    """One writer, one private temp file, one rename. 2026-10-15: two desk.py processes shared "<path>.tmp"; the
+    second truncated it under the first, the gap filled with NUL bytes, and the torn file was renamed into place.
+    Every later read of that record raised and the ticket was wedged."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, **kw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_json(path, default=None, quarantine=True):
+    """A record that does not parse is set aside as <path>.corrupt-<stamp> (never deleted) and the default is
+    returned, so one torn write cannot block every later command on that ticket."""
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except ValueError as e:
+        if not quarantine:
+            raise
+        aside = "%s.corrupt-%s" % (path, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+        try:
+            os.replace(path, aside)
+        except OSError:
+            pass
+        sys.stderr.write("desk: %s did not parse (%s); set aside as %s\n" % (path, str(e)[:120], os.path.basename(aside)))
+        return default
 
 
 def canon_url(source):
@@ -167,11 +205,7 @@ class Desk:
         return out
 
     def _thread(self, ticket):
-        p = os.path.join(self.root, "threads", "%s.json" % ticket)
-        if not os.path.exists(p):
-            return None
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
+        return read_json(os.path.join(self.root, "threads", "%s.json" % ticket), default=None)
 
     def _requests(self):
         return {r["md5"]: r for r in self._rows(self.requests_path)}
@@ -406,17 +440,14 @@ class Desk:
 
     def _run(self, ticket):
         p = os.path.join(self._run_dir(ticket), "run.json")
-        if os.path.exists(p):
-            with open(p, encoding="utf-8") as fh:
-                return json.load(fh)
-        return {"ticket": str(ticket), "started": self.clock(), "agents": [], "phase": "new", "rounds": 0}
+        fresh = {"ticket": str(ticket), "started": self.clock(), "agents": [], "phase": "new", "rounds": 0}
+        rec = read_json(p, default=None)
+        if rec is None:
+            return fresh
+        return rec
 
     def _save_run(self, run):
-        p = os.path.join(self._run_dir(run["ticket"]), "run.json")
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(run, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, p)
+        write_json(os.path.join(self._run_dir(run["ticket"]), "run.json"), run, indent=1)
         return run
 
     def run_update(self, ticket, phase=None, agent=None):
@@ -632,8 +663,8 @@ class Desk:
         if not source or not str(body or "").strip():
             return {"ok": False, "reason": "source and body"}
         os.makedirs(os.path.join(self.root, "pages"), exist_ok=True)
-        with open(os.path.join(self.root, "pages", md5_of(canon_url(source)) + ".json"), "w", encoding="utf-8") as fh:
-            json.dump({"source": source, "body": str(body), "origin": origin if origin in ("fetch", "search") else "search", "ts": self.clock()}, fh, ensure_ascii=False)
+        write_json(os.path.join(self.root, "pages", md5_of(canon_url(source)) + ".json"),
+                   {"source": source, "body": str(body), "origin": origin if origin in ("fetch", "search") else "search", "ts": self.clock()})
         return {"ok": True, "source": source, "chars": len(str(body)), "origin": origin}
 
     def _page(self, source):
@@ -731,14 +762,10 @@ class Desk:
     def _queue(self):
         if not os.path.exists(self.queue_path):
             return {}
-        with open(self.queue_path, encoding="utf-8") as fh:
-            return json.load(fh)
+        return read_json(self.queue_path, default={}) or {}
 
     def _save_queue(self, q):
-        tmp = self.queue_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(q, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.queue_path)
+        write_json(self.queue_path, q, indent=1)
 
     def _mark(self, ticket, state, **extra):
         q = self._queue()
@@ -827,8 +854,7 @@ class Desk:
                          "at": float(m.get("at") or now), "text": str(m.get("text") or "")})
         rec = {"thread": {"id": str(ticket), "source": "live", "fetched_at": now, "messages": msgs},
                "receipt": {"thread": str(ticket), "count": int(count if count is not None else len(msgs)), "at": now}}
-        with open(os.path.join(self.root, "threads", "%s.json" % ticket), "w", encoding="utf-8") as fh:
-            json.dump(rec, fh, ensure_ascii=False)
+        write_json(os.path.join(self.root, "threads", "%s.json" % ticket), rec)
         return {"ok": True, "ticket": str(ticket), "messages": len(msgs), "count": rec["receipt"]["count"]}
 
     def stats(self):

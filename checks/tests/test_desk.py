@@ -103,6 +103,21 @@ class DeskTests(unittest.TestCase):
         r = d.file("4", "Hi,\n\nI will get back to you shortly — the team is looking.\n")
         self.assertEqual(r["verdict"], "hold"); self.assertIn("dash", r["hits"]); self.assertIn("timeline-commitment", r["hits"])
 
+    def test_calls_shows_each_read_and_what_it_gave(self):
+        # 2026-10-16: #147036 ran with the thread never recorded and nobody could say from the workstation what the reads returned
+        d, c = mk()
+        d.call("147036", "inv1", "mcp__local-argus__invoke_proxy", {"proxy": "zendesk-full", "endpoint": "zendesk_list_comments"}, "HTTP 404", ok=False)
+        d.call("147036", "inv1", "mcp__local-argus__invoke_proxy", {"proxy": "zendesk-full", "endpoint": "zendesk_get_ticket_comments"}, "x" * 50)
+        d.event("147036", "inv1", "capture", "zendesk_get_ticket_comments: no comments found in a 50-char result: xxx")
+        out = d.calls("147036")
+        self.assertTrue(out["ok"]); self.assertEqual(len(out["calls"]), 2); self.assertFalse(out["thread"]["recorded"])
+        text = D.calls_text(out)
+        self.assertIn("thread not recorded", text); self.assertIn("zendesk_list_comments FAILED", text)
+        self.assertIn("no comments found in a 50-char result", text)
+        d.capture("147036", [{"id": "1", "who": "customer", "at": 1, "text": "Which CPE?"}], 1)
+        self.assertIn("thread 1 message(s)", D.calls_text(d.calls("147036")))
+        self.assertIn("captured: nothing", D.calls_text(d.calls("147037")))
+
     def test_thread_capture_drives_cadence_and_questions(self):
         d, c = mk()
         d.capture("5", [{"id": "1", "who": "customer", "at": T0 - 7200, "text": "Scans fail. Which agent version is required?"},

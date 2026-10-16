@@ -19,7 +19,7 @@ import argparse, json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DESK = os.path.join(HERE, "desk.py")
-VERSION = "0.8.7"
+VERSION = "0.8.8"
 
 TOOLS = [
     {"name": "file_draft",
@@ -120,7 +120,9 @@ def handle(desk, role, name, a):
         more = ""
         if why == "page-not-captured":
             cap = r.get("captured") or []
-            more = "; fetch the page in this run first, then quote it with the URL as the result names it (captured so far: %s)" % (", ".join(cap) if cap else "none")
+            mine = r.get("captured_this_run") or []
+            more = ("; fetch the page in this run first, then quote it with the URL as the result names it (this run captured %s; newest on any ticket: %s)"
+                    % (", ".join(mine) if mine else "NO page: no docs read in this run named an official URL", ", ".join(cap) if cap else "none"))
         elif why == "no-thread-captured":
             more = "; " + s(r.get("hint"))
         elif why == "quote-not-in-material":

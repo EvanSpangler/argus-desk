@@ -171,7 +171,8 @@ refused receipt is on the tail too, with the quote the agent claimed and why it 
 again (after a Deny, or by hand) keeps its earlier run under `history` in `runs/N/run.json` and starts its
 own review rounds.
 
-Hand controls: `/desk run N`, `/desk trace N` (the trace as text in the transcript), `/desk audit N`,
+Hand controls: `/desk run N`, `/desk trace N` (the trace as text in the transcript), `/desk calls N` (every read the run made
+and what the desk took from it: a thread, pages, or why nothing), `/desk audit N`,
 `/desk verify`, `/desk poll`,
 `/desk pull N`, `/desk pause`, `/desk resume`, `/desk stats`. The default search assumes the Argus proxies
 `zendesk-full` (reads) and `zendesk-write` (posts) and the endpoints `zendesk_search_tickets`,
@@ -319,6 +320,10 @@ Sonnet, the adversary and drafter to Opus.
   field with the cursor in it (a Modify note, a Deny reason) takes every key until Enter; Tab reaches its
   `cancel` button, which leaves the draft undecided. Esc hands the keyboard back to the prompt. Without the keys, the pane
   commands (`/desk review`, `/desk tickets`, `/desk wall`, `/desk show`) still work.
+- **Receipts refused no-thread-captured or page-not-captured.** `/desk calls N` lists each read of the run with its result
+  size and, under `captured:`, what the desk took from it: `thread N message(s) recorded`, `page(s) <urls>`, or why not
+  (`no comments found in a 3456-char result: <its start>`, `came back with no text`, `not JSON`). A page-not-captured
+  refusal says what this run captured; the newest pages on any ticket after it are context, not this ticket's.
 - **A run finished in seconds with no receipts.** Look at RUN in the Review pane, `/desk show N run`, or `/desk trace N`: an agent that
   says it had no proxy tool or that a desk tool was not answered means the desk was started outside a
   `/desk` command; type `/desk` and `/desk run N` again.

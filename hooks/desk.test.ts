@@ -11,7 +11,7 @@ const fake = (on: any, answer: (r: Run) => Record<string, unknown>) => {
   })
   return calls
 }
-const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait', 'tree', 'requester', 'mismatch'].includes(String(a)))
+const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait', 'tree', 'requester', 'mismatch', 'calls'].includes(String(a)))
 
 const DRAFT = 'Hi Sam,\n\nThe broker is disabled, so the connector reports unhealthy. Re-enable it under Settings > Connectors.\n\nThanks!\n'
 const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state: 'pending', filed: 1, age_s: 120, chars: 120, text: DRAFT,
@@ -98,6 +98,34 @@ test('capture 2026-10-16: comments under data with a total carry the total as th
   const body = JSON.parse(cap[0].stdin!)
   expect(body.count).toBe(4)
   expect(body.messages[0].text).toBe('Scans fail.')
+})
+
+test('capture 2026-10-16 (0.8.8): a comments read that comes back as MCP content blocks, with no text, or encoded twice, is the thread, and says so', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [] }))
+  const payload = { comments: [{ id: 21, author_id: 5, created_at: '2026-10-14T10:00:00Z', plain_body: 'Which CPE?', public: true }], count: 1 }
+  let ran: any = { result: { content: [{ type: 'text', text: JSON.stringify(payload) }] } }
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ran)
+  const read = () => $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket_comments', arguments: { ticket_id: 123456 } } as any)
+  await read()
+  ran = { result: [{ type: 'text', text: JSON.stringify(payload) }], text: '' }
+  await read()
+  ran = { result: {}, text: JSON.stringify(JSON.stringify(payload)) }
+  await read()
+  expect(calls.filter(c => cmdOf(c) === 'capture').length).toBe(3)
+  const notes = calls.filter(c => cmdOf(c) === 'event').map(c => JSON.parse(c.stdin!)).filter(e => e.kind === 'capture')
+  expect(notes.length).toBe(3)
+  expect(notes[0].text).toMatch(/zendesk_get_ticket_comments: thread 1 message\(s\) recorded/)
+  // a read that gave nothing says what it got, so /desk calls shows why the thread is missing
+  ran = { result: {} }
+  await read()
+  const last = calls.filter(c => cmdOf(c) === 'event').map(c => JSON.parse(c.stdin!)).filter(e => e.kind === 'capture').pop()
+  expect(last.text).toMatch(/came back with no text/)
+})
+
+test('/desk calls N prints what each read of the run gave the desk', async ($, on) => {
+  on('process.run', async (_$: any, e: any) => ({ value: { exitCode: 0, stdout: e.argv.includes('calls') ? '#147036: 2 call(s); thread not recorded' : '{"ok":true,"items":[],"rows":[]}', stderr: '' } }))
+  const r = await $.command.run({ command: 'desk', args: 'calls 147036' })
+  expect(String(r.text)).toContain('#147036: 2 call(s); thread not recorded')
 })
 
 test('receipt fault 2026-10-15: a comments read wrapped in an envelope, or a JSON string, with only html bodies, is still the thread', async ($, on) => {

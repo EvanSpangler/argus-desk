@@ -52,6 +52,7 @@ SALUTATION = re.compile(r"^\s*(?:Hi|Hello|Hey|Dear)\s+([A-Za-z][A-Za-z.'-]*)\s*[
 REVIEW_CODES = ("question-not-answered", "contradicts-customer", "contradicts-earlier-send", "ignores-customer-info", "misattributed",
                 "implied-commitment", "holding-reply", "customer-cannot-act", "quotes-customer-back", "platform-mismatch", "unreceipted")
 CODE = re.compile(r"^\s*\[([a-z-]+)\]")
+QUOTE_LINE = re.compile(r"(?m)^\s*>")
 # The fleet's history hold: a deny on the ticket in the last 72 h means the drafting has been wrong here, so the
 # operator decides; a delegated press does not.
 HISTORY_S = 72 * 3600
@@ -281,6 +282,9 @@ class Desk:
             lint.append("dash")
         if TIMELINE.search(draft):
             lint.append("timeline-commitment")
+        # 2026-10-16 #147802: three drafts carried a literal "> " on every line, the drafter quoting itself; no customer sees that
+        if QUOTE_LINE.search(draft):
+            lint.append("quote-markers")
         out["lint"] = lint
         out["hits"] += lint
         # 1b. the fleet's per-ticket gates: requester name, recent deny, the kill switch
@@ -448,6 +452,18 @@ class Desk:
                 out.append(code)
         return out
 
+    def moved_since(self, req):
+        """What happened on the ticket after this draft was filed. 2026-10-16 #147802: the customer asked a new question at
+        22:38Z; every draft at the desk predated it and the fleet's reply review held the one J1 took (question-not-answered).
+        A customer message in the captured thread after filing is a hold; the ticket's updated_at moving is a warning (bots
+        and internal notes move it too)."""
+        rec = self._thread(req["ticket"]) or {}
+        newer = [m for m in (rec.get("thread") or {}).get("messages", []) if m.get("who") == "customer" and float(m.get("at") or 0) > req["ts"]]
+        upd = _iso_epoch((self._queue().get(req["ticket"]) or {}).get("updated"))
+        return {"hits": ["thread-moved"] if newer else [],
+                "warnings": ["ticket-updated-since-draft"] if upd and upd > req["ts"] + SENT_GRACE_S and not newer else [],
+                "newer": [{"at": m.get("at"), "text": (m.get("text") or "")[:200]} for m in newer]}
+
     def list(self):
         """The drafts waiting for a decision. A request undecided past the ledger's REQUEST_TTL_S (24 h) and
         a grant past its 6 h life are written off first, so the desk shows what the guide says it shows."""
@@ -467,6 +483,11 @@ class Desk:
                 rev = self.review_hits(md5)
                 if rev:
                     checks = dict(checks, hits=checks["hits"] + [h for h in rev if h not in checks["hits"]], verdict="hold", review=rev)
+                mv = self.moved_since(r)
+                if mv["hits"] or mv["warnings"]:
+                    checks = dict(checks, hits=checks["hits"] + [h for h in mv["hits"] if h not in checks["hits"]],
+                                  warnings=checks["warnings"] + [w for w in mv["warnings"] if w not in checks["warnings"]],
+                                  verdict="hold" if mv["hits"] or checks.get("verdict") == "hold" else checks.get("verdict"), moved=mv["newer"])
                 items.append({"md5": md5, "ticket": r["ticket"], "state": st["state"], "source": r.get("source"),
                               "filed": r["ts"], "age_s": int(self.clock() - r["ts"]), "chars": r.get("chars"),
                               "checks": checks, "text": r["text"], "supersedes": r.get("supersedes")})
@@ -487,8 +508,8 @@ class Desk:
             return {"ok": False, "reason": "superseded by %s, the newer draft on #%s" % (later[-1][:8], req["ticket"])}
         # The press is the operator's own act at the terminal; the harness, not the model, raised it.
         src = CL.DictSource({press_id: {"from_operator": True, "automated": False, "ts": now, "body": "go %s" % md5}})
-        rev = self.review_hits(md5)
-        if rev:   # open reviewer objections are holds at the press too, so the overrule names them
+        rev = self.review_hits(md5) + self.moved_since(req)["hits"]
+        if rev:   # open reviewer objections and a customer message after filing are holds at the press too, so the overrule names them
             req = dict(req, checks=dict(req["checks"], hits=req["checks"]["hits"] + [h for h in rev if h not in req["checks"]["hits"]], verdict="hold"))
         r = self.ledger.grant_by_message(md5, press_id, src, OPERATOR)
         if r.get("ok"):

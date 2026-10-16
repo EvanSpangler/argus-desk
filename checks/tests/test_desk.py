@@ -558,5 +558,26 @@ class FleetParityTests(unittest.TestCase):
                                "url": "https://docs.example.org/broker", "quote": "When the broker is disabled the connector reports unhealthy",
                                "desk_receipt": rid}])
 
+
+    def test_a_customer_message_after_filing_holds_the_draft(self):
+        d, c = mk()
+        T = "53"
+        d.capture(T, [{"id": "1", "who": "customer", "at": T0 - 3600, "text": "All sensors are latest version."}], 1)
+        m = d.file(T, "Please send the sensor version from the host.\n")["md5"]
+        self.assertNotIn("thread-moved", d.list()["items"][0]["checks"]["hits"])
+        c.t += 600
+        d.capture(T, [{"id": "1", "who": "customer", "at": T0 - 3600, "text": "All sensors are latest version."},
+                      {"id": "2", "who": "customer", "at": c.t - 60, "text": "Does the runtime sensor auto update?"}], 2)
+        it = d.list()["items"][0]
+        self.assertIn("thread-moved", it["checks"]["hits"])
+        self.assertEqual(it["checks"]["verdict"], "hold")
+        self.assertIn("auto update", it["checks"]["moved"][0]["text"])
+        self.assertIn("thread-moved", d.grant(m, "press-53")["overruled"])
+
+    def test_quote_markers_hold(self):
+        d, c = mk()
+        self.assertIn("quote-markers", d.file("54", "> Please send the sensor version.\n> Thanks.\n")["hits"])
+        self.assertNotIn("quote-markers", d.file("55", "Please send the sensor version (the one > 1.2).\n")["hits"])
+
 if __name__ == "__main__":
     unittest.main()

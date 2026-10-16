@@ -222,6 +222,7 @@ The draft's own text:
 | Code | Meaning |
 |---|---|
 | `dash` | The draft contains an en or em dash. |
+| `quote-markers` | A line starts with ">", a quote marker the customer would see as text. |
 | `timeline-commitment` | It promises a time ("shortly", "by tomorrow", "within 2 days"). |
 | `requester-name-unrecorded` | The draft greets someone by name and no requester name is on record for the ticket. The desk records it when a ticket read shows the requester field; `desk.py requester --ticket N --name "<exact name>"` records it by hand; a requester registry exported from your own tooling in the same shape (`{"<ticket>": {"name": "Surname, Given"}}`) can be copied to `<stateDir>/requesters.json`. |
 | `requester-name-mismatch` | The greeted name is not a part of the recorded requester name ("Hi Alvar" to Alba). |
@@ -240,6 +241,7 @@ The thread it answers:
 | `too-soon` | We replied publicly less than 4 hours ago. |
 | `too-many` | Two or more of our public replies in the last 12 hours. |
 | `repeat-ask` | It asks the customer again while our last question is still unanswered. |
+| `thread-moved` | The customer wrote again after this draft was filed (the captured thread holds a newer customer message). The draft answers an older state of the ticket; run it again. Shown as a warning, `ticket-updated-since-draft`, when only the ticket's updated time moved. |
 | `customer-cannot-act` | Their latest message asks for steps, asks what we want, or says they are confused, and the draft has neither numbered steps nor a plain imperative ask. |
 | `holding-reply` | They asked a question and the draft says we are still checking without naming an action (a reproduction, an escalation, a test). |
 | `review:<code>` | A reviewer's objection is open against this draft and quotes it. The code is the fleet's reply-review code the reviewer named (`misattributed`, `question-not-answered`, `contradicts-customer`, `implied-commitment` ...), or `objection`. It clears when the drafter answers it; a Send names it as overruled. |

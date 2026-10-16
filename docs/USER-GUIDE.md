@@ -320,6 +320,10 @@ Sonnet, the adversary and drafter to Opus.
   field with the cursor in it (a Modify note, a Deny reason) takes every key until Enter; Tab reaches its
   `cancel` button, which leaves the draft undecided. Esc hands the keyboard back to the prompt. Without the keys, the pane
   commands (`/desk review`, `/desk tickets`, `/desk wall`, `/desk show`) still work.
+- **The thread is recorded through the proxy's banner (0.9.2).** The workstation proxy wraps each result in
+  `[TOOL_OUTPUT_BEGIN ...]` with an UNTRUSTED EXTERNAL DATA warning; `/desk calls N` showed `capture: ... not JSON` and no
+  customer quote could be receipted. The desk now reads the JSON under the banner. The comments endpoint defaults to
+  `zendesk_get_ticket_comments` alone (the proxy has no `zendesk_list_comments`).
 - **ISSUES names every hold (0.9.1).** A hold with no sentence or rule of its own (requester-name, a recent deny, sends held,
   escalation, thread moved) shows as `hold: <code>`, so the count is what a Send would overrule. A view key (1 to 3) reads the
   desk again, so a draft filed outside this session shows without a poll. Tab past the last row reaches the pane's close button.

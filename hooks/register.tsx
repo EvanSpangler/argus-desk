@@ -232,8 +232,9 @@ const requesterIn = (v: unknown, depth = 0): string | undefined => {
 const docsUrls = (o: Opts, ...texts: string[]): string[] => {
   const hosts = o.docsHosts.split(',').map(h => h.trim()).filter(Boolean)
   const out = new Set<string>()
-  for (const t of texts) for (const m of t.matchAll(/https?:\/\/([a-z0-9.-]+)(\/[^\s"'<>\\)]*)?/gi)) if (hosts.includes(m[1].toLowerCase())) out.add(m[0].replace(/[.,;:]+$/, ''))
-  return [...out].slice(0, 8)
+  // a JSON-escaped result writes https:\/\/docs.wiz.io\/docs\/x; a search returns ten or more pages, so the cap is wide
+  for (const t of texts) for (const m of t.replace(/\\\//g, '/').matchAll(/https?:\/\/([a-z0-9.-]+)(\/[^\s"'<>\\)]*)?/gi)) if (hosts.includes(m[1].toLowerCase())) out.add(m[0].replace(/[.,;:]+$/, ''))
+  return [...out].slice(0, 30)
 }
 
 async function desk($: any, o: Opts, args: string[], stdin?: string): Promise<Record<string, unknown> & { ok?: unknown }> {
@@ -1059,7 +1060,8 @@ export const register: Register = (on, options) => {
         const agentId = (e as { agentId?: string }).agentId
         const who = agentId ? active.get(agentId) : undefined
         const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
-        const text = ran?.text ?? (typeof ran?.result === 'string' ? ran.result : ran?.result ? JSON.stringify(ran.result) : '')
+        // an empty text beside a filled result is the result (?? kept the empty string and captured nothing)
+        const text = ran?.text || (typeof ran?.result === 'string' ? ran.result : ran?.result ? JSON.stringify(ran.result) : '')
         if (agentId) await wallLine($, o, agentId, 'docs', JSON.stringify(args).slice(0, 100))
         if (who) await desk($, o, ['call'], JSON.stringify({ ticket: who.ticket, agent: who.label, tool, args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
         // a search result is kept under each official URL it names, marked as a search result, not the page

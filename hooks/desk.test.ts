@@ -374,6 +374,22 @@ test('a documentation search is on the record and captured as a page per officia
   expect(JSON.parse(page!.stdin!).origin).toBe('search')
 })
 
+test('a search with many pages, escaped slashes, or an empty text beside its result captures every official page', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [], rows: [] }))
+  const hits = Array.from({ length: 12 }, (_, i) => ({ title: `p${i}`, url: `https://docs.wiz.io/docs/page-${i}`, snippet: `snippet ${i}` }))
+  let ran: any = { result: { results: hits }, text: '' }
+  on('tool.call', { tool: 'mcp__argus__enterprise_search' }, async () => ran)
+  await $.tool.call({ tool: 'mcp__argus__enterprise_search', query: 'cpe', data_source: 'wiz_docs_public' } as any)
+  let pages = calls.filter(c => cmdOf(c) === 'page').map(c => JSON.parse(c.stdin!).source)
+  expect(pages.length).toBe(12)
+  expect(pages).toContain('https://docs.wiz.io/docs/page-11')
+  // a server that escapes slashes in its JSON: the text as it arrived
+  ran = { result: {}, text: '{"results":[{"url":"https:\\/\\/docs.wiz.io\\/docs\\/cpe-matching"}]}' }
+  await $.tool.call({ tool: 'mcp__argus__enterprise_search', query: 'cpe', data_source: 'wiz_docs_public' } as any)
+  pages = calls.filter(c => cmdOf(c) === 'page').map(c => JSON.parse(c.stdin!).source)
+  expect(pages).toContain('https://docs.wiz.io/docs/cpe-matching')
+})
+
 test('the poller\'s pull spawns under the driver a /desk command created; /desk queue switches the tab without a key', async ($, on) => {
   const opened: string[] = []
   on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })

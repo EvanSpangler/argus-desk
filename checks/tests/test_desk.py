@@ -103,6 +103,15 @@ class DeskTests(unittest.TestCase):
         r = d.file("4", "Hi,\n\nI will get back to you shortly — the team is looking.\n")
         self.assertEqual(r["verdict"], "hold"); self.assertIn("dash", r["hits"]); self.assertIn("timeline-commitment", r["hits"])
 
+    def test_cli_call_reads_its_body_from_stdin(self):
+        # 2026-10-16: `call` was not among the stdin commands, so every call record was lost ("0 call(s)" on #147036)
+        import subprocess
+        root = tempfile.mkdtemp()
+        body = json.dumps({"ticket": "147036", "agent": "inv1", "tool": "mcp__x__invoke_proxy", "args": {"endpoint": "zendesk_get_ticket_comments"}, "result": "abc"})
+        r = subprocess.run([sys.executable, "-I", D.__file__, "--root", root, "call"], input=body, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(D.Desk(root).calls("147036")["calls"]), 1)
+
     def test_calls_shows_each_read_and_what_it_gave(self):
         # 2026-10-16: #147036 ran with the thread never recorded and nobody could say from the workstation what the reads returned
         d, c = mk()

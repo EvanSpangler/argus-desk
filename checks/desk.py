@@ -1211,7 +1211,8 @@ def main(argv=None):
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
     d = Desk(os.path.expanduser(a.root))
     body = {}
-    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite", "mismatch"):
+    # 2026-10-16 (#147036 on 0.8.8, "0 call(s)"): `call` was missing here, so every call record had an empty body and was lost
+    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite", "mismatch", "call"):
         raw = sys.stdin.read()
         body = json.loads(raw) if raw.strip() else {}
     if a.cmd == "file":

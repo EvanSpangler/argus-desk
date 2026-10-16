@@ -317,6 +317,12 @@ async function openDesk($: any): Promise<void> {
 
 /** The agents running now, by id: which ticket and role each belongs to, for the wall and the receipts. */
 const active = new Map<string, { ticket: string; role: Role; label: string }>()
+/** The ticket the desk is running when exactly one is: a read by an agent the desk cannot name (its id at tool.call is not
+ * the id the spawn returned) still belongs to that run. 2026-10-16 (#147036 on 0.8.8): reads were dropped for want of a ticket. */
+const runningTicket = (): string | undefined => {
+  const ts = new Set([...active.values()].map(a => a.ticket))
+  return ts.size === 1 ? [...ts][0] : undefined
+}
 /** Step text per agent, flushed to the tail at the end of each step. */
 const partial = new Map<string, string>()
 
@@ -1083,11 +1089,12 @@ export const register: Register = (on, options) => {
       try {
         const agentId = (e as { agentId?: string }).agentId
         const who = agentId ? active.get(agentId) : undefined
+        const docTicket = who?.ticket ?? (agentId ? runningTicket() : undefined)
         const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
         // an empty text beside a filled result is the result (?? kept the empty string and captured nothing)
         const text = resultText(ran)
         if (agentId) await wallLine($, o, agentId, 'docs', JSON.stringify(args).slice(0, 100))
-        if (who) await desk($, o, ['call'], JSON.stringify({ ticket: who.ticket, agent: who.label, tool, args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
+        if (docTicket) await desk($, o, ['call'], JSON.stringify({ ticket: docTicket, agent: who?.label ?? `agent ${String(agentId).slice(0, 12)}`, tool, args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
         // a search result is kept under each official URL it names, marked as a search result, not the page
         if (text) for (const url of docsUrls(o, text)) await desk($, o, ['page'], JSON.stringify({ source: url, body: text, origin: 'search' }))
       } catch {
@@ -1108,12 +1115,16 @@ export const register: Register = (on, options) => {
         if (agentId) await wallLine($, o, agentId, 'read', `${String(args.proxy ?? '')} ${String(args.endpoint ?? '')} ${JSON.stringify(args.arguments ?? {}).slice(0, 100)}`)
         // the call on the record, whole: who read what, with what arguments, and a hash of what came back
         const who = agentId ? active.get(agentId) : undefined
-        if (ticket || who) await desk($, o, ['call'], JSON.stringify({ ticket: who?.ticket ?? ticket, agent: who?.label ?? 'main', tool, args, result: text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny }))
+        const fallback = !who && agentId ? runningTicket() : undefined
+        const callTicket = who?.ticket ?? ticket ?? fallback
+        const callAgent = who?.label ?? (agentId ? `agent ${agentId.slice(0, 12)}` : 'main')
+        if (callTicket) await desk($, o, ['call'], JSON.stringify({ ticket: callTicket, agent: callAgent, tool, args, result: text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny }))
+        if (agentId && !who && callTicket) await desk($, o, ['event'], JSON.stringify({ ticket: callTicket, agent: callAgent, kind: 'capture', text: `read by an agent the desk did not spawn under this id (${agentId}); counted for #${callTicket}${fallback && !ticket ? ' as the one ticket running' : ''}` }))
         // 2026-10-15 (receipt fault): the comments read is the thread whatever the proxy wraps it in (a data or result envelope, a
         // JSON string inside JSON), whatever the agent named the ticket argument (the agent's own ticket stands in), and
         // whichever body field the proxy filled. A read that reached the hook but was not recognised left the desk with no
         // thread, and every verbatim customer quote was then refused as "quote-not-in-material".
-        const forTicket = ticket ?? who?.ticket
+        const forTicket = who?.ticket ?? ticket ?? fallback
         const commentsRead = /comment/i.test(String(args.endpoint ?? ''))
         // what this read gave the desk, on the record beside the call, so a thread that is never recorded shows why (/desk calls N)
         let got = ''
@@ -1150,7 +1161,7 @@ export const register: Register = (on, options) => {
           for (const url of urls) await desk($, o, ['page'], JSON.stringify({ source: url, body: text, origin: asked.has(url) ? 'fetch' : 'search' }))
           if (urls.length) got = `${got ? `${got}; ` : ''}page(s) ${urls.join(' ')}`
         }
-        if (forTicket && got) await desk($, o, ['event'], JSON.stringify({ ticket: forTicket, agent: who?.label ?? 'main', kind: 'capture', text: `${String(args.endpoint ?? tool)}: ${got}` }))
+        if (forTicket && got) await desk($, o, ['event'], JSON.stringify({ ticket: forTicket, agent: callAgent, kind: 'capture', text: `${String(args.endpoint ?? tool)}: ${got}` }))
       } catch {
         /* the read ran; a failure to record it must not run it again */
       }

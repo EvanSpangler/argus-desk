@@ -320,6 +320,10 @@ Sonnet, the adversary and drafter to Opus.
   field with the cursor in it (a Modify note, a Deny reason) takes every key until Enter; Tab reaches its
   `cancel` button, which leaves the draft undecided. Esc hands the keyboard back to the prompt. Without the keys, the pane
   commands (`/desk review`, `/desk tickets`, `/desk wall`, `/desk show`) still work.
+- **Only `/desk run N` runs agents (0.9.0).** An agent keeps the desk's hooks only when it is spawned while a command is still
+  running. One spawned later (by the poller, a pull, or Modify) runs, but its desk tools answer "no tool.call hook answered" and
+  its reads are never recorded. So the poller and `/desk pull N` only queue a ticket, and `/desk run N` runs it, holding the
+  turn until the run ends. A Modify queues the redraft the same way.
 - **Receipts refused no-thread-captured or page-not-captured.** `/desk calls N` lists each read of the run with its result
   size and, under `captured:`, what the desk took from it: `thread N message(s) recorded`, `page(s) <urls>`, or why not
   (`no comments found in a 3456-char result: <its start>`, `came back with no text`, `not JSON`). A page-not-captured

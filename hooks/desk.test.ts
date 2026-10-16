@@ -2,12 +2,12 @@ import { test, expect, mock } from 'claude-code/testing'
 
 // The desk's state lives in desk.py; here a fake answers $.process.run so the mod's own logic is what runs.
 type Run = { argv: readonly string[]; stdin?: string }
-const fake = (on: any, answer: (r: Run) => Record<string, unknown>) => {
+const fake = (on: any, answer: (r: Run) => Record<string, unknown> | Promise<Record<string, unknown>>) => {
   const calls: Run[] = []
   on('process.run', async (_$: any, e: any) => {
     const r = { argv: e.argv as readonly string[], stdin: e.init?.stdin as string | undefined }
     calls.push(r)
-    return { value: { exitCode: 0, stdout: JSON.stringify(answer(r)), stderr: '' } }
+    return { value: { exitCode: 0, stdout: JSON.stringify(await answer(r)), stderr: '' } }
   })
   return calls
 }
@@ -172,6 +172,11 @@ test('fails closed: a write on any proxy, or a call with no endpoint, needs a gr
   expect(bare.deny).toMatch(/no comment body/)
   const read = await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_search_tickets', arguments: '{"query":"status:open"}' } as any)
   expect(read.deny).toBeUndefined()
+  // 2026-10-16 (live): a read whose verb is not the second word is still a read; a write word anywhere is still outward
+  for (const endpoint of ['support_packages_get', 'wiz_docs_search', 'docs_get_page', 'zendesk_get_ticket_comments'])
+    expect((await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'p', endpoint, arguments: { ticket_id: 1 } } as any)).deny).toBeUndefined()
+  for (const endpoint of ['zendesk_update_ticket', 'tickets_get_and_update', 'support_packages_upload', 'ticket_comment_create'])
+    expect((await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'p', endpoint, arguments: { ticket_id: 1 } } as any)).deny).toMatch(/argus-desk/)
   // the chat post carried a text body and went to the gate; the bare call carried none and never reached it
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(1)
 })
@@ -236,12 +241,17 @@ const NEXT = { ticket: '123457', state: 'new', sla: '2026-10-15T09:00:00Z', age_
 
 const RUN = (phase: string, agents: any[] = [], rounds = 0) => ({ ok: true, run: { ticket: '123457', phase, agents, rounds }, findings: [], receipts: [], drafts: [] })
 
-test('/desk poll searches the open set, folds it into the queue and starts a run; each turn.complete advances the run', async ($, on) => {
+test('/desk poll searches the open set and queues a run; /desk run N advances it on each turn.complete, holding its own dispatch', async ($, on) => {
   const clock = mock.clock(on)
+  // desk.py wait blocks until the test releases it, as the real one blocks until the phase moves or 15 s pass
+  const waiters: Array<() => void> = []
+  const release = async () => { for (let i = 0; i < 6; i++) { waiters.splice(0).forEach(f => f()); await new Promise(r => setTimeout(r, 0)) } }
+
   // desk.py as a fake with a tiny run store, so advance() reads back what it wrote
   const store: { phase: string; agents: any[]; rounds: number } = { phase: 'new', agents: [], rounds: 0 }
   const calls = fake(on, r => {
     const c = cmdOf(r)
+    if (c === 'wait') return new Promise<void>(res => waiters.push(res)).then(() => (store.phase === 'done' ? { ok: true, phase: 'done' } : { ok: false, reason: 'timeout', phase: store.phase }))
     if (c === 'sync') return { ok: true, rows: [NEXT], next: NEXT, busy: [] }
     if (c === 'queue') return { ok: true, rows: [NEXT] }
     if (c === 'run') {
@@ -268,13 +278,16 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
   expect(searches[0].endpoint).toBe('zendesk_search_tickets')
   const sync = calls.find(c => cmdOf(c) === 'sync')
   expect(JSON.parse(sync!.stdin!).tickets.map((t: any) => t.id)).toEqual(['123456', '123457'])
-  // the run starts from the driver's timer: three investigators first
+  // the poll only queued it; /desk run N spawns, from its own dispatch: three investigators first
   await clock.advance(2_100)
   expect(calls.find(c => cmdOf(c) === 'mark')!.argv).toContain('drafting')
+  expect(spawns.length).toBe(0)
+  const running = $.command.run({ command: 'desk', args: 'run 123457' })
+  await release()
   expect(spawns.map(s => s.description)).toEqual(['investigator #123457 inv1', 'investigator #123457 inv2', 'investigator #123457 inv3'])
   expect(spawns[0].prompt).toMatch(/investigate Zendesk ticket #123457/)
   expect(spawns[0].prompt).toMatch(/desk_receipt/)
-  const finish = async (label: string, answer: string) => { const id = store.agents.find(a => a.label === label && a.status === 'running')!.id; await $.turn.complete({ agentId: id, answer, reason: 'answer', durationMs: 1, isAborted: false, turnId: `t-${id}` } as any); await clock.advance(2_100) }
+  const finish = async (label: string, answer: string) => { const id = store.agents.find(a => a.label === label && a.status === 'running')!.id; await $.turn.complete({ agentId: id, answer, reason: 'answer', durationMs: 1, isAborted: false, turnId: `t-${id}` } as any); await release() }
   await finish('inv1', 'cause: label'); await finish('inv2', 'evidence thin')
   expect(spawns.length).toBe(3, 'nothing moves until every investigator is done')
   await finish('inv3', 'history clean')
@@ -303,6 +316,8 @@ test('/desk poll searches the open set, folds it into the queue and starts a run
   await finish('rev2', 'NO OBJECTIONS'); await finish('rev2B', 'NO OBJECTIONS')
   expect(spawns.length).toBe(11)
   expect(store.phase).toBe('done')
+  await release()
+  expect(String((await running).text)).toMatch(/Run on #123457: phase done/)
   // accountability: the exact prompt and the full answer travel to the record, and every proxy read is a call row
   const runRows = calls.filter(c => cmdOf(c) === 'run').map(c => JSON.parse(c.stdin!))
   expect(runRows.find(r => r.agent?.label === 'inv1' && r.agent.prompt)?.agent.prompt).toBe(spawns[0].prompt)
@@ -432,7 +447,7 @@ test('a search with many pages, escaped slashes, or an empty text beside its res
   expect(pages).toContain('https://docs.wiz.io/docs/cpe-matching')
 })
 
-test('the poller\'s pull spawns under the driver a /desk command created; /desk queue switches the tab without a key', async ($, on) => {
+test('the poller\'s pull only queues; /desk run N spawns from its own dispatch; /desk queue switches the tab without a key', async ($, on) => {
   const opened: string[] = []
   on('ui.open', async (_$: any, e: any, next: any) => { opened.push(`${e.id}${e.focus ? '!' : ''}`); return next(e) })
   const clock = mock.clock(on)
@@ -449,10 +464,12 @@ test('the poller\'s pull spawns under the driver a /desk command created; /desk 
   on('agent.spawn', async (_$: any, e: any) => { spawns.push(e); return { agentId: `a${spawns.length}`, model: 'sonnet' } })
   on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: SEARCH, text: JSON.stringify(SEARCH) }))
   await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket', arguments: { ticket_id: 123456 } } as any)
-  // /desk resume is a command: it creates the driver; the poll on the clock then pulls, and the driver spawns
+  // the poll on the clock pulls, which only queues (2026-10-16: a spawn after a command's dispatch has returned gets no hooks)
   await $.command.run({ command: 'desk', args: 'resume' })
   await clock.advance(5 * 60_000 + 10)
   await clock.advance(4_000)
+  expect(spawns.length).toBe(0)
+  await $.command.run({ command: 'desk', args: 'run 123457' })
   expect(spawns.map(s => s.description)).toEqual(['investigator #123457 inv1', 'investigator #123457 inv2', 'investigator #123457 inv3'])
   const r = await $.command.run({ command: 'desk', args: 'queue' })
   expect(String(r.text)).toMatch(/Desk: Tickets/)
@@ -703,8 +720,11 @@ test('the Wall lists every agent as a row; Enter tails one, b comes back', async
   fake(on, r => (cmdOf(r) === 'trace' ? { ok: true, run: { ticket: '123457', phase: 'new', agents: [] }, findings: [], receipts: [], drafts: [], events: [] } : cmdOf(r) === 'queue' ? { ok: true, rows: [NEXT] } : { ok: true, items: [] }))
   const spawns: any[] = []
   on('agent.spawn', async (_$: any, e: any) => { spawns.push(e); return { agentId: `w${spawns.length}`, model: e.model ?? 'sonnet' } })
+  // a pull only queues: agents spawned outside /desk run N's dispatch get none of the desk's hooks
   await $.command.run({ command: 'desk', args: 'pull 123457' })
   await clock.advance(2_100)
+  expect(spawns.length).toBe(0)
+  await $.command.run({ command: 'desk', args: 'run 123457' })
   expect(spawns.length).toBe(3)
   await $.command.run({ command: 'desk', args: 'wall' })
   const w = await mountPane($, 'desk')

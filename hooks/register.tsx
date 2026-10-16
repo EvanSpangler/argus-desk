@@ -73,7 +73,10 @@ const opts = (o: Record<string, unknown>): Opts => ({
 // invoke_proxy as Argus shows it (2026-10-15): required proxy (an enum of 49 services) and endpoint (a name such
 // as zendesk_get_ticket, not a path), optional arguments (object or JSON string). There is no method field, so
 // the endpoint name is the only sign of a read. Anything not plainly a read is outward, on every proxy.
-const READ_ENDPOINT = /^[a-z0-9]+_(get|list|search|read|show|fetch|count|describe)(_|$)/i
+const READ_ENDPOINT = /(^|_)(get|list|search|read|show|fetch|count|describe)(_|$)/i
+// 2026-10-16 (live): support_packages_get and docs endpoints whose verb is not the second word were refused as writes, so their
+// reads never ran. A read verb may be any segment; any write verb anywhere still makes the call outward (fails closed).
+const WRITE_WORD = /(^|_)(create|update|delete|add|post|put|patch|set|remove|close|solve|merge|assign|send|reply|comment|upload|edit|write|mark|tag|apply|run|execute|trigger)(_|$)/i
 
 const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'consent', 'requestMeta'])
 
@@ -131,7 +134,7 @@ const normalize = (args: Record<string, unknown>): Record<string, unknown> => {
  */
 const isOutward = (args: Record<string, unknown>): boolean => {
   const endpoint = typeof args.endpoint === 'string' ? args.endpoint : ''
-  if (!endpoint || !READ_ENDPOINT.test(endpoint)) return true
+  if (!endpoint || !READ_ENDPOINT.test(endpoint) || WRITE_WORD.test(endpoint)) return true
   const flat = JSON.stringify(args).toLowerCase()
   return /"(?:method|verb|http_method)"\s*:\s*"(post|put|patch|delete)"/.test(flat)
 }
@@ -609,46 +612,23 @@ async function advance($: any, o: Opts, ticket: string): Promise<void> {
 /** After Modify: one more drafter pass with the operator's note, then the usual review. */
 async function redraft($: any, o: Opts, ticket: string, md5: string, note: string): Promise<void> {
   await desk($, o, ['run'], JSON.stringify({ ticket, phase: 'adversary', agent: { id: `operator-${Date.now()}`, role: 'adversary', label: 'operator', status: 'completed', summary: `Modify: ${note || '(none)'}; revise draft ${md5} with supersedes=${md5}.` } }))
-  startDriver($, o)
   pending.add(ticket)
+  await desk($, o, ['event'], JSON.stringify({ ticket, agent: 'desk', kind: 'phase', text: `redraft queued: /desk run ${ticket} runs it` }))
 }
 
 /**
- * Runs that need advancing, and the driver that advances them. Every spawn is made from the driver's own timer
- * dispatch: a subagent spawned from inside a hook's dispatch (a turn.complete, through a timer it set) ran with
- * none of this plugin's hooks answering its tool calls (seen 2026-10-15: "no tool.call hook answered"), while one
- * spawned from a timer set by a command ran with all of them. So no hook spawns; hooks only mark, and the driver,
- * started by a command or the session start, does the spawning.
+ * Runs that need advancing. 2026-10-16 (live, probed on engines 2.1.296 and 2.1.301): an agent keeps this plugin's hooks for
+ * its whole life only when it is spawned while a command's dispatch is still in flight, with that command's $. One spawned
+ * after the dispatch has returned (a timer it set, a hook, the old background driver) runs, but none of its tool calls
+ * reach a hook: its desk tools answer "no tool.call hook answered", and its proxy reads are never recorded, so no thread,
+ * no page and no receipt (#147036 and #147802 on the workstation, #143304 here). So only /desk run N spawns, from its
+ * own dispatch, which it holds until the run ends; anything else (the poller, Modify) only queues the ticket here.
  */
 const pending = new Set<string>()
-let driver: { cancel: () => void } | undefined
-let driving = false
 
-function startDriver($: any, o: Opts, lineage: 'command' | 'hook' = 'hook'): void {
-  if (driver) return
-  // 2026-10-15, workstation: a driver created in session.start spawned agents whose desk tool calls no hook answered
-  // ("no tool.call hook answered this call"), the same lineage fault as a spawn from turn.complete. Only a command's
-  // dispatch creates the driver; a hook only marks, and the next /desk command starts it.
-  if (lineage !== 'command') return
-  driver = $.clock.every(2_000, () => {
-    void (async () => {
-      if (driving || !pending.size) return
-      driving = true
-      try {
-        for (const ticket of [...pending]) {
-          pending.delete(ticket)
-          await advance($, o, ticket)
-        }
-      } finally {
-        driving = false
-      }
-    })().catch(() => { driving = false })
-  })
-}
-
-/** Start the run on one ticket: mark it, set the phase, and leave the first spawn to the driver. */
+/** Queue the run on one ticket: mark it and set the phase. The spawning is /desk run N's (see pending above). */
 function pull($: any, o: Opts, ticket: string, why: string, lineage: 'command' | 'hook' = 'hook'): void {
-  startDriver($, o, lineage)
+  void lineage
   $.clock.after(1, () => {
     void (async () => {
       await desk($, o, ['mark', '--ticket', ticket, '--state', 'drafting'])
@@ -920,7 +900,6 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'desk' }, async ($, e) => {
     const args = (e.args ?? '').trim()
     await ensureAgents($, o)
-    startDriver($, o, 'command')
     if (/^stats\b/.test(args)) {
       const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'stats', '--text'], { timeoutMs: 60_000 })
       return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${r.stderr.slice(0, 300)}` }
@@ -938,12 +917,22 @@ export const register: Register = (on, options) => {
     }
     if (/^run\s+#?\d+$/.test(args)) {
       const t = args.replace(/^run\s+#?/, '')
-      pull($, o, t, 'run by the operator', 'command')
-      // Hold the turn until the run ends: a $ call in flight costs the hook nothing, and the host caps one process
-      // at ten minutes, so the wait is a loop of them (up to ~45 min).
+      // the run is advanced here, in this command's own dispatch, so every agent it spawns keeps the desk's hooks (see pending).
+      // A $ call in flight costs the hook nothing, so the turn is held by short waits between advances, up to ~45 min.
+      const fresh = await desk($, o, ['trace', '--ticket', t]) as unknown as Trace
+      if (!fresh.ok || !['new', 'investigate', 'adversary', 'draft', 'review'].includes(String(fresh.run?.phase ?? ''))) {
+        await desk($, o, ['mark', '--ticket', t, '--state', 'drafting'])
+        await desk($, o, ['run'], JSON.stringify({ ticket: t, phase: 'new' }))
+      }
+      await desk($, o, ['event'], JSON.stringify({ ticket: t, agent: 'desk', kind: 'phase', text: 'run by the operator' }))
+      pending.add(t)
       let w: Record<string, unknown> = {}
-      for (let i = 0; i < 5; i++) {
-        w = await desk($, o, ['wait', '--ticket', t, '--timeout', '540'])
+      for (let i = 0; i < 180; i++) {
+        if (pending.has(t)) {
+          pending.delete(t)
+          await advance($, o, t)
+        }
+        w = await desk($, o, ['wait', '--ticket', t, '--timeout', '15'])
         if (w.ok || w.reason !== 'timeout') break
       }
       const tr = (await desk($, o, ['trace', '--ticket', t])) as unknown as Trace
@@ -964,7 +953,7 @@ export const register: Register = (on, options) => {
     if (/^pull\s+#?\d+$/.test(args)) {
       const t = args.replace(/^pull\s+#?/, '')
       pull($, o, t, 'pulled by the operator', 'command')
-      return { text: `Pulled #${t}: the run starts now; watch the Wall.` }
+      return { text: `Queued #${t}. /desk run ${t} runs it (agents spawned outside that command get none of the desk's hooks).` }
     }
     if (args === 'poll') {
       const t = await tick($, o, true)
@@ -1423,7 +1412,7 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
       )
     }
   } else if (which === 'tickets') {
-    text('q0', `poll ${v.poll}${v.lastPoll ? `, last ${ago(v.lastPoll)} ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, undefined, true)
+    text('q0', `poll ${v.poll}${v.lastPoll ? `, last ${ago(v.lastPoll)} ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${pending.size ? `; ${pending.size} run(s) queued: /desk run N runs one` : ''}`, undefined, true)
     if (v.lastResult && !v.pollError) text('q0r', `  proxy answered: ${cut(v.lastResult, width - 20)}`, undefined, true)
     const opened = new Set(v.open ?? [])
     const rows = v.queue.filter(q => match(q.ticket, q.subject, q.state))

@@ -81,7 +81,8 @@ class McpTests(unittest.TestCase):
         self.assertFalse(res[0]["result"]["isError"], res[0])
         self.assertIn("1 customer message(s)", res[1]["result"]["content"][0]["text"])
         self.assertFalse(res[2]["result"]["isError"], res[2])
-        self.assertIn("captured so far: https://docs.wiz.io/docs/sensor-versions", res[3]["result"]["content"][0]["text"])
+        self.assertIn("newest on any ticket: https://docs.wiz.io/docs/sensor-versions", res[3]["result"]["content"][0]["text"])
+        self.assertIn("this run captured", res[3]["result"]["content"][0]["text"])
 
     def test_file_draft_files_and_marks_drafting(self):
         res = talk(self.root, "drafter", [

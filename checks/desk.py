@@ -689,7 +689,10 @@ class Desk:
             if page is None:
                 # 2026-10-15 (receipt fault): the refusal names what IS captured, so an agent that wrote the URL another way
                 # (no scheme, trailing slash, anchor) can see the mismatch instead of reading "not captured" as "not read".
-                r = {"ok": False, "why": "page-not-captured", "source": source, "captured": self._pages_captured()}
+                # 2026-10-16 (#147036): the newest pages on ANY ticket read as this ticket's store; say how many this run captured
+                since = float((self._run(ticket) or {}).get("started") or 0)
+                r = {"ok": False, "why": "page-not-captured", "source": source, "captured": self._pages_captured(),
+                     "captured_this_run": self._pages_captured(limit=30, since=since)}
             else:
                 # page_origin says what the captured body is: the page itself (fetch), or a docs search result that
                 # names this URL (search). The audit shows the difference; the quote check is the same.
@@ -846,7 +849,7 @@ class Desk:
                 return p
         return os.path.join(self.root, "pages", md5_of(canon_url(source)) + ".json")
 
-    def _pages_captured(self, limit=8):
+    def _pages_captured(self, limit=8, since=None):
         """The documentation URLs captured so far, newest first: what a docs receipt may name."""
         d = os.path.join(self.root, "pages")
         if not os.path.isdir(d):
@@ -859,7 +862,7 @@ class Desk:
                 rows.append((float(pg.get("ts") or 0), str(pg.get("source") or "")))
             except (OSError, ValueError):
                 continue
-        return [src for _, src in sorted(rows, reverse=True)[:limit] if src]
+        return [src for ts, src in sorted(rows, reverse=True) if src and (since is None or ts >= since)][:limit]
 
     def cite(self, ticket, citations):
         """Bind receipts to the sentences of a draft: each citation is {receipt, sentence}. A receipt the ticket
@@ -897,6 +900,21 @@ class Desk:
             if time.time() >= deadline:
                 return {"ok": False, "phase": run.get("phase"), "reason": "timeout", "ticket": str(ticket)}
             time.sleep(poll_s)
+
+    def calls(self, ticket):
+        """Every call the run on a ticket made and what the desk took from each (thread, pages, or why nothing), in
+        order. 2026-10-16: #147036 ran three times with the thread never recorded and no page captured, and nobody
+        could say from the workstation what the reads had returned; this is the answer, without opening the store."""
+        ticket = str(ticket or "")
+        if not ticket:
+            return {"ok": False, "reason": "ticket required"}
+        rd = self._run_dir(ticket)
+        calls = self._rows(os.path.join(rd, "calls.jsonl"))
+        notes = [e for e in self._rows(os.path.join(rd, "events.jsonl")) if e.get("kind") in ("capture", "guard", "docs")]
+        rec = self._thread(ticket)
+        msgs = (rec or {}).get("thread", {}).get("messages", [])
+        return {"ok": True, "ticket": ticket, "calls": calls, "notes": notes,
+                "thread": {"recorded": rec is not None, "messages": len(msgs)}, "pages": self._pages_captured(limit=30)}
 
     def trace(self, ticket):
         """Everything the operator reads before Send: the run, its agents, the findings, the receipts, the tail."""
@@ -1155,9 +1173,25 @@ def render_audit(a):
     return "\n".join(L)
 
 
+def calls_text(c):
+    L = ["#%s: %d call(s); thread %s; pages captured (newest, any ticket): %d" % (
+        c["ticket"], len(c["calls"]), ("%d message(s)" % c["thread"]["messages"]) if c["thread"]["recorded"] else "not recorded", len(c["pages"]))]
+    for r in c["calls"]:
+        a = r.get("args") or {}
+        what = " ".join(str(a.get(k)) for k in ("proxy", "endpoint") if a.get(k)) or json.dumps(a)[:80]
+        L.append("  %s %s %s %s %d chars%s" % (r.get("agent") or "-", r.get("tool") or "", what, "ok" if r.get("ok") else "FAILED",
+                                            r.get("result_chars") or 0, (" (%s)" % r["note"]) if r.get("note") else ""))
+    if c["notes"]:
+        L.append("captured:")
+        L.extend("  (%s) %s: %s" % (n.get("agent"), n.get("kind"), n.get("text")) for n in c["notes"])
+    else:
+        L.append("captured: nothing (no read on this run produced a thread or a page)")
+    return "\n".join(L)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree", "requester", "mismatch"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree", "requester", "mismatch", "calls"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
@@ -1207,6 +1241,11 @@ def main(argv=None):
         if a.text and out.get("ok"):
             print(render_audit(out))
             return
+    elif a.cmd == "calls":
+        out = d.calls(a.ticket)
+        if a.text and out.get("ok"):
+            print(calls_text(out))
+            return 0
     elif a.cmd == "tree":
         out = DT.build(d, a.md5, a.ticket, send={"status": a.status, "via": a.via})
         if out.get("ok") and a.node:

@@ -151,7 +151,8 @@ const isComment = (c: unknown): boolean => {
 const commentsIn = (v: unknown, depth = 0, loose = false): { comments: Array<Record<string, unknown>>; count?: number } | undefined => {
   if (depth > 5 || v == null) return undefined
   if (typeof v === 'string') {
-    if (depth === 0 || !(loose || /"comments"\s*:\s*\[/.test(v))) return undefined
+    // a JSON string at the top is a body encoded twice (the proxy's JSON inside the host's JSON): parse it again too
+    if (!(loose || /"comments"\s*:\s*\[/.test(v))) return undefined
     try {
       return commentsIn(JSON.parse(v), depth + 1, loose)
     } catch {
@@ -184,6 +185,22 @@ const commentsIn = (v: unknown, depth = 0, loose = false): { comments: Array<Rec
     }
   }
   return undefined
+}
+
+/** The text a tool call came back with, whatever the host filled: `text`, a string `result`, MCP `content` blocks (at the top
+ * or inside `result`), else the result as JSON. 2026-10-16 (#147036 on 0.8.7, thread still not recorded): the read path took
+ * `.text` alone, so a result that arrived anywhere else was never scanned for comments or pages. The poll path already fell back. */
+const resultText = (ran: unknown): string => {
+  if (!ran || typeof ran !== 'object') return typeof ran === 'string' ? ran : ''
+  const r = ran as Record<string, unknown>
+  if (typeof r.text === 'string' && r.text.trim()) return r.text
+  const blocks = (v: unknown): string => Array.isArray(v) ? v.map(b => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : '')).filter(Boolean).join('\n') : ''
+  if (typeof r.result === 'string' && r.result.trim()) return r.result
+  const inner = r.result && typeof r.result === 'object' ? r.result as Record<string, unknown> : undefined
+  const fromBlocks = blocks(r.content) || blocks(inner?.content) || blocks(r.result)
+  if (fromBlocks) return fromBlocks
+  if (inner && typeof inner.text === 'string' && inner.text.trim()) return inner.text
+  return inner && Object.keys(inner).length ? JSON.stringify(inner) : ''
 }
 
 /** Our side of a comment: the proxy may say it as author_role, via_agent, or an author object with a role. */
@@ -333,7 +350,9 @@ const refusalDetail = (r: Record<string, unknown>): string => {
   const why = String(r.why ?? '')
   if (why === 'page-not-captured') {
     const cap = Array.isArray(r.captured) ? (r.captured as unknown[]).map(String) : []
-    return `; fetch the page through the proxy first, then quote it with the URL as the result names it (captured so far: ${cap.length ? cap.join(', ') : 'none'})`
+    // 2026-10-16 (#147036): the newest pages on any ticket read as this ticket's store; say what this run captured first
+    const mine = Array.isArray(r.captured_this_run) ? (r.captured_this_run as unknown[]).map(String) : []
+    return `; fetch the page through the proxy first, then quote it with the URL as the result names it (this run captured ${mine.length ? mine.join(', ') : 'NO page: no docs read in this run named an official URL'}; newest on any ticket: ${cap.length ? cap.join(', ') : 'none'})`
   }
   if (why === 'no-thread-captured') return `; ${String(r.hint ?? '')}`
   if (why === 'quote-not-in-material') {
@@ -800,7 +819,7 @@ export const register: Register = (on, options) => {
   const o = opts(options as Record<string, unknown>)
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'desk', description: 'The review desk: the Review, Tickets and Wall panes; /desk review|tickets|wall opens one, /desk show [md5 | N] [node] prints the proof tree, /desk run N, trace N, poll, pull N, pause, resume, stats, audit, verify', argumentHint: '[review | tickets | wall | show | run N | trace N | poll | pull N | pause | resume | stats]' })
+    await $.command.register({ name: 'desk', description: 'The review desk: the Review, Tickets and Wall panes; /desk review|tickets|wall opens one, /desk show [md5 | N] [node] prints the proof tree, /desk run N, trace N, calls N (what each read gave the desk), poll, pull N, pause, resume, stats, audit, verify', argumentHint: '[review | tickets | wall | show | run N | trace N | calls N | poll | pull N | pause | resume | stats]' })
     await $.tool.register({
       name: TOOL,
       description:
@@ -923,6 +942,11 @@ export const register: Register = (on, options) => {
       }
       const tr = (await desk($, o, ['trace', '--ticket', t])) as unknown as Trace
       return { text: `Run on #${t}: phase ${String(w.phase ?? '?')}${w.ok ? '' : ` (${String(w.reason ?? 'not finished')})`}\n\n${tr.ok ? traceText(tr) : ''}` }
+    }
+    if (/^calls\s+#?\d+$/.test(args)) {
+      const t = args.replace(/^calls\s+#?/, '')
+      const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'calls', '--ticket', t, '--text'], { timeoutMs: 60_000 })
+      return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${r.stderr.slice(0, 300)}` }
     }
     if (/^trace\s+#?\d+$/.test(args)) {
       const t = args.replace(/^trace\s+#?/, '')
@@ -1061,7 +1085,7 @@ export const register: Register = (on, options) => {
         const who = agentId ? active.get(agentId) : undefined
         const args = Object.fromEntries(Object.entries(e as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
         // an empty text beside a filled result is the result (?? kept the empty string and captured nothing)
-        const text = ran?.text || (typeof ran?.result === 'string' ? ran.result : ran?.result ? JSON.stringify(ran.result) : '')
+        const text = resultText(ran)
         if (agentId) await wallLine($, o, agentId, 'docs', JSON.stringify(args).slice(0, 100))
         if (who) await desk($, o, ['call'], JSON.stringify({ ticket: who.ticket, agent: who.label, tool, args, result: text || JSON.stringify(ran ?? null), ok: !ran?.isError }))
         // a search result is kept under each official URL it names, marked as a search result, not the page
@@ -1080,7 +1104,7 @@ export const register: Register = (on, options) => {
       const ran = await next(e)
       try {
         const ticket = ticketOf(args)
-        const text = (ran as { text?: string }).text
+        const text = resultText(ran) || undefined
         if (agentId) await wallLine($, o, agentId, 'read', `${String(args.proxy ?? '')} ${String(args.endpoint ?? '')} ${JSON.stringify(args.arguments ?? {}).slice(0, 100)}`)
         // the call on the record, whole: who read what, with what arguments, and a hash of what came back
         const who = agentId ? active.get(agentId) : undefined
@@ -1091,7 +1115,10 @@ export const register: Register = (on, options) => {
         // thread, and every verbatim customer quote was then refused as "quote-not-in-material".
         const forTicket = ticket ?? who?.ticket
         const commentsRead = /comment/i.test(String(args.endpoint ?? ''))
+        // what this read gave the desk, on the record beside the call, so a thread that is never recorded shows why (/desk calls N)
+        let got = ''
         if (forTicket && text && (commentsRead || /\\?"comments\\?"\s*:\s*\[/.test(text))) {
+          got = `no comments found in a ${text.length}-char result: ${text.slice(0, 160)}`
           try {
             const found = commentsIn(JSON.parse(text), 0, commentsRead)
             if (found) {
@@ -1103,11 +1130,15 @@ export const register: Register = (on, options) => {
                 at: typeof c.created_at === 'string' ? Date.parse(c.created_at) / 1000 : undefined,
                 text: commentText(c),
               }))
-              await desk($, o, ['capture'], JSON.stringify({ ticket: forTicket, messages, count: found.count ?? found.comments.length }))
+              const c = await desk($, o, ['capture'], JSON.stringify({ ticket: forTicket, messages, count: found.count ?? found.comments.length }))
+              got = c.ok === false ? `thread refused: ${String(c.reason ?? '')}` : `thread ${messages.length} message(s) recorded`
             }
           } catch {
             /* not a comments payload after all */
+            got = `not JSON (${text.length} chars): ${text.slice(0, 160)}`
           }
+        } else if (forTicket && commentsRead) {
+          got = `comments read came back with no text (result keys: ${Object.keys((ran ?? {}) as object).join(',') || 'none'})`
         }
         // the salutation check (the fleet's requester-name gate) needs the name as the ticket's requester field shows it
         const requester = forTicket && text ? requesterIn(text) : undefined
@@ -1115,8 +1146,11 @@ export const register: Register = (on, options) => {
         if (text) {
           // a URL the call itself named was fetched: the body is that page; one only named in the result is not
           const asked = new Set(docsUrls(o, JSON.stringify(args)))
-          for (const url of docsUrls(o, JSON.stringify(args), text.slice(0, 4000))) await desk($, o, ['page'], JSON.stringify({ source: url, body: text, origin: asked.has(url) ? 'fetch' : 'search' }))
+          const urls = docsUrls(o, JSON.stringify(args), text.slice(0, 4000))
+          for (const url of urls) await desk($, o, ['page'], JSON.stringify({ source: url, body: text, origin: asked.has(url) ? 'fetch' : 'search' }))
+          if (urls.length) got = `${got ? `${got}; ` : ''}page(s) ${urls.join(' ')}`
         }
+        if (forTicket && got) await desk($, o, ['event'], JSON.stringify({ ticket: forTicket, agent: who?.label ?? 'main', kind: 'capture', text: `${String(args.endpoint ?? tool)}: ${got}` }))
       } catch {
         /* the read ran; a failure to record it must not run it again */
       }
@@ -1137,7 +1171,7 @@ export const register: Register = (on, options) => {
     if (r.ok) {
       const ran = await next(e)
       try {
-        if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool, args, result: (ran as { text?: string }).text ?? JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny, note: `POST granted ${String(r.md5)}` }))
+        if (postTicket) await desk($, o, ['call'], JSON.stringify({ ticket: postTicket, agent: who?.label ?? 'main', tool, args, result: resultText(ran) || JSON.stringify(ran ?? null), ok: !(ran as { deny?: unknown }).deny, note: `POST granted ${String(r.md5)}` }))
         await refresh($, o, `sent ${String(r.md5).slice(0, 8)}`)
         if (r.ticket && r.status) await verify($, o, tool, String(r.ticket), String(r.status))
       } catch {

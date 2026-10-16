@@ -1191,7 +1191,7 @@ def calls_text(c):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree", "requester", "mismatch", "calls"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree", "requester", "mismatch", "calls", "qr"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
@@ -1206,6 +1206,7 @@ def main(argv=None):
     ap.add_argument("--node", help="tree: only this node (its body loaded when it lives in a file)")
     ap.add_argument("--depth", type=int, default=99, help="tree --text: how deep to print")
     ap.add_argument("--name", help="requester: the name as the ticket's requester field shows it")
+    ap.add_argument("--width", type=int, default=72, help="qr: the pane's columns; the code and its quiet zone fit them")
     ap.add_argument("--via", help="tree: the proxy/endpoint a Send will use, for the SEND node")
     a = ap.parse_args(argv)
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
@@ -1247,6 +1248,11 @@ def main(argv=None):
         if a.text and out.get("ok"):
             print(calls_text(out))
             return 0
+    elif a.cmd == "qr":
+        # 2026-10-16 F-1096: the draft's exact bytes leave the workstation on the screen, as QR codes the reader on box j1 checks
+        import desk_qr as DQ
+        req = d._requests().get(a.md5 or "")
+        out = DQ.codes(a.md5, req["text"], a.width) if req else {"ok": False, "reason": "unknown md5"}
     elif a.cmd == "tree":
         out = DT.build(d, a.md5, a.ticket, send={"status": a.status, "via": a.via})
         if out.get("ok") and a.node:

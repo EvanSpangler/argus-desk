@@ -11,7 +11,7 @@ const fake = (on: any, answer: (r: Run) => Record<string, unknown> | Promise<Rec
   })
   return calls
 }
-const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait', 'tree', 'requester', 'mismatch', 'calls'].includes(String(a)))
+const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait', 'tree', 'requester', 'mismatch', 'calls', 'qr'].includes(String(a)))
 
 const DRAFT = 'Hi Sam,\n\nThe broker is disabled, so the connector reports unhealthy. Re-enable it under Settings > Connectors.\n\nThanks!\n'
 const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state: 'pending', filed: 1, age_s: 120, chars: 120, text: DRAFT,
@@ -647,6 +647,34 @@ test('a view key reads the desk again: a draft filed outside the session shows w
   filed = true
   await ui.press({ key: 'go-review' })
   expect(await ui.find({ key: 'send' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('q shows the draft as QR codes one at a time, q again the next, b back to the proof (F-1096: the bytes leave on the screen)', async ($, on) => {
+  const asked: string[][] = []
+  fake(on, (r: Run) => {
+    if (cmdOf(r) === 'qr') { asked.push(r.argv); return { ok: true, md5: ITEM.md5, n: 2, codes: [{ payload: 'a', lines: ['\u2588\u2580 one'] }, { payload: 'b', lines: ['\u2584\u2588 two'] }] } }
+    return treeFake(r)
+  })
+  await $.command.run({ command: 'desk', args: '' })
+  const ui = await mountPane($, 'desk')
+  await ui.press({ key: 'qr' })
+  // the press returns before desk.py answers: wait for the code to draw
+  for (let i = 0; i < 50 && !(await ui.find({ type: 'Text', text: /QR 1 of 2/ })); i++) await new Promise(r => setTimeout(r, 20))
+  expect(asked.length).toBe(1)
+  expect(asked[0]).toContain(ITEM.md5)
+  expect(asked[0][asked[0].indexOf('--width') + 1]).toBe('98')
+  expect(await ui.find({ type: 'Text', text: /QR 1 of 2/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /one/ })).toBeDefined()
+  expect(await ui.find({ key: 'send' })).toBeDefined()
+  await ui.press({ key: 'qr-next' })
+  for (let i = 0; i < 50 && !(await ui.find({ type: 'Text', text: /QR 2 of 2/ })); i++) await new Promise(r => setTimeout(r, 20))
+  expect(await ui.find({ type: 'Text', text: /QR 2 of 2/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /two/ })).toBeDefined()
+  expect(asked.length).toBe(1)
+  await ui.press({ key: 'qr-back' })
+  expect(await ui.find({ type: 'Text', text: /QR \d of/ })).toBeUndefined()
+  expect(await ui.find({ key: 'qr' })).toBeDefined()
   await ui.unmount()
 })
 

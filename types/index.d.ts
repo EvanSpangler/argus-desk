@@ -102,6 +102,8 @@ export type DeskView = {
   filter?: { review?: string; tickets?: string; wall?: string }
   /** The agent whose tail the Wall shows, instead of the list. */
   tail?: string
+  /** The selected draft as QR codes (desk.py qr), the one shown and all of them: q shows the next, b goes back. */
+  qr?: { md5: string; i: number; codes: string[][] }
   /** The proof tree behind the selected draft. */
   tree?: TreeResult
   /** The Review pane: expanded node ids, the zoom stack (node ids, innermost last), bodies loaded on demand, the row last pressed. */

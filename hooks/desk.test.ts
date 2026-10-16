@@ -122,6 +122,20 @@ test('capture 2026-10-16 (0.8.8): a comments read that comes back as MCP content
   expect(last.text).toMatch(/came back with no text/)
 })
 
+test('0.8.9: a read by an agent the desk cannot name is still on the record, with a note saying so', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [] }))
+  const payload = { comments: [{ id: 31, author_id: 5, created_at: '2026-10-14T10:00:00Z', plain_body: 'Which CPE?', public: true }], count: 1 }
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: payload, text: JSON.stringify(payload) }))
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', agentId: 'a0ffbeef0000', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket_comments', arguments: { ticket_id: 147036 } } as any)
+  const rec = calls.filter(c => cmdOf(c) === 'call').map(c => JSON.parse(c.stdin!))
+  expect(rec.length).toBe(1)
+  expect(rec[0]).toMatchObject({ ticket: '147036', agent: 'agent a0ffbeef0000' })
+  expect(calls.filter(c => cmdOf(c) === 'capture').length).toBe(1)
+  const notes = calls.filter(c => cmdOf(c) === 'event').map(c => JSON.parse(c.stdin!)).filter(e => e.kind === 'capture').map(e => e.text)
+  expect(notes.some(n => /did not spawn under this id \(a0ffbeef0000\)/.test(n))).toBe(true)
+  expect(notes.some(n => /thread 1 message\(s\) recorded/.test(n))).toBe(true)
+})
+
 test('/desk calls N prints what each read of the run gave the desk', async ($, on) => {
   on('process.run', async (_$: any, e: any) => ({ value: { exitCode: 0, stdout: e.argv.includes('calls') ? '#147036: 2 call(s); thread not recorded' : '{"ok":true,"items":[],"rows":[]}', stderr: '' } }))
   const r = await $.command.run({ command: 'desk', args: 'calls 147036' })

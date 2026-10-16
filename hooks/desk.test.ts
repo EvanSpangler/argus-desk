@@ -72,6 +72,34 @@ test('fleet parity: desk_mismatch records the escalation basis through desk.py',
   expect(JSON.parse(m!.stdin!)).toMatchObject({ ticket: '123456', documented: 'rcpt:docs-1', observed: 'rcpt:material-2' })
 })
 
+test('capture 2026-10-16: a comments endpoint whose result is a bare array, or comments under another key, is still the thread', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [] }))
+  const bare = [{ id: 11, author_id: 5, created_at: '2026-10-14T10:00:00Z', plain_body: 'Which CPE does this match?', public: true }, { id: 12, author_role: 'agent', created_at: '2026-10-14T11:00:00Z', body: 'Please send the SBOM.' }]
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: bare, text: JSON.stringify(bare) }))
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket_comments', arguments: { ticket_id: 123456 } } as any)
+  const cap = calls.filter(c => cmdOf(c) === 'capture')
+  expect(cap.length).toBe(1)
+  const body = JSON.parse(cap[0].stdin!)
+  expect(body.messages.map((m: any) => m.who)).toEqual(['customer', 'us'])
+  expect(body.count).toBe(2)
+})
+
+test('capture 2026-10-16: comments under data with a total carry the total as the count; a non-comments read with an array is not a thread', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [] }))
+  const wrapped = { data: [{ id: 1, created_at: '2026-10-14T10:00:00Z', html_body: '<p>Scans fail.</p>' }], total: 4 }
+  const tickets = { data: [{ id: 123456, subject: 'Scans fail', created_at: '2026-10-14T10:00:00Z', body: 'x' }] }
+  let next: unknown = wrapped
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: next, text: JSON.stringify(next) }))
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_get_ticket_comments', arguments: { ticket_id: '123456' } } as any)
+  next = tickets
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'zendesk-full', endpoint: 'zendesk_search_tickets', arguments: { ticket_id: '123456' } } as any)
+  const cap = calls.filter(c => cmdOf(c) === 'capture')
+  expect(cap.length).toBe(1)
+  const body = JSON.parse(cap[0].stdin!)
+  expect(body.count).toBe(4)
+  expect(body.messages[0].text).toBe('Scans fail.')
+})
+
 test('receipt fault 2026-10-15: a comments read wrapped in an envelope, or a JSON string, with only html bodies, is still the thread', async ($, on) => {
   const calls = fake(on, () => ({ ok: true, items: [] }))
   const inner = { data: { count: 2, comments: [

@@ -260,6 +260,17 @@ def build(desk, md5=None, ticket=None, send=None):
         issues.append(_n("issue:warn:%s" % w, "warning at filing: %s" % w, target="ask", color="yellow"))
     for l in filed_checks.get("lint") or []:
         issues.append(_n("issue:voice:%s" % str(l)[:40], "voice rule: %s" % l, target="reply", color="yellow"))
+    # 2026-10-16 live drive: a draft held for requester-name-unrecorded showed "ISSUES: 2 open" without it. Every hold the
+    # Send would overrule (desk.grant: filed hits + open review objections + thread moved) is named here, once.
+    shown = set(str(l) for l in filed_checks.get("lint") or []) | set(thread_checks.get("mechanical") or []) | {p for s in sentences for p in s["problems"]}
+    if any(s["state"] == "uncovered" for s in sentences):
+        shown.add("uncovered")
+    if any(n["id"].startswith("issue:f-") for n in issues):
+        shown |= {h for h in desk.review_hits(md5)}
+    for h in list(filed_checks.get("hits") or []) + desk.review_hits(md5) + desk.moved_since(req)["hits"]:
+        if h not in shown:
+            shown.add(h)
+            issues.append(_n("issue:hold:%s" % h, "hold: %s" % h, target="ask:thread" if h == "thread-moved" else "send", color="yellow"))
     if stale:
         issues.append(_n("issue:stale", "the ticket was updated after the thread was recorded: read it again before Send", target="ask:thread", color="red"))
     issues_node = _n("issues", "ISSUES: %d open" % len(issues) if issues else "ISSUES: nothing open", issues, color="yellow" if issues else "green")

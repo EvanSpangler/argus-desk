@@ -19,7 +19,7 @@ import argparse, json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DESK = os.path.join(HERE, "desk.py")
-VERSION = "0.6.6"
+VERSION = "0.8.4"
 
 TOOLS = [
     {"name": "file_draft",
@@ -49,6 +49,11 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"ticket": {"type": "string"}, "kind": {"type": "string"}, "quote": {"type": "string"},
                                                       "source": {"type": "string", "description": "the page URL, for docs; the run, for test"}},
                      "required": ["ticket", "kind", "quote"]}},
+    {"name": "desk_mismatch",
+     "description": "Record the basis an escalation needs: the docs receipt id (what the product should do), the material or test receipt id "
+                    "(what it did), and one line on how they differ. Both receipts must be on this ticket and fresh.",
+     "inputSchema": {"type": "object", "properties": {"ticket": {"type": "string"}, "documented": {"type": "string"}, "observed": {"type": "string"},
+                                                      "summary": {"type": "string"}}, "required": ["ticket", "documented", "observed", "summary"]}},
 ]
 
 
@@ -124,6 +129,12 @@ def handle(desk, role, name, a):
         elif why == "quote-not-from-customer":
             more = "; those words are in a %s message, not the customer's" % r.get("found_in")
         return "Refused: %s. Only a sentence you actually read, verbatim, can be receipted%s." % (why, more), True
+    if name == "desk_mismatch":
+        r = desk.run(["mismatch"], {"ticket": ticket, "documented": s(a.get("documented")), "observed": s(a.get("observed")),
+                                    "summary": s(a.get("summary")), "by": role})
+        if r.get("ok"):
+            return "Mismatch %s." % r.get("id"), False
+        return "Refused: %s." % (r.get("why") or r.get("reason")), True
     return "unknown tool %s" % name, True
 
 

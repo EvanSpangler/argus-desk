@@ -27,7 +27,31 @@ export type QueueRow = {
   subject?: string
   age_s: number
   status?: string
+  updated?: string | null
+  /** The thread as the desk recorded it, when it has. */
+  thread?: { messages: number; count?: number | null; fetched_at?: number | null } | null
+  run?: { phase?: string; rounds?: number; agents?: number } | null
+  /** The md5s of the drafts waiting on this ticket. */
+  drafts?: string[]
 }
+
+/** One node of the proof tree desk.py builds behind a draft (checks/desk_tree.py). */
+export type TreeNode = {
+  id: string
+  label: string
+  children: TreeNode[]
+  body?: string
+  mark?: string
+  color?: string
+  state?: string
+  /** Another node this one is about: an issue's sentence, a receipt's minting agent. */
+  target?: string
+  /** A body kept in a file (an agent's prompt or answer), loaded on demand. */
+  body_file?: string
+  chars?: number
+}
+
+export type TreeResult = { ok: boolean; md5?: string; ticket?: string; state?: string; open?: number; tree?: TreeNode; reason?: string }
 
 export type WallAgent = {
   id: string
@@ -45,6 +69,8 @@ export type Finding = { id: string; agent: string; role: string; kind: string; t
 export type Receipt = { id: string; kind: string; ticket: string; quote: string; source?: string; bound?: string[]; minted?: string; page_origin?: 'fetch' | 'search' }
 export type Claim = { text: string; classes?: string[]; receipts?: string[]; problems?: string[]; echo?: boolean }
 
+export type ThreadMessage = { id?: string; who: string; at?: number; text: string }
+
 export type Trace = {
   ok: boolean
   run: { ticket: string; phase: string; rounds?: number; agents?: RunAgent[]; started?: number }
@@ -53,9 +79,13 @@ export type Trace = {
   events?: Array<{ agent: string; kind: string; text: string; ts?: number }>
   claims?: Claim[]
   drafts?: DeskItem[]
+  thread?: { id?: string; source?: string; fetched_at?: number; messages: ThreadMessage[] }
+  thread_count?: number
 }
 
 export type DeskView = {
+  /** The view the desk pane shows. */
+  which?: 'review' | 'tickets' | 'wall'
   items: DeskItem[]
   queue: QueueRow[]
   wall: WallAgent[]
@@ -68,8 +98,19 @@ export type DeskView = {
   lastPoll?: number
   pollError?: string
   lastResult?: string
-  tab: 'wall' | 'queue' | 'ticket' | 'decide'
-  scroll: number
+  /** The filter text per pane, applied on Enter. */
+  filter?: { review?: string; tickets?: string; wall?: string }
+  /** The agent whose tail the Wall shows, instead of the list. */
+  tail?: string
+  /** The proof tree behind the selected draft. */
+  tree?: TreeResult
+  /** The Review pane: expanded node ids, the zoom stack (node ids, innermost last), bodies loaded on demand, the row last pressed. */
+  expanded?: string[]
+  zoom?: string[]
+  bodies?: Record<string, string>
+  last?: string
+  /** The Tickets pane: the ticket rows opened. */
+  open?: string[]
 }
 
 declare module 'claude-code' {

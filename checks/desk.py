@@ -14,6 +14,8 @@ Subcommands (JSON in on stdin where noted, JSON out on stdout, exit 0 unless the
   modify    --md5 --note                                       -> operator asked for a change (returned)
   consume   stdin {candidates:[body text], what, status}       -> the send gate: spends an open grant
   capture   stdin {ticket, messages:[{id,who,at,text}], count} -> records the live thread + receipt
+  requester --ticket --name                                   -> the requester's name, for the salutation check
+  mismatch  stdin {ticket, documented, observed, summary}     -> the basis an escalation needs
   stats                                                        -> the economics table
 """
 import argparse, hashlib, json, os, re, sys, tempfile, time
@@ -22,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import confirm_ledger as CL
 import claim_receipts as CR
 import thread_review as TR
+import desk_tree as DT
 
 OPERATOR = "operator"
 # Official documentation hosts a docs receipt may cite, on top of claim_receipts' own list: ARGUS_DESK_DOCS_HOSTS=a,b
@@ -41,6 +44,17 @@ def _iso_epoch(s):
         return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         return None
+# The fleet's voice-lint salutation: a greeting names the requester exactly as the ticket's requester field has it.
+# "Hi Alvar" (09-15) and "Hi Alba" (09-18) went out to people with other names.
+SALUTATION = re.compile(r"^\s*(?:Hi|Hello|Hey|Dear)\s+([A-Za-z][A-Za-z.'-]*)\s*[,!\n]", re.M)
+# The fleet's reply-review codes. A reviewer objection names one in brackets ("[misattributed] ..."); an open one that quotes
+# the draft holds as review:<code>, the way a verified reply-review finding holds a delegated grant in the fleet.
+REVIEW_CODES = ("question-not-answered", "contradicts-customer", "contradicts-earlier-send", "ignores-customer-info", "misattributed",
+                "implied-commitment", "holding-reply", "customer-cannot-act", "quotes-customer-back", "platform-mismatch", "unreceipted")
+CODE = re.compile(r"^\s*\[([a-z-]+)\]")
+# The fleet's history hold: a deny on the ticket in the last 72 h means the drafting has been wrong here, so the
+# operator decides; a delegated press does not.
+HISTORY_S = 72 * 3600
 TIMELINE = re.compile(r"\b(shortly|soon|asap|as soon as possible|by (?:end of|eod|tomorrow|monday|tuesday|wednesday|thursday|friday)|within (?:the )?(?:hour|day|\d+ (?:hours|days)))\b", re.I)
 
 
@@ -207,6 +221,53 @@ class Desk:
     def _thread(self, ticket):
         return read_json(os.path.join(self.root, "threads", "%s.json" % ticket), default=None)
 
+    def _fleet_receipts(self, ticket, checks):
+        """What the fleet's own claim check needs re-minted for this draft: each credited sentence with the receipts behind
+        it (kind, URL or source, the verbatim quote). The fleet mints its own (a docs receipt needs its browser snapshot);
+        this is the list, so the second check reopens the same pages instead of investigating again."""
+        rc = {r["id"]: r for r in CR.load(self.receipts_path) if r.get("ticket") == str(ticket)}
+        kinds = {"docs": "docs", "material": "artifact", "test": "tenant", "mismatch": "mismatch"}
+        out = []
+        for c in (checks.get("claims") or {}).get("detail") or []:
+            for rid in c.get("receipts") or []:
+                r = rc.get(rid)
+                if r:
+                    out.append({"sentence": c["text"], "fleet_kind": kinds.get(r["kind"], r["kind"]), "url": r.get("source"),
+                                "quote": r.get("quote"), "desk_receipt": rid})
+        esc = checks.get("escalation") or {}
+        for mid in esc.get("mismatch") or []:
+            r = rc.get(mid)
+            if r:
+                out.append({"sentence": esc.get("sentence"), "fleet_kind": "mismatch", "documented": r.get("documented"),
+                            "observed": r.get("observed"), "quote": r.get("quote"), "desk_receipt": mid})
+        return out
+
+    def _requesters(self):
+        return read_json(os.path.join(self.root, "requesters.json"), default=None) or {}
+
+    def requester(self, ticket, name, by=OPERATOR):
+        """Record the requester's name as the ticket's requester field shows it, for the salutation check."""
+        name = re.sub(r"\s+", " ", str(name or "")).strip()
+        if not str(ticket or "").strip() or not name:
+            return {"ok": False, "reason": "ticket and name are required"}
+        reg = self._requesters()
+        reg[str(ticket)] = {"name": name, "at": self.clock(), "by": by}
+        write_json(os.path.join(self.root, "requesters.json"), reg, indent=1, sort_keys=True)
+        return {"ok": True, "ticket": str(ticket), "name": name}
+
+    def _denied_on(self, ticket, now):
+        """Operator denies of a draft on this ticket in the last 72 h, newest first. An expiry is not a deny."""
+        on = {r["md5"] for r in self._rows(self.requests_path) if r.get("ticket") == str(ticket)}
+        return [{"md5": e["md5"], "at": e["ts"], "reason": (e.get("reason") or "")[:160]}
+                for e in reversed(self.ledger.events()) if e.get("event") == "deny" and e.get("md5") in on and now - e["ts"] <= HISTORY_S]
+
+    def mismatch(self, ticket, documented, observed, summary, by=None):
+        r = CR.mint_mismatch(self.receipts_path, ticket, documented, observed, summary, datetime.fromtimestamp(self.clock(), timezone.utc))
+        self._append(os.path.join(self._run_dir(ticket), "events.jsonl"),
+                     {"agent": by or "", "kind": "receipt" if r.get("ok") else "receipt-refused",
+                      "text": "%s mismatch: %s" % (r.get("id") or r.get("why"), str(summary or "")[:120])})
+        return r
+
     def _requests(self):
         return {r["md5"]: r for r in self._rows(self.requests_path)}
 
@@ -222,6 +283,22 @@ class Desk:
             lint.append("timeline-commitment")
         out["lint"] = lint
         out["hits"] += lint
+        # 1b. the fleet's per-ticket gates: requester name, recent deny, the kill switch
+        sal = SALUTATION.search(draft)
+        if sal:
+            name = (self._requesters().get(str(ticket)) or {}).get("name")
+            greeted = sal.group(1)
+            out["requester"] = {"greeted": greeted, "recorded": name}
+            if not name:
+                out["hits"].append("requester-name-unrecorded")
+            elif not any(t.lower() == greeted.lower() for t in re.split(r"[\s,()]+", name.strip(".,'\"")) if t):
+                out["hits"].append("requester-name-mismatch")
+        denied = self._denied_on(ticket, now)
+        if denied:
+            out["denied_recently"] = denied
+            out["hits"].append("ticket-denied-recently")
+        if os.path.exists(os.path.join(self.root, "sends-held")):
+            out["hits"].append("sends-held")
         # 2. thread: capture proof, cadence, reversal, repeat-ask, open customer questions
         rec = self._thread(ticket)
         if rec:
@@ -243,10 +320,22 @@ class Desk:
         # sentence needs a receipt that says what it says; a problem on any sentence is a HOLD with its code.
         c = CR.check(draft, ticket, self.receipts_path, datetime.fromtimestamp(now, timezone.utc), inbound=inbound)
         claims = [r for r in c["claims"] if "snippet" not in r["classes"]]
-        out["claims"] = {"checkable": len(claims), "credited": c["credited"],
+        out["claims"] = {"detail": [{"text": r["text"], "receipts": r.get("receipts") or []} for r in claims if r.get("receipts") and not r["problems"]],
+                         "checkable": len(claims), "credited": c["credited"],
                          "uncovered": sum(1 for r in claims if "uncovered" in r["problems"]),
                          "echo": sum(1 for r in claims if r.get("echo")), "hits": c["hits"], "shadow": False}
         out["hits"] += [h for h in c["hits"] if h not in out["hits"]]
+        # 3b. escalation needs a recorded mismatch (docs say X, the product did Y), as in the fleet
+        when = datetime.fromtimestamp(now, timezone.utc)
+        esc = CR.escalation(draft, ticket, self.receipts_path, when)
+        if esc:
+            out["escalation"] = esc
+            if not esc["mismatch"]:
+                out["hits"].append("escalation-without-mismatch")
+        share = CR.echo_share(draft, inbound)
+        out["claims"]["echo_share"] = share
+        if share >= CR.POLICY["echo_warn_share"]:
+            out["warnings"].append("echo-share")
         # 4. voice: the operator's own lint rules (<root>/voice-rules.json, exported from the fleet's voice-lint;
         # a built-in floor when the file is absent). block is a HOLD voice:<id>, warn is a warning.
         voice = self._voice(draft)
@@ -321,24 +410,66 @@ class Desk:
         prior = self._requests().get(supersedes) if supersedes else None
         row = {"md5": md5, "ticket": str(ticket), "source": source, "supersedes": supersedes,
                "chars": len(text), "checks": checks, "text": text}
+        row["fleet_receipts"] = self._fleet_receipts(ticket, checks)
         if prior:
             row["edit"] = {"from": supersedes, "chars_before": prior.get("chars"), "distance": _distance(prior.get("text", ""), text)}
         self._append(self.requests_path, row)
+        # The newest draft on a ticket is the one at the desk. Left pending, an older one (the draft a redraft names, or a
+        # whole earlier run's) stayed beside it, counted as waiting and open to a Send: two replies to one customer.
+        # A Modify has withdrawn its draft already; a redraft round and a rerun had not.
+        for old, r in self._requests().items():
+            if old != md5 and r["ticket"] == str(ticket) and self.ledger.state(old)["state"] == "pending":
+                why = "superseded by " if old == supersedes else "replaced by the newer draft "
+                self.ledger._append({"event": "withdraw", "md5": old, "by": by, "reason": why + md5})
         return {"ok": True, "md5": md5, "ticket": str(ticket), "verdict": checks["verdict"], "hits": checks["hits"],
                 "warnings": checks["warnings"], "claims": checks["claims"], "thread": checks["thread"]}
+
+    def review_hits(self, md5):
+        """Open reviewer objections against this draft that quote it (a shared run of four words with the draft): review:<code>.
+        Answered objections, NO OBJECTIONS, and the operator's own Deny/Modify notes are not holds."""
+        req = self._requests().get(md5)
+        if not req:
+            return []
+        findings = self._rows(os.path.join(self._run_dir(req["ticket"]), "findings.jsonl"))
+        answered = {f.get("about") for f in findings if f.get("kind") == "answer"}
+        out = []
+        for f in findings:
+            if f.get("kind") != "objection" or f.get("role") == "operator" or f.get("id") in answered:
+                continue
+            if re.search(r"NO OBJECTIONS", f.get("text", ""), re.I):
+                continue
+            if not (f.get("about") == md5 or (f.get("about") in (None, "") and f.get("ts", 0) >= req["ts"])):
+                continue
+            if not DT._shares_run(f.get("text", ""), req["text"]):
+                continue                                  # a quote that is not in the draft is discarded, as in the fleet
+            m = CODE.match(f.get("text", ""))
+            code = "review:" + (m.group(1) if m and m.group(1) in REVIEW_CODES else "objection")
+            if code not in out:
+                out.append(code)
+        return out
 
     def list(self):
         """The drafts waiting for a decision. A request undecided past the ledger's REQUEST_TTL_S (24 h) and
         a grant past its 6 h life are written off first, so the desk shows what the guide says it shows."""
         self.ledger.sweep()
         events = self.ledger.events()
+        requests = self._requests()
+        # records from before 0.8.1 left older drafts pending beside the newest on their ticket: only the newest filed is
+        # shown, and once it is decided the older ones are not offered in its place
+        newest = {r["ticket"]: md5 for md5, r in requests.items()}
         items = []
-        for md5, r in self._requests().items():
+        for md5, r in requests.items():
+            if newest.get(r["ticket"]) != md5:
+                continue
             st = self.ledger.state(md5, events=events)
             if st["state"] in ("pending", "open"):
+                checks = r["checks"]
+                rev = self.review_hits(md5)
+                if rev:
+                    checks = dict(checks, hits=checks["hits"] + [h for h in rev if h not in checks["hits"]], verdict="hold", review=rev)
                 items.append({"md5": md5, "ticket": r["ticket"], "state": st["state"], "source": r.get("source"),
                               "filed": r["ts"], "age_s": int(self.clock() - r["ts"]), "chars": r.get("chars"),
-                              "checks": r["checks"], "text": r["text"], "supersedes": r.get("supersedes")})
+                              "checks": checks, "text": r["text"], "supersedes": r.get("supersedes")})
         items.sort(key=lambda i: i["filed"])
         return {"ok": True, "items": items}
 
@@ -349,8 +480,16 @@ class Desk:
             return {"ok": False, "reason": "unknown md5"}
         if status not in STATUSES:
             return {"ok": False, "reason": "status must be one of %s" % ", ".join(STATUSES)}
+        reqs = list(self._requests().items())
+        mine = next((i for i, (m, _) in enumerate(reqs) if m == md5), None)
+        later = [m for m, r in reqs[mine + 1:] if r["ticket"] == req["ticket"]] if mine is not None else []
+        if later:
+            return {"ok": False, "reason": "superseded by %s, the newer draft on #%s" % (later[-1][:8], req["ticket"])}
         # The press is the operator's own act at the terminal; the harness, not the model, raised it.
         src = CL.DictSource({press_id: {"from_operator": True, "automated": False, "ts": now, "body": "go %s" % md5}})
+        rev = self.review_hits(md5)
+        if rev:   # open reviewer objections are holds at the press too, so the overrule names them
+            req = dict(req, checks=dict(req["checks"], hits=req["checks"]["hits"] + [h for h in rev if h not in req["checks"]["hits"]], verdict="hold"))
         r = self.ledger.grant_by_message(md5, press_id, src, OPERATOR)
         if r.get("ok"):
             self._decide(md5, req, "send", press_id)
@@ -755,8 +894,9 @@ class Desk:
             c = CR.check(drafts[-1]["text"], ticket, self.receipts_path, datetime.fromtimestamp(self.clock(), timezone.utc),
                          inbound="\n".join(m["text"] for m in (self._thread(ticket) or {}).get("thread", {}).get("messages", []) if m.get("who") == "customer"))
             claims = c["claims"]
+        th = self._thread(ticket) or {}
         return {"ok": True, "run": run, "findings": findings, "receipts": list(reversed(uniq)), "events": events[-200:],
-                "claims": claims, "drafts": drafts}
+                "claims": claims, "drafts": drafts, "thread": th.get("thread"), "thread_count": (th.get("receipt") or {}).get("count")}
 
     # ---- the queue: open tickets the poller saw, and where each one stands
     def _queue(self):
@@ -827,7 +967,8 @@ class Desk:
     def queue_view(self):
         now = self.clock()
         q = self._queue()
-        waiting = {i["ticket"] for i in self.list()["items"]}
+        items = self.list()["items"]
+        waiting = {i["ticket"] for i in items}
         rows = []
         for tid, row in q.items():
             st = row["state"]
@@ -835,8 +976,14 @@ class Desk:
                 st = "waiting"
             elif st == "drafting" and now - row.get("drafting_at", now) > STALE_S:
                 st = "stale"
+            th = (self._thread(tid) or {})
+            run = self._run(tid)
             rows.append({"ticket": tid, "state": st, "sla": row.get("sla"), "subject": row.get("subject"),
-                         "age_s": int(now - row.get("first_seen", now)), "status": row.get("status")})
+                         "age_s": int(now - row.get("first_seen", now)), "status": row.get("status"), "updated": row.get("updated"),
+                         "thread": {"messages": len(th.get("thread", {}).get("messages", [])), "count": (th.get("receipt") or {}).get("count"),
+                                    "fetched_at": th.get("thread", {}).get("fetched_at")} if th else None,
+                         "run": {"phase": run.get("phase"), "rounds": run.get("rounds", 0), "agents": len(run.get("agents", []))} if run.get("phase") else None,
+                         "drafts": [i["md5"] for i in items if i["ticket"] == tid]})
         busy = [r for r in rows if r["state"] in ("drafting", "waiting")]
         pullable = [r for r in rows if r["state"] in ("new", "reopened", "stale")]
         pullable.sort(key=lambda r: (r["sla"] is None, r["sla"] or "", -r["age_s"]))
@@ -989,7 +1136,7 @@ def render_audit(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree", "requester", "mismatch"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
@@ -1000,12 +1147,16 @@ def main(argv=None):
     ap.add_argument("--state")
     ap.add_argument("--updated", help="mark: the ticket's updated_at as read back after the post")
     ap.add_argument("--timeout", type=float, default=1800)
-    ap.add_argument("--text", action="store_true", help="stats as text")
+    ap.add_argument("--text", action="store_true", help="stats, audit or tree as text")
+    ap.add_argument("--node", help="tree: only this node (its body loaded when it lives in a file)")
+    ap.add_argument("--depth", type=int, default=99, help="tree --text: how deep to print")
+    ap.add_argument("--name", help="requester: the name as the ticket's requester field shows it")
+    ap.add_argument("--via", help="tree: the proxy/endpoint a Send will use, for the SEND node")
     a = ap.parse_args(argv)
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
     d = Desk(os.path.expanduser(a.root))
     body = {}
-    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite"):
+    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite", "mismatch"):
         raw = sys.stdin.read()
         body = json.loads(raw) if raw.strip() else {}
     if a.cmd == "file":
@@ -1035,6 +1186,14 @@ def main(argv=None):
         if a.text and out.get("ok"):
             print(render_audit(out))
             return
+    elif a.cmd == "tree":
+        out = DT.build(d, a.md5, a.ticket, send={"status": a.status, "via": a.via})
+        if out.get("ok") and a.node:
+            hit = DT.find(out["tree"], a.node)
+            out = dict(out, tree=DT.load_body(d, hit)) if hit else {"ok": False, "reason": "no node %s" % a.node}
+        if a.text and out.get("ok"):
+            print("\n".join(DT.render(out["tree"], max_depth=a.depth)))
+            return
     elif a.cmd == "verify":
         out = d.verify()
     elif a.cmd == "event":
@@ -1051,6 +1210,10 @@ def main(argv=None):
         out = d.trace(a.ticket)
     elif a.cmd == "wait":
         out = d.wait(a.ticket, a.timeout)
+    elif a.cmd == "requester":
+        out = d.requester(a.ticket, a.name)
+    elif a.cmd == "mismatch":
+        out = d.mismatch(body.get("ticket", ""), body.get("documented", ""), body.get("observed", ""), body.get("summary", ""), body.get("by"))
     elif a.cmd == "capture":
         out = d.capture(body.get("ticket"), body.get("messages"), body.get("count"))
     else:

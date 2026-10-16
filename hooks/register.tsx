@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { DeskItem, DeskView, QueueRow, Trace, WallAgent } from '../types'
+import type { DeskItem, DeskView, QueueRow, Trace, TreeNode, TreeResult, WallAgent } from '../types'
 
 // argus-desk: the review desk and the investigation it reviews.
 //   1. the queue     a timer searches the open set and pulls one ticket at a time.
@@ -13,16 +13,28 @@ import type { DeskItem, DeskView, QueueRow, Trace, WallAgent } from '../types'
 //   5. the gate      an outward call passes only by spending a grant on the exact text, with the status chosen.
 // State and checks live in checks/desk.py (stdlib Python), one process per call; the mod is the binding.
 
-const PANE = 'argus-desk'
+// One engine pane holds the three views. The engine refuses `ui.open({ focus })` while the person holds a pane, so a key
+// pressed inside one pane can never raise another: with a pane per view, 1 to 3 did nothing on a real terminal (the
+// plugin test host does not model the refusal). The panes 0.8.0 opened are closed on the way in.
+const PANE = 'desk'
+const OLD_PANES = ['desk-review', 'desk-tickets', 'desk-wall']
+type View = 'review' | 'tickets' | 'wall'
+const VIEWS: View[] = ['review', 'tickets', 'wall']
+const TITLES: Record<View, string> = { review: 'Review', tickets: 'Tickets', wall: 'Wall' }
+/** Old names still typed by habit or by the model. */
+const ALIASES: Record<string, View> = { decide: 'review', queue: 'tickets', ticket: 'tickets' }
+/** The element the focus ring holds in each pane, from ui.focus: what a hotkey acts on (p pulls the ticket under the ring). */
+const ring = new Map<string, string>()
 const TOOL = 'file_draft'
 const SKIP = 'skip_ticket'
 const FINDING = 'desk_finding'
 const RECEIPT = 'desk_receipt'
+const MISMATCH = 'desk_mismatch'
 const STATUSES = ['pending', 'solved', 'open', 'on-hold']
 const ROLES = ['investigator', 'adversary', 'drafter', 'reviewer'] as const
 type Role = (typeof ROLES)[number]
 
-const view = atom({ plugin: 'argus-desk', key: 'view' } as const, { items: [], queue: [], wall: [], mode: 'list', poll: 'off', tab: 'decide', scroll: 0 } as DeskView)
+const view = atom({ plugin: 'argus-desk', key: 'view' } as const, { items: [], queue: [], wall: [], mode: 'list', poll: 'off' } as DeskView)
 
 type Opts = {
   stateDir: string; python: string; outwardTool: string
@@ -177,6 +189,28 @@ const ticketOf = (args: Record<string, unknown>): string | undefined => {
   return m?.[1]
 }
 
+/** The requester's name in a ticket read: requester.name, requester_name, or the sideloaded user whose id is requester_id. */
+const requesterIn = (v: unknown, depth = 0): string | undefined => {
+  if (depth > 6 || !v) return undefined
+  if (typeof v === 'string') {
+    if (!/requester/.test(v)) return undefined
+    try { return requesterIn(JSON.parse(v), depth + 1) } catch { return undefined }
+  }
+  if (Array.isArray(v)) { for (const x of v) { const f = requesterIn(x, depth + 1); if (f) return f } return undefined }
+  if (typeof v !== 'object') return undefined
+  const rec = v as Record<string, unknown>
+  const req = rec.requester as Record<string, unknown> | undefined
+  if (req && typeof req === 'object' && typeof req.name === 'string' && req.name.trim()) return req.name.trim()
+  if (typeof rec.requester_name === 'string' && rec.requester_name.trim()) return rec.requester_name.trim()
+  const tk = (rec.ticket ?? rec) as Record<string, unknown>
+  if (tk && typeof tk === 'object' && tk.requester_id != null && Array.isArray(rec.users)) {
+    const u = (rec.users as Array<Record<string, unknown>>).find(x => x && String(x.id) === String(tk.requester_id))
+    if (u && typeof u.name === 'string' && u.name.trim()) return u.name.trim()
+  }
+  for (const x of Object.values(rec)) { const f = requesterIn(x, depth + 1); if (f) return f }
+  return undefined
+}
+
 /** The documentation URLs a read names, on the official hosts, so its result can stand as that page. */
 const docsUrls = (o: Opts, ...texts: string[]): string[] => {
   const hosts = o.docsHosts.split(',').map(h => h.trim()).filter(Boolean)
@@ -196,6 +230,56 @@ async function desk($: any, o: Opts, args: string[], stdin?: string): Promise<Re
   }
 }
 
+let oldClosed = false
+/** The row the ring lands on when a view opens: the tree's first row, the selected ticket's, the first agent's. */
+function firstRow(v: DeskView, which: View): string | undefined {
+  const f = (v.filter?.[which] ?? '').trim().toLowerCase()
+  const has = (...parts: Array<string | undefined>) => !f || parts.some(p => p && p.toLowerCase().includes(f))
+  if (which === 'review') {
+    const zoomId = (v.zoom ?? [])[(v.zoom ?? []).length - 1]
+    const root = v.tree?.ok ? v.tree.tree : undefined
+    if (!root) return undefined
+    const n = zoomId ? findNode(root, zoomId) : root
+    const c = n?.children.find(x => !f || hasMatch(x, f))
+    return c ? nodeKey(c.id) : undefined
+  }
+  if (which === 'tickets') {
+    const rows = v.queue.filter(q => has(q.ticket, q.subject, q.state))
+    const t = rows.find(q => q.ticket === v.ticket) ?? rows[0]
+    return t ? `ticket:${t.ticket}` : undefined
+  }
+  if (v.tail) return 'back'
+  const a = v.wall.find(w => has(w.ticket, w.role, w.label, w.last, w.status))
+  return a ? `agent:${a.id}` : undefined
+}
+
+/** Show one view in the desk pane: the view is state, so a key pressed inside the pane switches it with no focus move.
+ *  A press passes its requestId, and the ring moves to the view's first row: left on the key pressed, Enter pressed it again. */
+async function openView($: any, v: View, focus = true, requestId?: string): Promise<void> {
+  await update($, view, x => ({ ...x, which: v }))
+  if (requestId) {
+    const key = firstRow(await read($, view), v)
+    if (key) await $.ui.focus({ requestId, key }).catch(() => undefined)
+  }
+  try {
+    if (!oldClosed) {
+      oldClosed = true
+      for (const id of OLD_PANES) await $.ui.close({ id }).catch(() => undefined)
+    }
+    await $.ui.open({ id: PANE, title: 'Desk', ...(focus ? { focus: true } : {}) })
+  } catch {
+    /* a host without panes: the state is set for when one draws */
+  }
+}
+/** Open the pane on the view it last showed, without asking for the keys. */
+async function openDesk($: any): Promise<void> {
+  try {
+    await $.ui.open({ id: PANE, title: 'Desk' })
+  } catch {
+    /* as above */
+  }
+}
+
 /** The agents running now, by id: which ticket and role each belongs to, for the wall and the receipts. */
 const active = new Map<string, { ticket: string; role: Role; label: string }>()
 /** Step text per agent, flushed to the tail at the end of each step. */
@@ -207,9 +291,16 @@ async function refresh($: any, o: Opts, notice?: string): Promise<DeskItem[]> {
   const q = await desk($, o, ['queue'])
   const queue = ((q.rows as QueueRow[] | undefined) ?? []).filter(x => x.state !== 'done' && x.state !== 'gone')
   const v = await read($, view)
-  const ticket = v.ticket ?? items[0]?.ticket ?? queue[0]?.ticket
+  const selected = v.selected && items.some(i => i.md5 === v.selected) ? v.selected : items[0]?.md5
+  const ticket = v.ticket ?? items.find(i => i.md5 === selected)?.ticket ?? queue[0]?.ticket
   const trace = ticket ? ((await desk($, o, ['trace', '--ticket', ticket])) as unknown as Trace) : undefined
-  await update($, view, x => ({ ...x, items, queue, ticket, trace: trace?.ok ? trace : x.trace, notice: notice ?? (r.ok ? undefined : String(r.reason)) }))
+  const tree = selected ? await loadTree($, o, selected) : undefined
+  await update($, view, x => ({
+    ...x, items, queue, ticket, selected, trace: trace?.ok ? trace : x.trace, notice: notice ?? (r.ok ? undefined : String(r.reason)),
+    tree: tree ?? undefined,
+    // a different draft starts from the default view of its tree
+    ...(tree?.md5 && tree.md5 !== x.tree?.md5 ? { expanded: DEFAULT_OPEN, zoom: [], bodies: {}, last: undefined } : {}),
+  }))
   try {
     const open = queue.filter(x => x.state !== 'skipped').length
     $.ui.status(items.length ? `desk: ${items.length} waiting` : active.size ? `desk: ${active.size} agents on ${new Set([...active.values()].map(a => a.ticket)).size} ticket(s)` : open ? `desk: ${open} open` : undefined)
@@ -242,7 +333,7 @@ async function wallLine($: any, o: Opts, agentId: string, kind: string, text: st
   await update($, view, v => {
     const wall: WallAgent[] = v.wall.filter(w => w.id !== agentId)
     const prev = v.wall.find(w => w.id === agentId)
-    wall.push({ id: agentId, ticket: a.ticket, role: a.role, label: a.label, status: prev?.status ?? 'running', started: prev?.started ?? Date.now(), last: `${kind}: ${text.slice(0, 160)}`, lines: [...(prev?.lines ?? []).slice(-5), `${kind}: ${text.slice(0, 160)}`] })
+    wall.push({ id: agentId, ticket: a.ticket, role: a.role, label: a.label, status: prev?.status ?? 'running', started: prev?.started ?? Date.now(), last: `${kind}: ${text.slice(0, 160)}`, lines: [...(prev?.lines ?? []).slice(-79), `${kind}: ${text.slice(0, 400)}`] })
     return { ...v, wall }
   })
 }
@@ -258,14 +349,16 @@ async function decide($: any, o: Opts, md5: string, decision: 'send' | 'deny' | 
     }
     await refresh($, o, `granted ${md5.slice(0, 8)}, status ${status}`)
     void $.prompt.submit({ text:
-      `The operator approved draft ${md5} for #${item.ticket}. Post exactly that text now, unchanged, as a public comment with ` +
-      `${o.outwardTool} (proxy ${o.writeProxy}, endpoint ${o.updateEndpoint}), and in the same call set the ticket status to "${status}". ` +
-      `The gate refuses the post if the status is missing.` }).catch(() => undefined)
+      // the text itself: a subagent drafted it, so this session may never have seen it (and after a restart it has seen nothing)
+      `The operator approved draft ${md5} for #${item.ticket}. Post exactly the text between the two marker lines below, unchanged, ` +
+      `as a public comment with ${o.outwardTool} (proxy ${o.writeProxy}, endpoint ${o.updateEndpoint}), and in the same call set the ticket ` +
+      `status to "${status}". The marker lines are not part of it. The gate refuses the post if the text differs or the status is missing.\n` +
+      `----- BEGIN APPROVED DRAFT ${md5.slice(0, 8)} -----\n${item.text}\n----- END APPROVED DRAFT ${md5.slice(0, 8)} -----` }).catch(() => undefined)
   } else if (decision === 'deny') {
     await desk($, o, ['deny', '--md5', md5, '--reason', note])
     await desk($, o, ['finding'], JSON.stringify({ ticket: item.ticket, agent: 'operator', role: 'operator', kind: 'objection', text: `Denied: ${note || '(no reason)'}`, about: md5 }))
     await refresh($, o, `denied ${md5.slice(0, 8)}`)
-    void $.prompt.submit({ text: `The operator denied draft ${md5} for #${item.ticket}${note ? `: ${note}` : ''}. Do not post it. Run /desk run ${item.ticket} to investigate again with that objection on record, or say what the ticket needs instead.` }).catch(() => undefined)
+    void $.prompt.submit({ text: `The operator denied draft ${md5} for #${item.ticket}${note ? `: ${note}` : ''}. Do not post it. Tell the operator in one line that \`/desk run ${item.ticket}\` investigates again with that objection on record (it is the operator's command; you cannot run it), or say what the ticket needs instead.` }).catch(() => undefined)
   } else {
     await desk($, o, ['modify', '--md5', md5, '--note', note])
     await desk($, o, ['finding'], JSON.stringify({ ticket: item.ticket, agent: 'operator', role: 'operator', kind: 'objection', text: `Modify: ${note || '(no note)'}`, about: md5 }))
@@ -273,6 +366,24 @@ async function decide($: any, o: Opts, md5: string, decision: 'send' | 'deny' | 
     $.clock.after(1, () => void redraft($, o, item.ticket, md5, note).catch(() => undefined))
   }
   await update($, view, v => ({ ...v, mode: 'list', selected: undefined }))
+  // the next draft opens with the ring on its first row: left where the engine puts it, the ring sat on Send, and the
+  // Enter that submitted a Deny's reason, pressed once more, would have sent the next draft
+  await ringToFirstRow($)
+}
+
+/** The ring onto the Review's first row, now and again once the engine has re-seated it: when the field that held the
+ *  ring is gone, the engine moves the ring to the nearest element (a decision key) after this call has run. */
+async function ringToFirstRow($: any): Promise<void> {
+  const go = async () => {
+    const key = firstRow(await read($, view), 'review')
+    if (key) await $.ui.focus({ requestId: PANE, key }).catch(() => undefined)
+  }
+  await go()
+  try {
+    $.clock.after(150, () => void go())
+  } catch {
+    /* a host without a clock: the first move stands */
+  }
 }
 
 // ---- the run: one investigation, a tree of subagents, awaited through the Agent tool so the turn that started
@@ -311,7 +422,8 @@ const prompts: Record<Role, (o: Opts, ticket: string, angle: string, context: st
     `No dashes of any kind. Never promise a time. No closing offer, no sign-off, no greeting line beyond the first (Zendesk appends the signature). ` +
     `Do not restate the customer's words back to them; a sentence that echoes them is not an answer and is counted against the draft. Do not repeat what we already told them. ` +
     `There is no "unconfirmed", "I suspect" or "I believe" wording that makes an unverified sentence acceptable: a claim is verified with a receipt or it is cut; if you cannot verify the answer, ask for exactly what would settle it and assert nothing. ` +
-    `Every factual sentence must carry a receipt that says what the sentence says. When the reply escalates to engineering, say "I've passed along your request to the WizOS engineering team." and only when there is a documented mismatch between the docs and what the product did. ` +
+    `Every factual sentence must carry a receipt that says what the sentence says. When the reply escalates to engineering, say "I've passed along your request to the WizOS engineering team." and only when there is a documented mismatch between the docs and what the product did, recorded first with ${MISMATCH} (the docs receipt, the material or test receipt, one line on how they differ); an escalation with no mismatch on record is held. ` +
+    `Greet the customer by name only with the name in the ticket's requester field; if the ticket read showed no requester name, use no name. ` +
     `File it with ${TOOL}: ticket, draft (the exact text), and citations as a list of {sentence, receipt} covering every factual sentence. ` +
     `If the ticket needs no reply from us right now, call ${SKIP} with the reason instead. Do not post anything. Answer with the md5 ${TOOL} returned and one line on what the reply does.`,
   reviewer: (o, ticket, angle, context) =>
@@ -319,7 +431,8 @@ const prompts: Record<Role, (o: Opts, ticket: string, angle: string, context: st
     (angle ? `${angle}\n` : '') +
     `${readingRules(o, ticket)}\n${context}\n` +
     `You are a checker, not a writer: do not suggest wording, do not grade style. Every quote you give must be copied exactly from the thread or the draft; a quote that is not there is discarded and counted against you. ` +
-    `Record each objection with ${FINDING} kind objection, quoting the draft sentence and the customer's or our earlier words it fails against. ` +
+    `Record each objection with ${FINDING} kind objection, about the draft's md5, quoting the draft sentence and the customer's or our earlier words it fails against. ` +
+    `Begin each objection with its code in brackets, the fleet's reply-review codes: [question-not-answered], [contradicts-customer], [contradicts-earlier-send], [ignores-customer-info], [misattributed], [implied-commitment], [holding-reply], [customer-cannot-act], [quotes-customer-back], [platform-mismatch] or [unreceipted]. An open objection that quotes the draft holds it until it is answered or the operator overrules it. ` +
     `If there is nothing to object to after working the whole checklist, record one objection with the text "NO OBJECTIONS" and, for each checklist item, what you checked and found. Answer with the list.`,
 }
 
@@ -652,7 +765,7 @@ async function ensureAgents($: any, o: Opts): Promise<void> {
       const mcpServers = o.agentTools === 'mcp'
         ? [{ desk: { command: o.python, args: ['-I', `${$.plugin.root}/checks/desk_mcp.py`, '--root', o.stateDir, '--role', role, '--docs-hosts', o.docsHosts] } }]
         : undefined
-      await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.${mcpServers ? ` The desk tools (${TOOL}, ${SKIP}, ${FINDING}, ${RECEIPT}) are served by the MCP server named desk.` : ''}`, ...(mcpServers ? { mcpServers } : {}), model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
+      await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.${mcpServers ? ` The desk tools (${TOOL}, ${SKIP}, ${FINDING}, ${RECEIPT}, ${MISMATCH}) are served by the MCP server named desk.` : ''}`, ...(mcpServers ? { mcpServers } : {}), model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
     } catch {
       /* a host without agent types: the role prompt rides in the task and the gate still holds */
     }
@@ -663,7 +776,7 @@ export const register: Register = (on, options) => {
   const o = opts(options as Record<string, unknown>)
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'desk', description: 'The review desk: pane with Wall, Queue, Ticket, Decide; /desk run N, trace N, poll, pull N, pause, resume, stats', argumentHint: '[run N | trace N | poll | pull N | pause | resume | stats]' })
+    await $.command.register({ name: 'desk', description: 'The review desk: the Review, Tickets and Wall panes; /desk review|tickets|wall opens one, /desk show [md5 | N] [node] prints the proof tree, /desk run N, trace N, poll, pull N, pause, resume, stats, audit, verify', argumentHint: '[review | tickets | wall | show | run N | trace N | poll | pull N | pause | resume | stats]' })
     await $.tool.register({
       name: TOOL,
       description:
@@ -700,12 +813,18 @@ export const register: Register = (on, options) => {
       inputSchema: { type: 'object', properties: { ticket: { type: 'string' }, kind: { type: 'string' }, quote: { type: 'string' }, source: { type: 'string', description: 'the page URL, for docs' } }, required: ['ticket', 'kind', 'quote'] },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: MISMATCH,
+      description: 'Record the basis an escalation needs: the docs receipt id (what the product should do), the material or test receipt id (what it did), and one line on how they differ. Both receipts must be on this ticket and fresh.',
+      inputSchema: { type: 'object', properties: { ticket: { type: 'string' }, documented: { type: 'string' }, observed: { type: 'string' }, summary: { type: 'string' } }, required: ['ticket', 'documented', 'observed', 'summary'] },
+      isDeferred: false,
+    })
     await findOutward($, o)
     await ensureAgents($, o)
     if (e.isInteractive) {
       await update($, view, v => ({ ...v, poll: o.pollMinutes > 0 ? 'on' : 'off' }))
       await refresh($, o)
-      if (e.surface === 'terminal') void $.ui.open({ id: PANE, title: 'Desk' })
+      if (e.surface === 'terminal') void openDesk($)
       startPolling($, o)
     }
     return next(e)
@@ -784,7 +903,8 @@ export const register: Register = (on, options) => {
     if (/^trace\s+#?\d+$/.test(args)) {
       const t = args.replace(/^trace\s+#?/, '')
       const tr = (await desk($, o, ['trace', '--ticket', t])) as unknown as Trace
-      await update($, view, v => ({ ...v, ticket: t, tab: 'ticket', scroll: 0 }))
+      await update($, view, v => ({ ...v, ticket: t, trace: tr.ok ? tr : v.trace, open: [...new Set([...(v.open ?? []), t])] }))
+      await openView($, 'tickets')
       return { text: tr.ok ? traceText(tr) : `no trace for #${t}` }
     }
     if (/^pull\s+#?\d+$/.test(args)) {
@@ -812,16 +932,25 @@ export const register: Register = (on, options) => {
       if (args === 'resume') startPolling($, o)
       return { text: args === 'pause' ? 'Polling paused; /desk resume to start it again.' : 'Polling on.' }
     }
-    if (/^(wall|queue|decide)$/.test(args) || /^ticket(\s+#?\d+)?$/.test(args)) {
-      const tab = args.split(/\s+/)[0] as DeskView['tab']
+    if (/^show(\s|$)/.test(args)) {
+      const [, what, node] = args.split(/\s+/)
+      const v = await read($, view)
+      const sel = what && /^[0-9a-f]{32}$/.test(what) ? ['--md5', what] : what ? ['--ticket', what.replace(/^#/, '')] : v.selected ? ['--md5', v.selected] : undefined
+      if (!sel) return { text: 'Nothing selected: /desk show <md5> or /desk show <ticket>.' }
+      const r = await $.process.run([o.python, '-I', `${$.plugin.root}/checks/desk.py`, '--root', o.stateDir, 'tree', ...sel, '--text', ...(node ? ['--node', node] : [])], { timeoutMs: 60_000 })
+      return { text: r.exitCode === 0 ? r.stdout.trim() : `desk.py failed: ${(r.stderr || r.stdout).slice(0, 300)}` }
+    }
+    if (/^(review|tickets|wall|decide|queue)$/.test(args) || /^ticket(\s+#?\d+)?$/.test(args)) {
+      const word = args.split(/\s+/)[0]
+      const which = (ALIASES[word] ?? word) as View
       const t = args.replace(/^ticket\s+#?/, '')
-      await update($, view, v => ({ ...v, tab, scroll: 0, ...(tab === 'ticket' && /^\d+$/.test(t) ? { ticket: t } : {}) }))
+      await update($, view, v => ({ ...v, tail: undefined, ...(word === 'ticket' && /^\d+$/.test(t) ? { ticket: t, open: [...new Set([...(v.open ?? []), t])] } : {}) }))
       await refresh($, o)
-      try { await $.ui.open({ id: PANE, title: 'Desk', focus: true }) } catch { /* a host without a pane: the tab is set for when one draws */ }
-      return { text: `Desk: ${tab} tab. The keys (1 to 4, j, k, n, s, v, m, d) work while the pane holds the focus: press ctrl+x then tab, or click it; /desk trace N prints the trace as text.` }
+      await openView($, which)
+      return { text: `Desk: ${TITLES[which]}. The pane takes the keys after ctrl+x then tab, or a click; every key is drawn as a button on it. 1 to 3 switch views, Tab walks the rows, the arrows scroll, Enter opens one, f finds.` }
     }
     const items = await refresh($, o)
-    await $.ui.open({ id: PANE, title: 'Desk', focus: true })
+    await openView($, 'review')
     return { text: `${items.length ? `${items.length} draft(s) waiting at the desk.` : 'Nothing waiting at the desk.'}${pending.size ? ` ${pending.size} run(s) start now.` : ''}` }
   })
 
@@ -876,6 +1005,14 @@ export const register: Register = (on, options) => {
     if (a.agentId && !r.ok) await wallLine($, o, a.agentId, 'receipt-refused', `${String(a.kind)} ${String(r.why ?? r.reason)}: "${String(a.quote ?? '').slice(0, 120)}"${a.source ? ` (${String(a.source)})` : ''}`)
     return { result: r.ok ? `Receipt ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}. Only a sentence you actually read, verbatim, can be receipted${refusalDetail(r)}.` }
   }).catch(() => ({ deny: 'argus-desk: the receipt was not minted, try again' }))
+
+  on('tool.call', { tool: `mcp__argus-desk__${MISMATCH}` }, async ($, e) => {
+    const a = e as unknown as { ticket?: string; documented?: string; observed?: string; summary?: string; agentId?: string }
+    const who = active.get(String(a.agentId ?? ''))
+    const r = await desk($, o, ['mismatch'], JSON.stringify({ ticket: String(a.ticket ?? ''), documented: String(a.documented ?? ''), observed: String(a.observed ?? ''), summary: String(a.summary ?? ''), by: who?.label }))
+    if (a.agentId) await wallLine($, o, a.agentId, r.ok ? 'mismatch' : 'receipt-refused', `${String(r.id ?? r.why ?? r.reason)}: ${String(a.summary ?? '').slice(0, 120)}`)
+    return { result: r.ok ? `Mismatch ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}.` }
+  }).catch(() => ({ deny: 'argus-desk: the mismatch was not recorded, try again' }))
 
   // 2. the gate: an outward call passes only by spending an open grant on the exact text it carries.
   // A documentation search (enterprise_search by default): the result is a call on the record and a page per official URL it
@@ -946,6 +1083,9 @@ export const register: Register = (on, options) => {
             /* not a comments payload after all */
           }
         }
+        // the salutation check (the fleet's requester-name gate) needs the name as the ticket's requester field shows it
+        const requester = forTicket && text ? requesterIn(text) : undefined
+        if (forTicket && requester) await desk($, o, ['requester', '--ticket', forTicket, '--name', requester])
         if (text) {
           // a URL the call itself named was fetched: the body is that page; one only named in the result is not
           const asked = new Set(docsUrls(o, JSON.stringify(args)))
@@ -1001,99 +1141,281 @@ export const register: Register = (on, options) => {
   })
 
   // 3. the pane: Wall, Queue, Ticket, Decide.
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Input } = $.ui.resolve(e) as any
-    const v = await read($, view)
-    const width = Math.max(40, e.props.bodyColumns ?? 80)
-    const rows = Math.max(10, (e.viewport?.rows ?? 30) - 4)
-    const cut = (t: string, n = width - 4) => t.replace(/\s+/g, ' ').slice(0, n)
-    const sel = v.items.find(i => i.md5 === v.selected) ?? v.items.find(i => i.ticket === v.ticket) ?? v.items[0]
-    const lines: Array<{ key: string; text: string; color?: string; dim?: boolean }> = []
-    const add = (key: string, text: string, color?: string, dim?: boolean) => lines.push({ key, text, color, dim })
-    const t = v.trace
-    if (v.tab === 'wall') {
+  on('ui.focus', ($, e, next) => {
+    if (e.element && e.requestId === PANE) ring.set(e.requestId, e.element)
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => drawPane($, o, e, (await read($, view)).which ?? 'review'))
+}
+
+// ---- the views: Review (the proof tree behind the selected draft), Tickets (the queue; a row opens to its thread, run
+// and drafts) and Wall (every agent live). Three views in one pane, so 1 to 3 switch them from inside it (see PANE).
+// Every row is a control the focus ring walks: Tab moves the ring, Enter opens, the arrows scroll; the engine keeps the
+// ring in view. The operator's rule: every key that does something is drawn as a labelled button (`z: zoom`), on bars
+// above the rows so they show when a view opens; nothing works that is not on screen. Arrows, Tab, Enter and Esc are the engine's: they walk the rows and act on one.
+
+const KEYS_OFF = 'keys off: press ctrl+x then tab, or click the pane, to take the keys'
+/** Every bar of keys: a gap between the buttons, wrapping onto the next row rather than running off the pane. */
+const BAR = { flexWrap: 'wrap', columnGap: 3 } as const
+const DEFAULT_OPEN = ['issues', 'reply']
+
+const nodeKey = (id: string) => `n:${id}`
+const idOf = (key: string | undefined): string | undefined => (key && key.startsWith('n:') ? key.slice(2) : undefined)
+
+function findNode(n: TreeNode | undefined, id: string): TreeNode | undefined {
+  if (!n) return undefined
+  if (n.id === id) return n
+  for (const c of n.children) {
+    const hit = findNode(c, id)
+    if (hit) return hit
+  }
+  return undefined
+}
+function pathTo(n: TreeNode | undefined, id: string, acc: string[] = []): string[] | undefined {
+  if (!n) return undefined
+  if (n.id === id) return [...acc, id]
+  for (const c of n.children) {
+    const p = pathTo(c, id, [...acc, n.id])
+    if (p) return p
+  }
+  return undefined
+}
+const descendants = (n: TreeNode): string[] => [n.id, ...n.children.flatMap(descendants)]
+const matches = (n: TreeNode, f: string): boolean => n.label.toLowerCase().includes(f) || (n.body ?? '').toLowerCase().includes(f)
+const hasMatch = (n: TreeNode, f: string): boolean => matches(n, f) || n.children.some(c => hasMatch(c, f))
+
+async function loadTree($: any, o: Opts, md5: string, node?: string): Promise<TreeResult> {
+  return (await desk($, o, ['tree', '--md5', md5, '--status', o.sendStatus, '--via', `${o.writeProxy}/${o.updateEndpoint}`, ...(node ? ['--node', node] : [])])) as unknown as TreeResult
+}
+
+/** Make one draft the Review's: selected, its tree loaded, the pane opened. */
+async function selectDraft($: any, o: Opts, md5: string, open = true, requestId?: string): Promise<void> {
+  const v = await read($, view)
+  const item = v.items.find(i => i.md5 === md5)
+  await update($, view, x => ({ ...x, selected: md5, ticket: item?.ticket ?? x.ticket, mode: 'list' }))
+  await refresh($, o)
+  if (open) await openView($, 'review', true, requestId)
+}
+
+/** Expand the path down to a node, leave any zoom, and put the ring on it. */
+async function reveal($: any, target: string, requestId?: string): Promise<void> {
+  const v = await read($, view)
+  const path = pathTo(v.tree?.tree, target)
+  if (!path) return
+  await update($, view, x => ({ ...x, zoom: [], expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), ...path])], last: target }))
+  if (requestId) await $.ui.focus({ requestId, key: nodeKey(target) }).catch(() => undefined)
+}
+
+async function toggleNode($: any, o: Opts, n: TreeNode): Promise<void> {
+  const v = await read($, view)
+  if (n.body_file && !n.body && !v.bodies?.[n.id] && v.tree?.md5) {
+    const r = await loadTree($, o, v.tree.md5, n.id)
+    const body = r.ok ? String(r.tree?.body ?? '') : `not loaded: ${String(r.reason ?? '')}`
+    await update($, view, x => ({ ...x, bodies: { ...(x.bodies ?? {}), [n.id]: body } }))
+  }
+  await update($, view, x => {
+    const ex = new Set(x.expanded ?? DEFAULT_OPEN)
+    if (ex.has(n.id)) ex.delete(n.id)
+    else ex.add(n.id)
+    return { ...x, expanded: [...ex], last: n.id }
+  })
+}
+
+/** The node an action acts on: the one under the focus ring, else the row last pressed. */
+const acted = (v: DeskView, requestId: string): string | undefined => idOf(ring.get(requestId)) ?? v.last
+
+async function drawPane($: any, o: Opts, e: any, which: View) {
+  const { Box, Text, Button, Input } = $.ui.resolve(e) as any
+  const v = await read($, view)
+  const width = Math.max(40, e.props.bodyColumns ?? 80)
+  const focused = e.props.isFocused === true
+  const f = (v.filter?.[which] ?? '').trim().toLowerCase()
+  const cut = (t: string, n = width - 4) => t.replace(/\s+/g, ' ').slice(0, n)
+  const ago = (t: number) => `${Math.max(0, Math.round((Date.now() - t) / 60000))}m`
+  const match = (...parts: Array<string | undefined>) => !f || parts.some(p => p && p.toLowerCase().includes(f))
+  // the filter applies on Enter, and the ring leaves the field for the first row left: in the field, every key is text
+  const setFilter = (text: string, requestId?: string) => void update($, view, x => ({ ...x, filter: { ...(x.filter ?? {}), [which]: text.trim() } })).then(async () => {
+    const key = requestId ? firstRow(await read($, view), which) : undefined
+    if (key) await $.ui.focus({ requestId, key }).catch(() => undefined)
+  })
+  const sel = v.items.find(i => i.md5 === v.selected) ?? v.items[0]
+  /** Modify and Deny ask for one line: the field opens and takes the ring. */
+  const askFor = async (requestId: string, mode: 'modify' | 'deny') => {
+    await update($, view, x => ({ ...x, selected: sel.md5, mode }))
+    await $.ui.focus({ requestId, key: mode === 'modify' ? 'modify-note' : 'deny-reason' }).catch(() => undefined)
+  }
+  let first = true
+  const focusFirst = () => { if (!first) return {}; first = false; return { autoFocus: true as const } }
+
+  const nav = (
+    <Box key="nav" {...BAR}>
+      {VIEWS.map((id, i) => (
+        <Button key={`go-${id}`} plain hotkey={String(i + 1)} dimColor={id !== which} onPress={(p: any) => void openView($, id, true, p.requestId)}>{id === which ? `[${TITLES[id]}]` : TITLES[id]}</Button>
+      ))}
+      <Text dimColor>{v.items.length} waiting, {active.size} agents, poll {v.poll}{v.notice ? `  (${v.notice})` : ''}</Text>
+    </Box>
+  )
+  const keysOff = focused ? null : <Text key="keys-off" color="yellow">{KEYS_OFF}</Text>
+  const finder = (
+    <Box key="finder" columnGap={1}>
+      <Button key="find" plain hotkey="f" onPress={(p: any) => void $.ui.focus({ requestId: p.requestId, key: 'filter' }).catch(() => undefined)}>find</Button>
+      <Input key="filter" placeholder="type, then Enter, to narrow the rows" value={v.filter?.[which] ?? ''} submitLabel="narrow" onSubmit={(txt: string, p: any) => setFilter(txt, p?.requestId)} />
+      {f ? <Button key="clear" plain hotkey="c" onPress={(p: any) => setFilter('', p.requestId)}>clear</Button> : null}
+    </Box>
+  )
+  const body: any[] = []
+  /** The view's keys, drawn above its rows so they are on screen when the view opens, whatever the length of the rows. */
+  const keys: any[] = []
+  const text = (key: string, t: string, color?: string, dim?: boolean) => body.push(<Text key={key} color={color} dimColor={dim}>{t}</Text>)
+  const row = (key: string, t: string, press: (p?: any) => void, color?: string, dim?: boolean) =>
+    body.push(<Button key={key} plain dimColor={dim} {...focusFirst()} onPress={press}>{color ? <Text color={color}>{t}</Text> : t}</Button>)
+
+  if (which === 'review') {
+    const tree = v.tree?.ok ? v.tree.tree : undefined
+    const zoom = v.zoom ?? []
+    const zoomId = zoom[zoom.length - 1]
+    const expanded = new Set(v.expanded ?? DEFAULT_OPEN)
+    if (!sel) {
+      text('r0', `No draft at the desk. The drafter files one with ${TOOL}; its proof shows here, and nothing posts without a Send.`, undefined, true)
+    } else if (!tree) {
+      // the draft is still the operator's to decide when its tree did not build: the text and the checks at filing stand in
+      text('r0', `The proof tree did not build: ${String(v.tree?.reason ?? 'desk.py gave no tree')}. The draft and its checks at filing:`, 'yellow')
+      text('r1', `#${sel.ticket} draft ${sel.md5.slice(0, 8)} ${sel.checks.verdict === 'hold' ? `HOLD ${sel.checks.hits.join(',')}` : 'clear'} | thread: ${sel.checks.thread?.status === 'captured' ? `${sel.checks.thread.messages} of ${sel.checks.thread.console_count} comments recorded` : 'NOT captured'} | claims: ${sel.checks.claims ? `${sel.checks.claims.credited} of ${sel.checks.claims.checkable} receipted` : 'n/a'}${sel.checks.warnings.length ? ` | ${sel.checks.warnings.join(', ')}` : ''}`, undefined, true)
+      for (const [n, l] of sel.text.split('\n').entries()) text(`dl-${n}`, l || ' ')
+    } else {
+      const crumbs = [tree.label, ...zoom.map(id => cut(findNode(tree, id)?.label ?? id, 40))]
+      text('crumbs', crumbs.join('  >  '), 'cyan')
+      const walk = (n: TreeNode, depth: number) => {
+        if (f && !hasMatch(n, f)) return
+        const open = Boolean(f) || n.id === zoomId || expanded.has(n.id)
+        // a row cut to the pane's width opens to its whole text: a customer message, an objection, a sentence
+        const room = width - 6 - depth * 2
+        const isCut = n.label.replace(/\s+/g, ' ').length > room
+        const hidden = (n.body ?? v.bodies?.[n.id] ?? '').trim()
+        const glyph = n.children.length || isCut || (hidden && !n.label.includes(hidden)) || n.body_file ? (open ? '-' : '+') : '·'
+        const dim = n.state === 'answered' || n.state === 'asserts-nothing' || n.state === 'overruled'
+        row(nodeKey(n.id), `${'  '.repeat(depth)}${glyph} ${cut(n.label, room)}`, () => void toggleNode($, o, n), n.color, dim)
+        if (!open) return
+        // the whole text in a box indented under its row, so its wrapped lines keep the row's indent
+        if (isCut) body.push(<Box key={`l:${n.id}`} flexDirection="column" paddingLeft={(depth + 2) * 2}>{n.label.split('\n').map((l, i) => <Text key={`l:${n.id}:${i}`}>{l || ' '}</Text>)}</Box>)
+        const b = (n.body ?? v.bodies?.[n.id] ?? '').trim()
+        if (b && !n.label.includes(b)) for (const [i, l] of b.split('\n').entries()) text(`b:${n.id}:${i}`, `${'  '.repeat(depth + 2)}${l || ' '}`, undefined, true)
+        for (const c of n.children) walk(c, depth + 1)
+      }
+      const root = zoomId ? findNode(tree, zoomId) : undefined
+      if (root) walk(root, 0)
+      else for (const c of tree.children) walk(c, 0)
+      keys.push(
+        <Box key="r-nav" {...BAR}>
+          <Button key="zoom" plain hotkey="z" onPress={(p: any) => { const id = acted(v, p.requestId); if (id && id !== zoomId) void update($, view, x => ({ ...x, zoom: [...(x.zoom ?? []), id], expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), id])] })) }}>zoom into the row</Button>
+          <Button key="up" plain hotkey="u" onPress={() => void update($, view, x => ({ ...x, zoom: (x.zoom ?? []).slice(0, -1) }))}>up</Button>
+          <Button key="expand-all" plain hotkey="x" onPress={(p: any) => { const id = acted(v, p.requestId); const n = id ? findNode(tree, id) : undefined; if (n) void update($, view, x => ({ ...x, expanded: [...new Set([...(x.expanded ?? DEFAULT_OPEN), ...descendants(n)])] })) }}>expand all beneath</Button>
+          <Button key="follow" plain hotkey="g" onPress={(p: any) => { const id = acted(v, p.requestId); const n = id ? findNode(tree, id) : undefined; if (n?.target) void reveal($, n.target, p.requestId) }}>go to what the row is about</Button>
+        </Box>,
+      )
+      keys.splice(0, 0,
+        <Box key="r-jump" {...BAR}>
+          <Button key="jump-issues" plain hotkey="i" onPress={(p: any) => void reveal($, 'issues', p.requestId)}>issues</Button>
+          <Button key="jump-ask" plain hotkey="t" onPress={(p: any) => void reveal($, 'ask:thread', p.requestId)}>thread</Button>
+          <Button key="jump-reply" plain hotkey="r" onPress={(p: any) => void reveal($, 'reply', p.requestId)}>reply</Button>
+          <Button key="jump-run" plain hotkey="w" onPress={(p: any) => void reveal($, 'run', p.requestId)}>who did what</Button>
+          <Button key="open-ticket" plain hotkey="o" onPress={(p: any) => { void update($, view, x => ({ ...x, ticket: sel.ticket, open: [...new Set([...(x.open ?? []), sel.ticket])] })).then(() => openView($, 'tickets', true, p.requestId)) }}>the ticket</Button>
+          {v.items.length > 1 ? <Button key="next" plain hotkey="n" onPress={() => { const i = v.items.findIndex(it => it.md5 === sel.md5); void selectDraft($, o, v.items[(i + 1) % v.items.length].md5, false) }}>next draft</Button> : null}
+        </Box>,
+      )
+    }
+    if (sel) {
+      const open = v.tree?.open ?? 0
+      if (v.mode === 'list') keys.unshift(
+        <Box key="r-decide" {...BAR}>
+          <Button key="send" plain hotkey="s" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`)}>Send, {o.sendStatus}{open ? ` (${open} open)` : ''}</Button>
+          <Button key="solve" plain hotkey="v" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`, 'solved')}>Send, solved</Button>
+          <Button key="modify" plain hotkey="m" onPress={(p: any) => void askFor(p.requestId, 'modify')}>Modify</Button>
+          <Button key="deny" plain hotkey="d" onPress={(p: any) => void askFor(p.requestId, 'deny')}>Deny</Button>
+        </Box>,
+      )
+      // the field takes the ring as it opens, so the words typed are the note, not the view's keys; cancel (Tab, Enter) leaves
+      // the draft undecided. Esc hands the keys back to the prompt and the field stays, with its cancel beside it.
+      const cancel = <Button key="cancel" plain onPress={() => void update($, view, x => ({ ...x, mode: 'list' })).then(() => ringToFirstRow($))}>cancel, keep the draft undecided</Button>
+      if (v.mode === 'modify') keys.unshift(
+        <Box key="r-ask" {...BAR}>
+          <Input key="modify-note" label="what to change" placeholder="one line for the drafter, then Enter" autoFocus submitLabel="return" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'modify', txt, p.requestId)} />
+          {cancel}
+        </Box>,
+      )
+      if (v.mode === 'deny') keys.unshift(
+        <Box key="r-ask" {...BAR}>
+          <Input key="deny-reason" label="why" placeholder="recorded with the deny, then Enter" autoFocus submitLabel="deny" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'deny', txt, p.requestId)} />
+          {cancel}
+        </Box>,
+      )
+    }
+  } else if (which === 'tickets') {
+    text('q0', `poll ${v.poll}${v.lastPoll ? `, last ${ago(v.lastPoll)} ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, undefined, true)
+    if (v.lastResult && !v.pollError) text('q0r', `  proxy answered: ${cut(v.lastResult, width - 20)}`, undefined, true)
+    const opened = new Set(v.open ?? [])
+    const rows = v.queue.filter(q => match(q.ticket, q.subject, q.state))
+    if (!v.queue.length) text('q1', 'No open tickets seen. /desk poll asks now; /desk query shows the search.', undefined, true)
+    else if (!rows.length) text('q1', `No ticket matches "${f}".`, undefined, true)
+    for (const q of rows) {
+      const isOpen = opened.has(q.ticket)
+      row(`ticket:${q.ticket}`, `${isOpen ? '-' : '+'} #${q.ticket} ${q.state}${q.sla ? ` SLA ${q.sla.slice(5, 16)}` : ''} ${Math.round(q.age_s / 60)}m  ${cut(q.subject ?? '', width - 36)}`,
+        () => void update($, view, x => ({ ...x, ticket: q.ticket, open: isOpen ? (x.open ?? []).filter(t => t !== q.ticket) : [...(x.open ?? []), q.ticket] })), undefined, q.state === 'skipped' || q.state === 'sent')
+      if (!isOpen) continue
+      text(`th:${q.ticket}`, `    thread: ${q.thread ? `${q.thread.messages} of ${q.thread.count ?? '?'} comments recorded${q.thread.fetched_at ? ` ${ago(q.thread.fetched_at * 1000)} ago` : ''}` : 'not recorded'}`, undefined, true)
+      text(`run:${q.ticket}`, `    run: ${q.run ? `phase ${q.run.phase}, rounds ${q.run.rounds ?? 0}, agents ${q.run.agents ?? 0}` : 'none'}`, undefined, true)
+      const drafts = v.items.filter(i => i.ticket === q.ticket)
+      if (!drafts.length) text(`d0:${q.ticket}`, '    drafts: none waiting', undefined, true)
+      // one line per draft, cut to the pane: a long HOLD list wrapped the row into the next one
+      for (const i of drafts) row(`draft:${i.md5}`, `    ${cut(`draft ${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m  ${i.text}`, width - 8)}`, (p: any) => void selectDraft($, o, i.md5, true, p?.requestId))
+    }
+    const under = (requestId: string): string | undefined => {
+      const k = ring.get(requestId)
+      const t = k?.startsWith('ticket:') ? k.slice(7) : k?.startsWith('draft:') ? v.items.find(i => i.md5 === k.slice(6))?.ticket : undefined
+      return t ?? v.ticket
+    }
+    keys.push(
+      <Box key="q-actions" {...BAR}>
+        <Button key="pull" plain hotkey="p" onPress={(p: any) => { const id = under(p.requestId); if (id) pull($, o, id, 'pulled by the operator at the desk') }}>pull the ticket under the ring</Button>
+        <Button key="reread" plain hotkey="r" onPress={(p: any) => { const id = under(p.requestId); if (id) void $.prompt.submit({ text: `Read every comment on ticket #${id} again now with ${o.outwardTool} (proxy ${o.readProxy}, endpoint ${o.commentsEndpoint}, arguments {"ticket_id":"${id}"}), so the desk records the thread afresh. Do not post anything.` }).catch(() => undefined) }}>re-read its thread</Button>
+        <Button key="open-review" plain hotkey="o" onPress={(p: any) => { const id = under(p.requestId); const d = v.items.find(i => i.ticket === id); if (d) void selectDraft($, o, d.md5, true, p.requestId) }}>its draft in Review</Button>
+      </Box>,
+    )
+  } else {
+    const tail = v.tail ? v.wall.find(w => w.id === v.tail) : undefined
+    if (tail) {
+      body.push(
+        <Box key="tail-head">
+          <Button key="back" plain hotkey="b" autoFocus onPress={() => void update($, view, x => ({ ...x, tail: undefined }))}>back</Button>
+          <Text color="cyan">  #{tail.ticket} {tail.role} {tail.label}  {tail.status}  {ago(tail.started)}</Text>
+        </Box>,
+      )
+      if (!tail.lines.length) text('tail-0', 'Nothing said yet.', undefined, true)
+      tail.lines.forEach((l, i) => text(`tail-${i}`, l))
+    } else {
       const byTicket = new Map<string, WallAgent[]>()
       for (const w of v.wall) byTicket.set(w.ticket, [...(byTicket.get(w.ticket) ?? []), w])
-      if (!byTicket.size) add('w0', 'No agents yet. A pull or /desk run N starts a run.', undefined, true)
+      if (!byTicket.size) text('w0', 'No agents yet. A poll or /desk run N starts a run; every agent shows here as it works, Enter tails one.', undefined, true)
       for (const [ticket, agents] of byTicket) {
-        add(`w-${ticket}`, `#${ticket}  ${t?.run?.ticket === ticket ? `phase ${t.run.phase}` : ''}`, 'cyan')
-        for (const a of agents.slice(-12)) {
-          add(`w-${ticket}-${a.id}`, `  ${a.status === 'running' ? '*' : a.status === 'pending' ? '.' : a.status === 'failed' ? 'x' : 'v'} ${a.role} ${a.label} ${Math.round((Date.now() - a.started) / 60000)}m  ${cut(a.last, width - 30)}`, a.status === 'failed' ? 'red' : undefined, a.status !== 'running')
-          for (const l of a.lines.slice(-2)) add(`w-${ticket}-${a.id}-${l.slice(0, 12)}`, `      ${cut(l, width - 8)}`, undefined, true)
+        const rows = agents.filter(a => match(ticket, a.role, a.label, a.last, a.status))
+        if (!rows.length) continue
+        text(`w-${ticket}`, `#${ticket}${v.trace?.run?.ticket === ticket ? `  phase ${v.trace.run.phase}` : ''}  ${rows.filter(a => a.status === 'running').length} running`, 'cyan')
+        for (const a of rows) {
+          const glyph = a.status === 'running' ? '*' : a.status === 'pending' ? '.' : a.status === 'failed' ? 'x' : 'v'
+          row(`agent:${a.id}`, `${glyph} ${a.role} ${a.label} ${ago(a.started)}  ${cut(a.last, width - 30)}`, () => void update($, view, x => ({ ...x, tail: a.id })), a.status === 'failed' ? 'red' : undefined, a.status !== 'running')
         }
-      }
-    } else if (v.tab === 'queue') {
-      add('q0', `poll ${v.poll}${v.lastPoll ? `, last ${Math.round((Date.now() - v.lastPoll) / 60000)} min ago` : ', none yet'}${v.pollError ? `, failed: ${v.pollError}` : ''}${!driver && pending.size ? `; ${pending.size} run(s) waiting: type /desk` : ''}`, undefined, true)
-      if (v.lastResult && !v.pollError) add('q0r', `  proxy answered: ${cut(v.lastResult, width - 20)}`, undefined, true)
-      if (!v.queue.length) add('q1', 'No open tickets seen.', undefined, true)
-      for (const q of v.queue) add(`q-${q.ticket}`, `#${q.ticket} ${q.state}${q.sla ? ` SLA ${q.sla.slice(5, 16)}` : ''} ${Math.round(q.age_s / 60)}m  ${cut(q.subject ?? '', width - 36)}`, undefined, q.state === 'skipped' || q.state === 'sent')
-    } else if (v.tab === 'ticket') {
-      if (!t?.ok) add('t0', 'Pick a ticket in Queue or Decide; the trace shows here.', undefined, true)
-      else {
-        add('t1', `#${t.run.ticket}  phase ${t.run.phase}  rounds ${t.run.rounds ?? 0}  agents ${t.run.agents?.length ?? 0}`, 'cyan')
-        for (const a of t.run.agents ?? []) add(`ta-${a.id}`, `  ${a.status === 'completed' ? 'v' : a.status === 'failed' ? 'x' : '*'} ${a.role} ${a.label} (${a.model})${a.params ? ` ${cut(a.params, 50)}` : ''}${a.summary ? `: ${cut(a.summary, width - 40)}` : ''}`, undefined, true)
-        for (const k of ['hypothesis', 'evidence', 'counter', 'objection', 'answer', 'summary']) {
-          const fs = (t.findings ?? []).filter(f => f.kind === k)
-          if (!fs.length) continue
-          add(`tk-${k}`, k.toUpperCase(), k === 'counter' || k === 'objection' ? 'yellow' : 'green')
-          for (const f of fs) add(`tf-${f.id}`, `  - (${f.agent}) ${cut(f.text, width - 8)}${f.receipts?.length ? ` <${f.receipts.map(r => r.replace(/^rcpt:/, '')).join(',')}>` : ''}`)
-        }
-        if (t.receipts?.length) {
-          add('tr', 'RECEIPTS', 'green')
-          for (const r of t.receipts) add(`tr-${r.id}`, `  ${r.id.replace(/^rcpt:/, '')} ${r.kind}${r.source ? ` ${cut(r.source, 50)}${r.page_origin === 'search' ? ' (search result)' : ''}` : ''}: "${cut(r.quote, width - 30)}"`, undefined, true)
-        }
-        if (t.claims?.length) {
-          add('tc', 'CLAIMS IN THE DRAFT', 'green')
-          for (const c of t.claims) add(`tc-${c.text.slice(0, 24)}`, `  ${c.problems?.length ? c.problems.join(',') : c.echo ? 'echo' : 'ok'}: ${cut(c.text, width - 20)}`, c.problems?.length ? 'yellow' : undefined)
-        }
-      }
-    } else {
-      for (const i of v.items) add(`d-${i.md5}`, `${i.md5 === sel?.md5 ? '> ' : '  '}#${i.ticket} ${i.md5.slice(0, 8)} ${i.checks.verdict === 'hold' ? `HOLD ${i.checks.hits.join(',')}` : 'clear'} ${i.state} ${Math.round(i.age_s / 60)}m`)
-      if (!v.items.length) add('d0', `No drafts filed. The drafter files one with ${TOOL}; nothing posts without a Send here.`, undefined, true)
-      if (sel) {
-        add('ds', `thread: ${sel.checks.thread?.status === 'captured' ? `${sel.checks.thread.messages} of ${sel.checks.thread.console_count} comments recorded` : 'NOT captured'} | claims: ${sel.checks.claims ? `${sel.checks.claims.credited} of ${sel.checks.claims.checkable} receipted` : 'n/a'}${sel.checks.warnings.length ? ` | ${sel.checks.warnings.join(', ')}` : ''}`, undefined, true)
-        for (const q of (sel.checks.thread?.open_questions ?? []).slice(0, 4)) add(`dq-${q.slice(0, 16)}`, `customer asked: ${cut(q, width - 18)}`, 'yellow')
-        const objections = (t?.findings ?? []).filter(f => f.kind === 'objection' && !/NO OBJECTIONS/i.test(f.text))
-        for (const f of objections.slice(-4)) add(`do-${f.id}`, `objection (${f.agent}): ${cut(f.text, width - 24)}`, 'yellow')
-        for (const [n, l] of sel.text.split('\n').entries()) add(`dl-${n}`, cut(l))
       }
     }
-    const body = Math.max(4, rows - 5)
-    const scroll = Math.max(0, Math.min(v.scroll, Math.max(0, lines.length - body)))
-    const shown = lines.slice(scroll, scroll + body)
-    const tab = (id: DeskView['tab'], label: string, hotkey: string) => (
-      <Button key={`tab-${id}`} {...(v.tab !== id ? { plain: true } : {})} hotkey={hotkey} onPress={() => void update($, view, x => ({ ...x, tab: id, scroll: 0 }))}>{v.tab === id ? `[${label}]` : ` ${label} `}</Button>
-    )
-    return (
-      <Box flexDirection="column">
-        <Box>
-          {tab('wall', '1 Wall', '1')}{tab('queue', '2 Queue', '2')}{tab('ticket', '3 Ticket', '3')}{tab('decide', '4 Decide', '4')}
-          <Text dimColor>  {v.items.length} waiting, {active.size} agents{v.notice ? `  (${v.notice})` : ''}</Text>
-        </Box>
-        {shown.map(l => (
-          <Text key={l.key} color={l.color} dimColor={l.dim}>{l.text}</Text>
-        ))}
-        {lines.length > body && <Text dimColor>lines {scroll + 1}-{Math.min(lines.length, scroll + body)} of {lines.length}</Text>}
-        <Box marginTop={0}>
-          <Button key="up" plain hotkey="k" onPress={() => void update($, view, x => ({ ...x, scroll: Math.max(0, x.scroll - Math.max(1, body - 2)) }))}>k up</Button>
-          <Button key="down" plain hotkey="j" onPress={() => void update($, view, x => ({ ...x, scroll: x.scroll + Math.max(1, body - 2) }))}>j down</Button>
-          {v.items.length > 1 && <Button key="next" plain hotkey="n" onPress={() => void update($, view, x => { const i = x.items.findIndex(it => it.md5 === (sel?.md5 ?? '')); const nx = x.items[(i + 1) % x.items.length]; return { ...x, selected: nx?.md5, ticket: nx?.ticket, scroll: 0 } })}>n next draft</Button>}
-          {sel && v.tab === 'decide' && v.mode === 'list' && (
-            <Box>
-              <Button key="send" variant="primary" hotkey="s" onPress={p => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`)}>s Send, {o.sendStatus}</Button>
-              <Button key="solve" hotkey="v" onPress={p => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`, 'solved')}>v Send, solved</Button>
-              <Button key="modify" hotkey="m" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'modify' }))}>m Modify</Button>
-              <Button key="deny" hotkey="d" onPress={() => void update($, view, x => ({ ...x, selected: sel.md5, mode: 'deny' }))}>d Deny</Button>
-            </Box>
-          )}
-        </Box>
-        {sel && v.mode === 'modify' && (
-          <Input key="modify-note" label="what to change" placeholder="one line for the drafter" autoFocus submitLabel="return" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'modify', txt, p.requestId)} />
-        )}
-        {sel && v.mode === 'deny' && (
-          <Input key="deny-reason" label="why" placeholder="recorded with the deny" autoFocus submitLabel="deny" onSubmit={(txt: string, p: any) => void decide($, o, sel.md5, 'deny', txt, p.requestId)} />
-        )}
-      </Box>
-    )
-  })
+  }
+
+  return (
+    <Box flexDirection="column">
+      {nav}
+      {keysOff}
+      {finder}
+      {keys}
+      {body}
+    </Box>
+  )
 }

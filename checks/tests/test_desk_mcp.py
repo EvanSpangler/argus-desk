@@ -25,7 +25,7 @@ class McpTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "resources/list"},
         ])
         self.assertEqual(res[0]["result"]["serverInfo"]["name"], "argus-desk")
-        self.assertEqual([t["name"] for t in res[1]["result"]["tools"]], ["file_draft", "skip_ticket", "desk_finding", "desk_receipt"])
+        self.assertEqual([t["name"] for t in res[1]["result"]["tools"]], ["file_draft", "skip_ticket", "desk_finding", "desk_receipt", "desk_mismatch"])
         self.assertEqual(res[2]["error"]["code"], -32601, "an unknown method is refused, not ignored")
         self.assertEqual(len(res), 3, "the notification gets no answer")
 

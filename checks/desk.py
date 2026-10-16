@@ -221,6 +221,27 @@ class Desk:
     def _thread(self, ticket):
         return read_json(os.path.join(self.root, "threads", "%s.json" % ticket), default=None)
 
+    def _fleet_receipts(self, ticket, checks):
+        """What the fleet's own claim check needs re-minted for this draft: each credited sentence with the receipts behind
+        it (kind, URL or source, the verbatim quote). The fleet mints its own (a docs receipt needs its browser snapshot);
+        this is the list, so the second check reopens the same pages instead of investigating again."""
+        rc = {r["id"]: r for r in CR.load(self.receipts_path) if r.get("ticket") == str(ticket)}
+        kinds = {"docs": "docs", "material": "artifact", "test": "tenant", "mismatch": "mismatch"}
+        out = []
+        for c in (checks.get("claims") or {}).get("detail") or []:
+            for rid in c.get("receipts") or []:
+                r = rc.get(rid)
+                if r:
+                    out.append({"sentence": c["text"], "fleet_kind": kinds.get(r["kind"], r["kind"]), "url": r.get("source"),
+                                "quote": r.get("quote"), "desk_receipt": rid})
+        esc = checks.get("escalation") or {}
+        for mid in esc.get("mismatch") or []:
+            r = rc.get(mid)
+            if r:
+                out.append({"sentence": esc.get("sentence"), "fleet_kind": "mismatch", "documented": r.get("documented"),
+                            "observed": r.get("observed"), "quote": r.get("quote"), "desk_receipt": mid})
+        return out
+
     def _requesters(self):
         return read_json(os.path.join(self.root, "requesters.json"), default=None) or {}
 
@@ -299,7 +320,8 @@ class Desk:
         # sentence needs a receipt that says what it says; a problem on any sentence is a HOLD with its code.
         c = CR.check(draft, ticket, self.receipts_path, datetime.fromtimestamp(now, timezone.utc), inbound=inbound)
         claims = [r for r in c["claims"] if "snippet" not in r["classes"]]
-        out["claims"] = {"checkable": len(claims), "credited": c["credited"],
+        out["claims"] = {"detail": [{"text": r["text"], "receipts": r.get("receipts") or []} for r in claims if r.get("receipts") and not r["problems"]],
+                         "checkable": len(claims), "credited": c["credited"],
                          "uncovered": sum(1 for r in claims if "uncovered" in r["problems"]),
                          "echo": sum(1 for r in claims if r.get("echo")), "hits": c["hits"], "shadow": False}
         out["hits"] += [h for h in c["hits"] if h not in out["hits"]]
@@ -388,6 +410,7 @@ class Desk:
         prior = self._requests().get(supersedes) if supersedes else None
         row = {"md5": md5, "ticket": str(ticket), "source": source, "supersedes": supersedes,
                "chars": len(text), "checks": checks, "text": text}
+        row["fleet_receipts"] = self._fleet_receipts(ticket, checks)
         if prior:
             row["edit"] = {"from": supersedes, "chars_before": prior.get("chars"), "distance": _distance(prior.get("text", ""), text)}
         self._append(self.requests_path, row)

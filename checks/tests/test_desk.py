@@ -546,5 +546,17 @@ class FleetParityTests(unittest.TestCase):
         g = d.grant(m, "press-51")
         self.assertIn("review:objection", g["overruled"])
 
+
+    def test_filed_row_lists_the_receipts_the_fleet_check_re_mints(self):
+        d, c = mk()
+        T = "52"
+        d.page("https://docs.example.org/broker", "Broker\n\nWhen the broker is disabled the connector reports unhealthy.\n")
+        rid = d.receipt(T, "docs", "When the broker is disabled the connector reports unhealthy", "https://docs.example.org/broker")["id"]
+        m = d.file(T, "When the broker is disabled the connector reports unhealthy.\n")["md5"]
+        fr = d._requests()[m]["fleet_receipts"]
+        self.assertEqual(fr, [{"sentence": "When the broker is disabled the connector reports unhealthy.", "fleet_kind": "docs",
+                               "url": "https://docs.example.org/broker", "quote": "When the broker is disabled the connector reports unhealthy",
+                               "desk_receipt": rid}])
+
 if __name__ == "__main__":
     unittest.main()

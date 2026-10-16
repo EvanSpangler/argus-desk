@@ -223,7 +223,7 @@ The draft's own text:
 |---|---|
 | `dash` | The draft contains an en or em dash. |
 | `timeline-commitment` | It promises a time ("shortly", "by tomorrow", "within 2 days"). |
-| `requester-name-unrecorded` | The draft greets someone by name and no requester name is on record for the ticket. The desk records it when a ticket read shows the requester field; `desk.py requester --ticket N --name "<exact name>"` records it by hand. |
+| `requester-name-unrecorded` | The draft greets someone by name and no requester name is on record for the ticket. The desk records it when a ticket read shows the requester field; `desk.py requester --ticket N --name "<exact name>"` records it by hand; a requester registry exported from your own tooling in the same shape (`{"<ticket>": {"name": "Surname, Given"}}`) can be copied to `<stateDir>/requesters.json`. |
 | `requester-name-mismatch` | The greeted name is not a part of the recorded requester name ("Hi Alvar" to Alba). |
 | `ticket-denied-recently` | You denied a draft on this ticket in the last 72 hours. The drafting has been wrong here, so the decision is yours: a delegated press under the usual bar would be held. A Modify is not a deny. |
 | `sends-held` | The file `<stateDir>/sends-held` exists: every draft holds until you remove it. |

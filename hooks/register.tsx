@@ -53,7 +53,7 @@ const opts = (o: Record<string, unknown>): Opts => ({
   writeProxy: String(o.writeProxy ?? 'zendesk-write'),
   searchEndpoint: String(o.searchEndpoint ?? 'zendesk_search_tickets'),
   searchQuery: String(o.searchQuery ?? 'type:ticket status<pending assignee:me'),
-  commentsEndpoint: String(o.commentsEndpoint ?? 'zendesk_list_comments'),
+  commentsEndpoint: String(o.commentsEndpoint ?? 'zendesk_get_ticket_comments,zendesk_list_comments'),
   ticketEndpoint: String(o.ticketEndpoint ?? 'zendesk_get_ticket'),
   updateEndpoint: String(o.updateEndpoint ?? 'zendesk_update_ticket'),
   sendStatus: STATUSES.includes(String(o.sendStatus)) ? String(o.sendStatus) : 'pending',
@@ -138,19 +138,30 @@ const isOutward = (args: Record<string, unknown>): boolean => {
 
 /** The comments array of a read result, wherever the proxy put it: at the top, under data/result/response, or as a JSON
  *  string inside the JSON. Returns the array and the count beside it when the payload carries one. */
-const commentsIn = (v: unknown, depth = 0): { comments: Array<Record<string, unknown>>; count?: number } | undefined => {
+/** A comment as any proxy shapes it: a body field and a time or an author. */
+const isComment = (c: unknown): boolean => {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return false
+  const r = c as Record<string, unknown>
+  return ['plain_body', 'body', 'html_body', 'text'].some(k => typeof r[k] === 'string') && ('created_at' in r || 'author_id' in r || 'author' in r || 'author_role' in r)
+}
+
+/** The comments in a read result. 2026-10-16 (real workstation, #147036): the comments endpoint that answers wraps them
+ * as something other than a `comments` key, and every read went unrecorded, so every material receipt was refused.
+ * `loose` (a read of a comments endpoint) also takes the first array whose items are comments, under any key or bare. */
+const commentsIn = (v: unknown, depth = 0, loose = false): { comments: Array<Record<string, unknown>>; count?: number } | undefined => {
   if (depth > 5 || v == null) return undefined
   if (typeof v === 'string') {
-    if (depth === 0 || !/"comments"\s*:\s*\[/.test(v)) return undefined
+    if (depth === 0 || !(loose || /"comments"\s*:\s*\[/.test(v))) return undefined
     try {
-      return commentsIn(JSON.parse(v), depth + 1)
+      return commentsIn(JSON.parse(v), depth + 1, loose)
     } catch {
       return undefined
     }
   }
   if (Array.isArray(v)) {
+    if (loose && v.length && v.every(isComment)) return { comments: v as Array<Record<string, unknown>> }
     for (const x of v) {
-      const f = commentsIn(x, depth + 1)
+      const f = commentsIn(x, depth + 1, loose)
       if (f) return f
     }
     return undefined
@@ -162,8 +173,14 @@ const commentsIn = (v: unknown, depth = 0): { comments: Array<Record<string, unk
       return { comments: rec.comments.filter(c => c && typeof c === 'object') as Array<Record<string, unknown>>, count }
     }
     for (const x of Object.values(rec)) {
-      const f = commentsIn(x, depth + 1)
-      if (f) return f
+      const f = commentsIn(x, depth + 1, loose)
+      if (f) {
+        if (f.count === undefined) {
+          const n = rec.count ?? rec.total ?? rec.total_count ?? rec.comment_count
+          if (typeof n === 'number') f.count = n
+        }
+        return f
+      }
     }
   }
   return undefined
@@ -392,8 +409,14 @@ async function ringToFirstRow($: any): Promise<void> {
 // 2026-10-15, workstation: a `tools` list on the agent type left the subagents without the proxy tool (its real name is only known
 // once the session lists its tools), so the types name none and inherit every tool the session has; the gate holds on the outward one.
 
+/** The comments endpoints in the order to try: 2026-10-16 the real proxy answered 404 on zendesk_list_comments. */
+const commentsVia = (o: Opts): string => {
+  const [first, ...rest] = o.commentsEndpoint.split(',').map(x => x.trim()).filter(Boolean)
+  return rest.length ? `${first} (if it answers an error, ${rest.join(', then ')})` : String(first)
+}
+
 const readingRules = (o: Opts, ticket: string): string =>
-  `Read with ${o.outwardTool}: proxy ${o.readProxy}, endpoint ${o.commentsEndpoint} with arguments {"ticket_id":"${ticket}"} for every comment, ` +
+  `Read with ${o.outwardTool}: proxy ${o.readProxy}, endpoint ${commentsVia(o)} with arguments {"ticket_id":"${ticket}"} for every comment, ` +
   `endpoint ${o.ticketEndpoint} for the ticket. For documentation call ${o.docsTool} with data source ${o.docsSource}; a docs receipt may cite only a page URL that appears in that result. You may not post, comment, or change anything. ` +
   `Every fact you will rely on must be receipted the moment you read it: call ${RECEIPT} with kind "docs" and the sentence verbatim from the ` +
   `page plus its URL, or kind "material" and the customer's words verbatim. A receipt that is refused means you did not actually read it; do not rely on it. ` +
@@ -1065,9 +1088,10 @@ export const register: Register = (on, options) => {
         // whichever body field the proxy filled. A read that reached the hook but was not recognised left the desk with no
         // thread, and every verbatim customer quote was then refused as "quote-not-in-material".
         const forTicket = ticket ?? who?.ticket
-        if (forTicket && text && /\\?"comments\\?"\s*:\s*\[/.test(text)) {
+        const commentsRead = /comment/i.test(String(args.endpoint ?? ''))
+        if (forTicket && text && (commentsRead || /\\?"comments\\?"\s*:\s*\[/.test(text))) {
           try {
-            const found = commentsIn(JSON.parse(text))
+            const found = commentsIn(JSON.parse(text), 0, commentsRead)
             if (found) {
               const messages = found.comments.map((c, i) => ({
                 id: String(c.id ?? i),
@@ -1378,7 +1402,7 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
     keys.push(
       <Box key="q-actions" {...BAR}>
         <Button key="pull" plain hotkey="p" onPress={(p: any) => { const id = under(p.requestId); if (id) pull($, o, id, 'pulled by the operator at the desk') }}>pull the ticket under the ring</Button>
-        <Button key="reread" plain hotkey="r" onPress={(p: any) => { const id = under(p.requestId); if (id) void $.prompt.submit({ text: `Read every comment on ticket #${id} again now with ${o.outwardTool} (proxy ${o.readProxy}, endpoint ${o.commentsEndpoint}, arguments {"ticket_id":"${id}"}), so the desk records the thread afresh. Do not post anything.` }).catch(() => undefined) }}>re-read its thread</Button>
+        <Button key="reread" plain hotkey="r" onPress={(p: any) => { const id = under(p.requestId); if (id) void $.prompt.submit({ text: `Read every comment on ticket #${id} again now with ${o.outwardTool} (proxy ${o.readProxy}, endpoint ${commentsVia(o)}, arguments {"ticket_id":"${id}"}), so the desk records the thread afresh. Do not post anything.` }).catch(() => undefined) }}>re-read its thread</Button>
         <Button key="open-review" plain hotkey="o" onPress={(p: any) => { const id = under(p.requestId); const d = v.items.find(i => i.ticket === id); if (d) void selectDraft($, o, d.md5, true, p.requestId) }}>its draft in Review</Button>
       </Box>,
     )

@@ -19,7 +19,7 @@ import argparse, json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DESK = os.path.join(HERE, "desk.py")
-VERSION = "0.8.4"
+VERSION = "0.8.5"
 
 TOOLS = [
     {"name": "file_draft",

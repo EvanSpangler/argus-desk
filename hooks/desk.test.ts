@@ -618,6 +618,18 @@ test('the three views share one pane: 1 to 3 switch the view inside it, the pane
   await ui.unmount()
 })
 
+test('a view key reads the desk again: a draft filed outside the session shows without a poll', async ($, on) => {
+  let filed = false
+  fake(on, (r: Run) => cmdOf(r) === 'list' ? { ok: true, items: filed ? [ITEM] : [] } : treeFake(r))
+  await $.command.run({ command: 'desk', args: '' })
+  const ui = await mountPane($, 'desk')
+  expect(await ui.find({ key: 'send' })).toBeUndefined()
+  filed = true
+  await ui.press({ key: 'go-review' })
+  expect(await ui.find({ key: 'send' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('the keys are drawn above the rows, on bars that wrap with a gap between buttons', async ($, on) => {
   fake(on, treeFake)
   await $.tool.call({ tool: 'mcp__argus-desk__file_draft', ticket: '123456', draft: DRAFT } as any)

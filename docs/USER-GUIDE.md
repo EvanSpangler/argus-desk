@@ -320,6 +320,9 @@ Sonnet, the adversary and drafter to Opus.
   field with the cursor in it (a Modify note, a Deny reason) takes every key until Enter; Tab reaches its
   `cancel` button, which leaves the draft undecided. Esc hands the keyboard back to the prompt. Without the keys, the pane
   commands (`/desk review`, `/desk tickets`, `/desk wall`, `/desk show`) still work.
+- **ISSUES names every hold (0.9.1).** A hold with no sentence or rule of its own (requester-name, a recent deny, sends held,
+  escalation, thread moved) shows as `hold: <code>`, so the count is what a Send would overrule. A view key (1 to 3) reads the
+  desk again, so a draft filed outside this session shows without a poll. Tab past the last row reaches the pane's close button.
 - **Only `/desk run N` runs agents (0.9.0).** An agent keeps the desk's hooks only when it is spawned while a command is still
   running. One spawned later (by the poller, a pull, or Modify) runs, but its desk tools answer "no tool.call hook answered" and
   its reads are never recorded. So the poller and `/desk pull N` only queue a ticket, and `/desk run N` runs it, holding the

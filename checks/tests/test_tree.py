@@ -150,5 +150,16 @@ class TreeTests(unittest.TestCase):
         self.assertEqual(DT.find(t["tree"], "reply:s1")["state"], "uncovered")
         self.assertTrue(any(i["id"] == "issue:s1:uncovered" for i in DT.find(t["tree"], "issues")["children"]))
 
+    def test_issues_name_every_hold_the_send_would_overrule(self):
+        # 2026-10-16 live drive: requester-name-unrecorded held the draft but ISSUES listed only the warning and the voice rule
+        d = D.Desk(tempfile.mkdtemp(), clock=Clock())
+        f = d.file("9", "Hi Bob,\n\nI will look into this and get back to you shortly.\n\nBest, Evan")
+        self.assertIn("requester-name-unrecorded", f["hits"])
+        issues = DT.find(DT.build(d, f["md5"])["tree"], "issues")
+        labels = [i["label"] for i in issues["children"]]
+        self.assertIn("hold: requester-name-unrecorded", labels)
+        self.assertEqual(sum("timeline-commitment" in l for l in labels), 1, "a hit already shown as a voice rule is not named twice")
+        self.assertEqual(issues["label"], "ISSUES: %d open" % len(labels))
+
 if __name__ == "__main__":
     unittest.main()

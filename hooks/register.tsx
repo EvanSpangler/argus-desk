@@ -408,7 +408,7 @@ async function decide($: any, o: Opts, md5: string, decision: 'send' | 'deny' | 
   } else {
     await desk($, o, ['modify', '--md5', md5, '--note', note])
     await desk($, o, ['finding'], JSON.stringify({ ticket: item.ticket, agent: 'operator', role: 'operator', kind: 'objection', text: `Modify: ${note || '(no note)'}`, about: md5 }))
-    await refresh($, o, `returned ${md5.slice(0, 8)}`)
+    await refresh($, o, `returned ${md5.slice(0, 8)}: /desk run ${item.ticket} redrafts it`)
     $.clock.after(1, () => void redraft($, o, item.ticket, md5, note).catch(() => undefined))
   }
   await update($, view, v => ({ ...v, mode: 'list', selected: undefined }))
@@ -1308,10 +1308,12 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
   let first = true
   const focusFirst = () => { if (!first) return {}; first = false; return { autoFocus: true as const } }
 
+  // 2026-10-16 live drive: a draft filed outside this session (another session, the CLI) stayed hidden with poll off
+  // until a /desk command; a view key reads the desk again first
   const nav = (
     <Box key="nav" {...BAR}>
       {VIEWS.map((id, i) => (
-        <Button key={`go-${id}`} plain hotkey={String(i + 1)} dimColor={id !== which} onPress={(p: any) => void openView($, id, true, p.requestId)}>{id === which ? `[${TITLES[id]}]` : TITLES[id]}</Button>
+        <Button key={`go-${id}`} plain hotkey={String(i + 1)} dimColor={id !== which} onPress={(p: any) => void refresh($, o).catch(() => undefined).then(() => openView($, id, true, p.requestId))}>{id === which ? `[${TITLES[id]}]` : TITLES[id]}</Button>
       ))}
       <Text dimColor>{v.items.length} waiting, {active.size} agents, poll {v.poll}{v.notice ? `  (${v.notice})` : ''}</Text>
     </Box>
@@ -1456,7 +1458,7 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
     } else {
       const byTicket = new Map<string, WallAgent[]>()
       for (const w of v.wall) byTicket.set(w.ticket, [...(byTicket.get(w.ticket) ?? []), w])
-      if (!byTicket.size) text('w0', 'No agents yet. A poll or /desk run N starts a run; every agent shows here as it works, Enter tails one.', undefined, true)
+      if (!byTicket.size) text('w0', 'No agents yet. /desk run N starts a run (a poll only queues one); every agent shows here as it works, Enter tails one.', undefined, true)
       for (const [ticket, agents] of byTicket) {
         const rows = agents.filter(a => match(ticket, a.role, a.label, a.last, a.status))
         if (!rows.length) continue

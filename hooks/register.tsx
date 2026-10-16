@@ -1301,6 +1301,23 @@ async function toggleNode($: any, o: Opts, n: TreeNode): Promise<void> {
 /** The node an action acts on: the one under the focus ring, else the row last pressed. */
 const acted = (v: DeskView, requestId: string): string | undefined => idOf(ring.get(requestId)) ?? v.last
 
+/** q on Review: the selected draft as QR codes, one at a time, so its exact bytes can leave the workstation on the screen.
+ * 2026-10-16 (#147802, F-1096): the usual bar's S2 needs those bytes on box j1, and no file runs there; J1 reads the screen. */
+async function showQr($: any, o: Opts, md5: string, width: number): Promise<void> {
+  const v = await read($, view)
+  if (v.qr?.md5 === md5 && v.qr.codes.length) {
+    await update($, view, x => ({ ...x, qr: x.qr ? { ...x.qr, i: (x.qr.i + 1) % x.qr.codes.length } : undefined }))
+    return
+  }
+  const r = await desk($, o, ['qr', '--md5', md5, '--width', String(width)])
+  if (!r.ok) {
+    await update($, view, x => ({ ...x, notice: `QR: ${String(r.reason ?? 'desk.py gave no codes')}` }))
+    return
+  }
+  const codes = ((r.codes as Array<{ lines: string[] }> | undefined) ?? []).map(c => c.lines)
+  await update($, view, x => ({ ...x, qr: { md5, i: 0, codes } }))
+}
+
 async function drawPane($: any, o: Opts, e: any, which: View) {
   const { Box, Text, Button, Input } = $.ui.resolve(e) as any
   const v = await read($, view)
@@ -1354,7 +1371,17 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
     const zoom = v.zoom ?? []
     const zoomId = zoom[zoom.length - 1]
     const expanded = new Set(v.expanded ?? DEFAULT_OPEN)
-    if (!sel) {
+    if (sel && v.qr?.md5 === sel.md5 && v.qr.codes.length) {
+      const qr = v.qr
+      text('qr-h', `#${sel.ticket} draft ${sel.md5}  QR ${qr.i + 1} of ${qr.codes.length}, ${sel.text.length} chars`, 'cyan')
+      for (const [n, l] of (qr.codes[qr.i] ?? []).entries()) text(`qr-${qr.i}-${n}`, l)
+      keys.push(
+        <Box key="r-qr" {...BAR}>
+          <Button key="qr-next" plain hotkey="q" autoFocus onPress={() => void showQr($, o, sel.md5, width - 2)}>{qr.codes.length > 1 ? 'next code' : 'same code'}</Button>
+          <Button key="qr-back" plain hotkey="b" onPress={() => void update($, view, x => ({ ...x, qr: undefined }))}>back to the proof</Button>
+        </Box>,
+      )
+    } else if (!sel) {
       text('r0', `No draft at the desk. The drafter files one with ${TOOL}; its proof shows here, and nothing posts without a Send.`, undefined, true)
     } else if (!tree) {
       // the draft is still the operator's to decide when its tree did not build: the text and the checks at filing stand in
@@ -1411,6 +1438,7 @@ async function drawPane($: any, o: Opts, e: any, which: View) {
           <Button key="solve" plain hotkey="v" onPress={(p: any) => void decide($, o, sel.md5, 'send', '', `${p.requestId}-${sel.md5.slice(0, 8)}-${Date.now()}`, 'solved')}>Send, solved</Button>
           <Button key="modify" plain hotkey="m" onPress={(p: any) => void askFor(p.requestId, 'modify')}>Modify</Button>
           <Button key="deny" plain hotkey="d" onPress={(p: any) => void askFor(p.requestId, 'deny')}>Deny</Button>
+          {v.qr?.md5 === sel.md5 ? null : <Button key="qr" plain hotkey="q" onPress={() => void showQr($, o, sel.md5, width - 2)}>QR of the text</Button>}
         </Box>,
       )
       // the field takes the ring as it opens, so the words typed are the note, not the view's keys; cancel (Tab, Enter) leaves

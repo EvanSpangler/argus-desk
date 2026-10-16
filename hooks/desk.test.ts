@@ -11,7 +11,7 @@ const fake = (on: any, answer: (r: Run) => Record<string, unknown>) => {
   })
   return calls
 }
-const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait', 'tree'].includes(String(a)))
+const cmdOf = (r: Run) => r.argv.find(a => ['file', 'list', 'grant', 'deny', 'modify', 'consume', 'capture', 'stats', 'sync', 'queue', 'mark', 'run', 'event', 'finding', 'receipt', 'page', 'cite', 'call', 'audit', 'verify', 'trace', 'wait', 'tree', 'requester', 'mismatch'].includes(String(a)))
 
 const DRAFT = 'Hi Sam,\n\nThe broker is disabled, so the connector reports unhealthy. Re-enable it under Settings > Connectors.\n\nThanks!\n'
 const ITEM = { md5: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', ticket: '123456', state: 'pending', filed: 1, age_s: 120, chars: 120, text: DRAFT,
@@ -52,6 +52,24 @@ test('a read of the ticket comments passes untouched and is captured as the live
   expect(body.count).toBe(3)
   expect(body.messages[1].who).toBe('us')
   expect(body.messages[2].who).toBe('staff')
+})
+
+test('fleet parity: a ticket read that names the requester records the name for the salutation check', async ($, on) => {
+  const calls = fake(on, () => ({ ok: true, items: [] }))
+  const payload = { ticket: { id: 123456, requester_id: 77, subject: 'Scans fail' }, users: [{ id: 5, name: 'Wiz Support' }, { id: 77, name: 'Alba Ruiz' }] }
+  on('tool.call', { tool: 'mcp__local-argus__invoke_proxy' }, async () => ({ result: payload, text: JSON.stringify(payload) }))
+  await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'ticketing-full', endpoint: 'ticketing_get_ticket', arguments: { ticket_id: 123456 } } as any)
+  const rq = calls.find(c => cmdOf(c) === 'requester')
+  expect(rq).toBeDefined()
+  expect(rq!.argv.slice(rq!.argv.indexOf('--ticket'))).toEqual(['--ticket', '123456', '--name', 'Alba Ruiz'])
+})
+
+test('fleet parity: desk_mismatch records the escalation basis through desk.py', async ($, on) => {
+  const calls = fake(on, r => (cmdOf(r) === 'mismatch' ? { ok: true, id: 'rcpt:mismatch-1a2b3c4d' } : { ok: true, items: [] }))
+  const r = await $.tool.call({ tool: 'mcp__argus-desk__desk_mismatch', ticket: '123456', documented: 'rcpt:docs-1', observed: 'rcpt:material-2', summary: 'the docs say healthy; theirs is not' } as any)
+  expect(String(r.result)).toContain('Mismatch rcpt:mismatch-1a2b3c4d')
+  const m = calls.find(c => cmdOf(c) === 'mismatch')
+  expect(JSON.parse(m!.stdin!)).toMatchObject({ ticket: '123456', documented: 'rcpt:docs-1', observed: 'rcpt:material-2' })
 })
 
 test('receipt fault 2026-10-15: a comments read wrapped in an envelope, or a JSON string, with only html bodies, is still the thread', async ($, on) => {

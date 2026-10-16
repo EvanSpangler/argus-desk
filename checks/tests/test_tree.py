@@ -17,6 +17,7 @@ def seed():
     """A ticket with a recorded thread, two investigators, a docs and a material receipt, one finding, one open
     objection that quotes the second sentence, and a filed draft citing both receipts."""
     root = tempfile.mkdtemp(); c = Clock(); d = D.Desk(root, clock=c); T = "12"
+    d.requester(T, "Sam Lee")
     d.capture(T, [{"id": "1", "who": "customer", "at": T0 - 7200, "text": "Our connector reports unhealthy since Monday. Which agent version is required?"}], 1)
     d.run_update(T, phase="new", agent={"id": "a1", "role": "investigator", "label": "inv1", "model": "sonnet", "status": "running", "prompt": "read the docs", "params": "docs-first"})
     d.run_update(T, agent={"id": "a3", "role": "investigator", "label": "inv3", "model": "sonnet", "status": "completed", "params": "thread-first", "summary": "They ask which agent version; the connector is unhealthy."})

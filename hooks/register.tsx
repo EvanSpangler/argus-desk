@@ -29,6 +29,7 @@ const TOOL = 'file_draft'
 const SKIP = 'skip_ticket'
 const FINDING = 'desk_finding'
 const RECEIPT = 'desk_receipt'
+const MISMATCH = 'desk_mismatch'
 const STATUSES = ['pending', 'solved', 'open', 'on-hold']
 const ROLES = ['investigator', 'adversary', 'drafter', 'reviewer'] as const
 type Role = (typeof ROLES)[number]
@@ -186,6 +187,28 @@ const ticketOf = (args: Record<string, unknown>): string | undefined => {
   const flat = JSON.stringify(args)
   const m = flat.match(/tickets?\/(\d{4,})/) ?? flat.match(/"ticket(?:_id|Id)?"\s*:\s*"?(\d{4,})/)
   return m?.[1]
+}
+
+/** The requester's name in a ticket read: requester.name, requester_name, or the sideloaded user whose id is requester_id. */
+const requesterIn = (v: unknown, depth = 0): string | undefined => {
+  if (depth > 6 || !v) return undefined
+  if (typeof v === 'string') {
+    if (!/requester/.test(v)) return undefined
+    try { return requesterIn(JSON.parse(v), depth + 1) } catch { return undefined }
+  }
+  if (Array.isArray(v)) { for (const x of v) { const f = requesterIn(x, depth + 1); if (f) return f } return undefined }
+  if (typeof v !== 'object') return undefined
+  const rec = v as Record<string, unknown>
+  const req = rec.requester as Record<string, unknown> | undefined
+  if (req && typeof req === 'object' && typeof req.name === 'string' && req.name.trim()) return req.name.trim()
+  if (typeof rec.requester_name === 'string' && rec.requester_name.trim()) return rec.requester_name.trim()
+  const tk = (rec.ticket ?? rec) as Record<string, unknown>
+  if (tk && typeof tk === 'object' && tk.requester_id != null && Array.isArray(rec.users)) {
+    const u = (rec.users as Array<Record<string, unknown>>).find(x => x && String(x.id) === String(tk.requester_id))
+    if (u && typeof u.name === 'string' && u.name.trim()) return u.name.trim()
+  }
+  for (const x of Object.values(rec)) { const f = requesterIn(x, depth + 1); if (f) return f }
+  return undefined
 }
 
 /** The documentation URLs a read names, on the official hosts, so its result can stand as that page. */
@@ -399,7 +422,8 @@ const prompts: Record<Role, (o: Opts, ticket: string, angle: string, context: st
     `No dashes of any kind. Never promise a time. No closing offer, no sign-off, no greeting line beyond the first (Zendesk appends the signature). ` +
     `Do not restate the customer's words back to them; a sentence that echoes them is not an answer and is counted against the draft. Do not repeat what we already told them. ` +
     `There is no "unconfirmed", "I suspect" or "I believe" wording that makes an unverified sentence acceptable: a claim is verified with a receipt or it is cut; if you cannot verify the answer, ask for exactly what would settle it and assert nothing. ` +
-    `Every factual sentence must carry a receipt that says what the sentence says. When the reply escalates to engineering, say "I've passed along your request to the WizOS engineering team." and only when there is a documented mismatch between the docs and what the product did. ` +
+    `Every factual sentence must carry a receipt that says what the sentence says. When the reply escalates to engineering, say "I've passed along your request to the WizOS engineering team." and only when there is a documented mismatch between the docs and what the product did, recorded first with ${MISMATCH} (the docs receipt, the material or test receipt, one line on how they differ); an escalation with no mismatch on record is held. ` +
+    `Greet the customer by name only with the name in the ticket's requester field; if the ticket read showed no requester name, use no name. ` +
     `File it with ${TOOL}: ticket, draft (the exact text), and citations as a list of {sentence, receipt} covering every factual sentence. ` +
     `If the ticket needs no reply from us right now, call ${SKIP} with the reason instead. Do not post anything. Answer with the md5 ${TOOL} returned and one line on what the reply does.`,
   reviewer: (o, ticket, angle, context) =>
@@ -740,7 +764,7 @@ async function ensureAgents($: any, o: Opts): Promise<void> {
       const mcpServers = o.agentTools === 'mcp'
         ? [{ desk: { command: o.python, args: ['-I', `${$.plugin.root}/checks/desk_mcp.py`, '--root', o.stateDir, '--role', role, '--docs-hosts', o.docsHosts] } }]
         : undefined
-      await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.${mcpServers ? ` The desk tools (${TOOL}, ${SKIP}, ${FINDING}, ${RECEIPT}) are served by the MCP server named desk.` : ''}`, ...(mcpServers ? { mcpServers } : {}), model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
+      await $.agent.register({ name: role, description: `argus-desk ${role}: spawned by the desk on a ticket run`, prompt: `You are the ${role} of the argus-desk review workflow. Follow the task exactly; use only the tools named in it.${mcpServers ? ` The desk tools (${TOOL}, ${SKIP}, ${FINDING}, ${RECEIPT}, ${MISMATCH}) are served by the MCP server named desk.` : ''}`, ...(mcpServers ? { mcpServers } : {}), model: role === 'investigator' ? o.investigatorModel : role === 'adversary' ? o.adversaryModel : role === 'drafter' ? o.drafterModel : o.reviewerModel, maxTurns: 40 })
     } catch {
       /* a host without agent types: the role prompt rides in the task and the gate still holds */
     }
@@ -786,6 +810,12 @@ export const register: Register = (on, options) => {
       name: RECEIPT,
       description: 'Mint a receipt for something you actually read on this ticket: kind "docs" with the sentence verbatim from an official documentation page and its URL (the page must have been fetched in this session), or kind "material" with the customer\'s own words verbatim from the thread. Refused when the quote is not on the page or not in the thread.',
       inputSchema: { type: 'object', properties: { ticket: { type: 'string' }, kind: { type: 'string' }, quote: { type: 'string' }, source: { type: 'string', description: 'the page URL, for docs' } }, required: ['ticket', 'kind', 'quote'] },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: MISMATCH,
+      description: 'Record the basis an escalation needs: the docs receipt id (what the product should do), the material or test receipt id (what it did), and one line on how they differ. Both receipts must be on this ticket and fresh.',
+      inputSchema: { type: 'object', properties: { ticket: { type: 'string' }, documented: { type: 'string' }, observed: { type: 'string' }, summary: { type: 'string' } }, required: ['ticket', 'documented', 'observed', 'summary'] },
       isDeferred: false,
     })
     await findOutward($, o)
@@ -975,6 +1005,14 @@ export const register: Register = (on, options) => {
     return { result: r.ok ? `Receipt ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}. Only a sentence you actually read, verbatim, can be receipted${refusalDetail(r)}.` }
   }).catch(() => ({ deny: 'argus-desk: the receipt was not minted, try again' }))
 
+  on('tool.call', { tool: `mcp__argus-desk__${MISMATCH}` }, async ($, e) => {
+    const a = e as unknown as { ticket?: string; documented?: string; observed?: string; summary?: string; agentId?: string }
+    const who = active.get(String(a.agentId ?? ''))
+    const r = await desk($, o, ['mismatch'], JSON.stringify({ ticket: String(a.ticket ?? ''), documented: String(a.documented ?? ''), observed: String(a.observed ?? ''), summary: String(a.summary ?? ''), by: who?.label }))
+    if (a.agentId) await wallLine($, o, a.agentId, r.ok ? 'mismatch' : 'receipt-refused', `${String(r.id ?? r.why ?? r.reason)}: ${String(a.summary ?? '').slice(0, 120)}`)
+    return { result: r.ok ? `Mismatch ${String(r.id)}.` : `Refused: ${String(r.why ?? r.reason)}.` }
+  }).catch(() => ({ deny: 'argus-desk: the mismatch was not recorded, try again' }))
+
   // 2. the gate: an outward call passes only by spending an open grant on the exact text it carries.
   // A documentation search (enterprise_search by default): the result is a call on the record and a page per official URL it
   // carries, so a docs receipt can quote it. No outbound internet on the workstation; this is the docs leg there.
@@ -1044,6 +1082,9 @@ export const register: Register = (on, options) => {
             /* not a comments payload after all */
           }
         }
+        // the salutation check (the fleet's requester-name gate) needs the name as the ticket's requester field shows it
+        const requester = forTicket && text ? requesterIn(text) : undefined
+        if (forTicket && requester) await desk($, o, ['requester', '--ticket', forTicket, '--name', requester])
         if (text) {
           // a URL the call itself named was fetched: the body is that page; one only named in the result is not
           const asked = new Set(docsUrls(o, JSON.stringify(args)))

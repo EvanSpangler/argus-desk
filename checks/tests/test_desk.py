@@ -9,10 +9,17 @@ class Clock:
     def __init__(self, t=T0): self.t = t
     def __call__(self): return self.t
 
-def mk():
+class Sam(dict):
+    """Every ticket's requester is Sam Lee, so the fixtures' "Hi Sam," passes the requester check; RequesterTests use the registry."""
+    def get(self, k, default=None): return {"name": "Sam Lee"}
+
+def mk(requesters=True):
     root = tempfile.mkdtemp()
     c = Clock()
-    return D.Desk(root, clock=c), c
+    d = D.Desk(root, clock=c)
+    if requesters:
+        d._requesters = Sam
+    return d, c
 
 DRAFT = "Hi Sam,\n\nThe broker for this connector is disabled, so the connector reports unhealthy. Re-enable the broker in the portal under Settings > Connectors, then run a fresh scan.\n\nPlease send a fresh support package after that.\n\nThanks!\n"
 
@@ -428,6 +435,89 @@ class RemediationTests(unittest.TestCase):
         r = d.file("4", "Hi,\n\nThe broker is off \u2014 turn it on.\n")
         self.assertEqual([h for h in r["hits"] if "dash" in h], ["dash"])
 
+
+
+class FleetParityTests(unittest.TestCase):
+    """The fleet's send gates the desk carries, so a draft that clears the desk clears the fleet's usual bar."""
+
+    def test_requester_name_unrecorded_mismatch_and_match(self):
+        d, c = mk(requesters=False)
+        r = d.file("41", "Hi Alvar,\n\nPlease send a fresh support package.\n")
+        self.assertIn("requester-name-unrecorded", r["hits"])
+        d.requester("41", "Alba Ruiz")
+        r = d.file("41", "Hi Alvar,\n\nPlease send the support package again.\n")
+        self.assertIn("requester-name-mismatch", r["hits"])
+        self.assertEqual(d._requests()[r["md5"]]["checks"]["requester"], {"greeted": "Alvar", "recorded": "Alba Ruiz"})
+        r = d.file("41", "Hi Alba,\n\nPlease send a new support package.\n")
+        self.assertNotIn("requester-name-mismatch", r["hits"])
+        self.assertNotIn("requester-name-unrecorded", r["hits"])
+        r = d.file("41", "Please send one more support package.\n")     # no greeting, nothing to check
+        self.assertNotIn("requester", d._requests()[r["md5"]]["checks"])
+        d.requester("42", "Connick Shields")
+        self.assertEqual(d._requesters()["42"]["name"], "Connick Shields")
+
+    def test_a_deny_on_the_ticket_holds_the_next_draft_for_72h(self):
+        d, c = mk()
+        m = d.file("43", "Please send a fresh support package.\n")["md5"]
+        d.deny(m, "wrong product")
+        r = d.file("43", "Please send the support package from the sensor host.\n")
+        self.assertIn("ticket-denied-recently", r["hits"])
+        self.assertEqual(d._requests()[r["md5"]]["checks"]["denied_recently"][0]["reason"], "wrong product")
+        self.assertNotIn("ticket-denied-recently", d.file("44", "Please send a fresh support package.\n")["hits"])
+        c.t += 73 * 3600
+        self.assertNotIn("ticket-denied-recently", d.file("43", "Please send the support package again today.\n")["hits"])
+
+    def test_modify_is_not_a_deny(self):
+        d, c = mk()
+        m = d.file("45", "Please send a fresh support package.\n")["md5"]
+        d.modify(m, "shorter")
+        self.assertNotIn("ticket-denied-recently", d.file("45", "Please send a support package.\n", supersedes=m)["hits"])
+
+    def test_sends_held_switch(self):
+        d, c = mk()
+        open(os.path.join(d.root, "sends-held"), "w").close()
+        self.assertIn("sends-held", d.file("46", "Please send a fresh support package.\n")["hits"])
+
+    def test_escalation_needs_a_recorded_mismatch(self):
+        d, c = mk()
+        T = "47"
+        d.capture(T, [{"id": "1", "who": "customer", "at": T0 - 3600, "text": "The scan finished but the connector still shows as unhealthy after we enabled the broker."}], 1)
+        d.page("https://docs.example.org/broker", "Broker\n\nWhen the broker is enabled the connector reports healthy after the next scan.\n")
+        docs = d.receipt(T, "docs", "When the broker is enabled the connector reports healthy after the next scan", "https://docs.example.org/broker")["id"]
+        seen = d.receipt(T, "material", "the connector still shows as unhealthy after we enabled the broker")["id"]
+        draft = "I've passed along your request to the WizOS engineering team.\n"
+        r = d.file(T, draft)
+        self.assertIn("escalation-without-mismatch", r["hits"])
+        self.assertEqual(d.mismatch(T, seen, docs, "docs say healthy, it is not")["why"], "documented-not-a-docs-receipt")
+        self.assertEqual(d.mismatch(T, docs, docs, "docs say healthy, it is not")["why"], "observed-not-a-material-or-test-receipt")
+        self.assertEqual(d.mismatch(T, docs, seen, "differs")["why"], "summary-missing")
+        self.assertTrue(d.mismatch(T, docs, seen, "the docs say healthy after a scan; theirs stays unhealthy")["ok"])
+        d.modify(r["md5"], "retry")
+        r = d.file(T, draft)
+        self.assertNotIn("escalation-without-mismatch", r["hits"])
+        self.assertEqual(len(d._requests()[r["md5"]]["checks"]["escalation"]["mismatch"]), 1)
+        d.modify(r["md5"], "again")
+        c.t += 25 * 3600                                      # the receipts behind it went stale: no basis
+        self.assertIn("escalation-without-mismatch", d.file(T, "We escalated this to engineering.\n")["hits"])
+
+    def test_fleet_reversal_phrases_hold(self):
+        import thread_review as TR
+        for s in ("Apologies, the earlier steps were for the other connector.", "My prior response named the wrong page.",
+                  "I got that wrong in the last note.", "I was wrong to suggest a restart."):
+            self.assertTrue(TR.REVERSAL.search(s), s)
+
+    def test_partial_binding_at_the_fleets_thresholds(self):
+        import claim_receipts as CR
+        self.assertEqual((CR.POLICY["unbound_words"], CR.POLICY["unbound_share"]), (3, 0.2))
+
+    def test_echo_share_is_a_warning(self):
+        d, c = mk()
+        T = "48"
+        said = "we upgraded the sensor to the newest release last week and since then the console shows no data at all"
+        d.capture(T, [{"id": "1", "who": "customer", "at": T0 - 3600, "text": said}], 1)
+        r = d.file(T, "You upgraded the sensor to the newest release last week and since then the console shows no data at all. Please send a support package.\n")
+        self.assertGreaterEqual(r["claims"]["echo_share"], 0.25)
+        self.assertIn("echo-share", r["warnings"])
 
 if __name__ == "__main__":
     unittest.main()

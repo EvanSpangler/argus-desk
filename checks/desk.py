@@ -14,6 +14,8 @@ Subcommands (JSON in on stdin where noted, JSON out on stdout, exit 0 unless the
   modify    --md5 --note                                       -> operator asked for a change (returned)
   consume   stdin {candidates:[body text], what, status}       -> the send gate: spends an open grant
   capture   stdin {ticket, messages:[{id,who,at,text}], count} -> records the live thread + receipt
+  requester --ticket --name                                   -> the requester's name, for the salutation check
+  mismatch  stdin {ticket, documented, observed, summary}     -> the basis an escalation needs
   stats                                                        -> the economics table
 """
 import argparse, hashlib, json, os, re, sys, tempfile, time
@@ -42,6 +44,12 @@ def _iso_epoch(s):
         return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         return None
+# The fleet's voice-lint salutation: a greeting names the requester exactly as the ticket's requester field has it.
+# "Hi Alvar" (09-15) and "Hi Alba" (09-18) went out to people with other names.
+SALUTATION = re.compile(r"^\s*(?:Hi|Hello|Hey|Dear)\s+([A-Za-z][A-Za-z.'-]*)\s*[,!\n]", re.M)
+# The fleet's history hold: a deny on the ticket in the last 72 h means the drafting has been wrong here, so the
+# operator decides; a delegated press does not.
+HISTORY_S = 72 * 3600
 TIMELINE = re.compile(r"\b(shortly|soon|asap|as soon as possible|by (?:end of|eod|tomorrow|monday|tuesday|wednesday|thursday|friday)|within (?:the )?(?:hour|day|\d+ (?:hours|days)))\b", re.I)
 
 
@@ -208,6 +216,32 @@ class Desk:
     def _thread(self, ticket):
         return read_json(os.path.join(self.root, "threads", "%s.json" % ticket), default=None)
 
+    def _requesters(self):
+        return read_json(os.path.join(self.root, "requesters.json"), default=None) or {}
+
+    def requester(self, ticket, name, by=OPERATOR):
+        """Record the requester's name as the ticket's requester field shows it, for the salutation check."""
+        name = re.sub(r"\s+", " ", str(name or "")).strip()
+        if not str(ticket or "").strip() or not name:
+            return {"ok": False, "reason": "ticket and name are required"}
+        reg = self._requesters()
+        reg[str(ticket)] = {"name": name, "at": self.clock(), "by": by}
+        write_json(os.path.join(self.root, "requesters.json"), reg, indent=1, sort_keys=True)
+        return {"ok": True, "ticket": str(ticket), "name": name}
+
+    def _denied_on(self, ticket, now):
+        """Operator denies of a draft on this ticket in the last 72 h, newest first. An expiry is not a deny."""
+        on = {r["md5"] for r in self._rows(self.requests_path) if r.get("ticket") == str(ticket)}
+        return [{"md5": e["md5"], "at": e["ts"], "reason": (e.get("reason") or "")[:160]}
+                for e in reversed(self.ledger.events()) if e.get("event") == "deny" and e.get("md5") in on and now - e["ts"] <= HISTORY_S]
+
+    def mismatch(self, ticket, documented, observed, summary, by=None):
+        r = CR.mint_mismatch(self.receipts_path, ticket, documented, observed, summary, datetime.fromtimestamp(self.clock(), timezone.utc))
+        self._append(os.path.join(self._run_dir(ticket), "events.jsonl"),
+                     {"agent": by or "", "kind": "receipt" if r.get("ok") else "receipt-refused",
+                      "text": "%s mismatch: %s" % (r.get("id") or r.get("why"), str(summary or "")[:120])})
+        return r
+
     def _requests(self):
         return {r["md5"]: r for r in self._rows(self.requests_path)}
 
@@ -223,6 +257,22 @@ class Desk:
             lint.append("timeline-commitment")
         out["lint"] = lint
         out["hits"] += lint
+        # 1b. the fleet's per-ticket gates: requester name, recent deny, the kill switch
+        sal = SALUTATION.search(draft)
+        if sal:
+            name = (self._requesters().get(str(ticket)) or {}).get("name")
+            greeted = sal.group(1)
+            out["requester"] = {"greeted": greeted, "recorded": name}
+            if not name:
+                out["hits"].append("requester-name-unrecorded")
+            elif not any(t.lower() == greeted.lower() for t in re.split(r"[\s,()]+", name.strip(".,'\"")) if t):
+                out["hits"].append("requester-name-mismatch")
+        denied = self._denied_on(ticket, now)
+        if denied:
+            out["denied_recently"] = denied
+            out["hits"].append("ticket-denied-recently")
+        if os.path.exists(os.path.join(self.root, "sends-held")):
+            out["hits"].append("sends-held")
         # 2. thread: capture proof, cadence, reversal, repeat-ask, open customer questions
         rec = self._thread(ticket)
         if rec:
@@ -248,6 +298,17 @@ class Desk:
                          "uncovered": sum(1 for r in claims if "uncovered" in r["problems"]),
                          "echo": sum(1 for r in claims if r.get("echo")), "hits": c["hits"], "shadow": False}
         out["hits"] += [h for h in c["hits"] if h not in out["hits"]]
+        # 3b. escalation needs a recorded mismatch (docs say X, the product did Y), as in the fleet
+        when = datetime.fromtimestamp(now, timezone.utc)
+        esc = CR.escalation(draft, ticket, self.receipts_path, when)
+        if esc:
+            out["escalation"] = esc
+            if not esc["mismatch"]:
+                out["hits"].append("escalation-without-mismatch")
+        share = CR.echo_share(draft, inbound)
+        out["claims"]["echo_share"] = share
+        if share >= CR.POLICY["echo_warn_share"]:
+            out["warnings"].append("echo-share")
         # 4. voice: the operator's own lint rules (<root>/voice-rules.json, exported from the fleet's voice-lint;
         # a built-in floor when the file is absent). block is a HOLD voice:<id>, warn is a warning.
         voice = self._voice(draft)
@@ -1016,7 +1077,7 @@ def render_audit(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree"])
+    ap.add_argument("cmd", choices=["file", "list", "grant", "deny", "modify", "consume", "capture", "stats", "sync", "queue", "mark", "run", "event", "finding", "receipt", "page", "cite", "trace", "wait", "call", "audit", "verify", "tree", "requester", "mismatch"])
     ap.add_argument("--root", default=os.path.expanduser(os.environ.get("ARGUS_DESK_ROOT", "~/.argus-desk")))
     ap.add_argument("--md5")
     ap.add_argument("--press-id")
@@ -1030,12 +1091,13 @@ def main(argv=None):
     ap.add_argument("--text", action="store_true", help="stats, audit or tree as text")
     ap.add_argument("--node", help="tree: only this node (its body loaded when it lives in a file)")
     ap.add_argument("--depth", type=int, default=99, help="tree --text: how deep to print")
+    ap.add_argument("--name", help="requester: the name as the ticket's requester field shows it")
     ap.add_argument("--via", help="tree: the proxy/endpoint a Send will use, for the SEND node")
     a = ap.parse_args(argv)
     # the mod passes its stateDir option as given, often "~/.argus-desk"; no shell expands it on the way here
     d = Desk(os.path.expanduser(a.root))
     body = {}
-    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite"):
+    if a.cmd in ("file", "consume", "capture", "sync", "run", "event", "finding", "receipt", "page", "cite", "mismatch"):
         raw = sys.stdin.read()
         body = json.loads(raw) if raw.strip() else {}
     if a.cmd == "file":
@@ -1089,6 +1151,10 @@ def main(argv=None):
         out = d.trace(a.ticket)
     elif a.cmd == "wait":
         out = d.wait(a.ticket, a.timeout)
+    elif a.cmd == "requester":
+        out = d.requester(a.ticket, a.name)
+    elif a.cmd == "mismatch":
+        out = d.mismatch(body.get("ticket", ""), body.get("documented", ""), body.get("observed", ""), body.get("summary", ""), body.get("by"))
     elif a.cmd == "capture":
         out = d.capture(body.get("ticket"), body.get("messages"), body.get("count"))
     else:

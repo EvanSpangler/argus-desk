@@ -14,10 +14,18 @@ import re
 
 POLICY = {"receipt_max_age": 900, "min_gap_hours": 4.0, "window_hours": 12.0, "max_per_window": 2}
 
+# The fleet's thread-check REVERSAL, kept identical: a desk draft that clears here must clear there.
 REVERSAL = re.compile(
-    r"\b(?:my|our|the)\s+(?:last|previous|earlier)\s+(?:message|reply|answer|note)\b"
-    r"|\bi\s+was\s+wrong\b|\bscratch\s+that\b|\bto\s+correct\s+(?:myself|that)\b"
-    r"|\bignore\s+what\s+i\s+(?:said|wrote)\b|\bcorrection\s*:", re.I)
+    r"\b(?:my|the|our)\s+(?:last|previous|earlier|prior)\s+(?:message|reply|response|email|note|comment)\b"
+    r"|\bi\s+(?:was|got\s+that)\s+wrong\b"
+    r"|\bwas\s+wrong\s+to\s+(?:tell|say|suggest|leave|advise)\b"
+    r"|\b(?:correction|apologies|sorry)[,:]?\s+(?:that|the|my|i)\b"
+    r"|\bignore\s+(?:my|the)\s+(?:last|previous|earlier)\b"
+    r"|\bto\s+correct\s+(?:myself|my\s+last)\b"
+    r"|\bscratch\s+that\b"
+    r"|\bignore\s+what\s+i\s+(?:said|wrote)\b|\bcorrection\s*:",
+    re.I,
+)
 ASK = re.compile(r"\?|\b(?:can|could|would|will)\s+you\b|\bplease\s+(?:send|share|provide|confirm|attach|run)\b", re.I)
 SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 

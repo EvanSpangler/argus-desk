@@ -16,8 +16,10 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-POLICY = {"max_age_hours": 24, "support_share": 0.5, "weak_min_words": 5, "unbound_words": 4,
-          "unbound_share": 0.4, "echo_share": 0.6, "docs_hosts": ["docs.example.org"],
+# unbound_words/unbound_share are the fleet's (claim-check max_unbound_words 3, max_unbound_share 0.2): a desk draft
+# that clears here must clear there. echo_ngram is its draft-level copy-back measure (a warning, as in the fleet).
+POLICY = {"max_age_hours": 24, "support_share": 0.5, "weak_min_words": 5, "unbound_words": 3,
+          "unbound_share": 0.2, "echo_share": 0.6, "echo_ngram": 6, "echo_warn_share": 0.25, "docs_hosts": ["docs.example.org"],
           "good_origins": ["captured_text", "ocr_of_capture"]}
 
 STOP = set("a an the and or but if then than that this these those it its is are was were be been to of in on "
@@ -192,6 +194,67 @@ def mint_material(path, ticket, quote, inbound, claims, now):
            "ticket": str(ticket), "minted": now.isoformat(), "quote": quote, "bound": list(claims)}
     _append(path, row)
     return {"ok": True, "id": row["id"]}
+
+
+# ---------------------------------------------------------------- copy-back and escalation
+def words(s):
+    return re.findall(r"[a-z0-9']+", norm(plain(s)))
+
+
+def echo_share(draft, inbound, n=None):
+    """Share of the draft's words inside a run of n consecutive words copied from the customer's inbound. 0.0 when
+    there is no inbound to compare, which is "cannot tell", not "clean"."""
+    n = n or POLICY["echo_ngram"]
+    dw, iw = words(draft), words(inbound)
+    if len(dw) < n or len(iw) < n:
+        return 0.0
+    grams = {tuple(iw[i:i + n]) for i in range(len(iw) - n + 1)}
+    hit = [False] * len(dw)
+    for i in range(len(dw) - n + 1):
+        if tuple(dw[i:i + n]) in grams:
+            hit[i:i + n] = [True] * n
+    return round(sum(hit) / float(len(dw)), 3)
+
+
+# A reply that escalates, or says it did, needs a recorded mismatch: the docs say X, the product did Y. The fleet's
+# claim-check ESC_TEXT, plus the operator's own escalation sentence ("I've passed along your request to the WizOS
+# engineering team.", the wording the drafter is told to use), which ESC_TEXT does not match.
+ESCALATION = re.compile(r"\bpass(?:ed|ing)?\s+(?:along|on)\s+(?:your|the|this)\s+(?:request|question|report|case)\s+to\b[^.\n]{0,40}\bengineering\b|\bescalat\w*|\b(?:take|taking|took|raise|raising|raised|bring|bringing|pass|passing|send|sending|"
+                        r"flag|flagging|log|logging|file|filing)\s+(?:it|this|that|them)\s+(?:to|with|up with)\s+"
+                        r"(?:our\s+|the\s+)?(?:engineering|product|dev|development|r&d)\b|\b(?:filed|opened|raised|logged)\s+"
+                        r"(?:a\s+|an\s+)?(?:bug|defect|engineering (?:ticket|case))|\bengineering (?:team )?(?:is|are|will|to) "
+                        r"(?:look|investigat|review|check)", re.I)
+
+
+def mint_mismatch(path, ticket, documented, observed, summary, now):
+    """The basis for an escalation: a fresh docs receipt (what the product should do) and a fresh material or test
+    receipt (what it did), both on this ticket, and one line saying how they differ."""
+    mine = {r["id"]: r for r in load(path) if r.get("ticket") == str(ticket)}
+    d, o = mine.get(documented), mine.get(observed)
+    if not d or d.get("kind") != "docs":
+        return {"ok": False, "why": "documented-not-a-docs-receipt"}
+    if not o or o.get("kind") not in ("material", "test"):
+        return {"ok": False, "why": "observed-not-a-material-or-test-receipt"}
+    if not (_fresh(d, now) and _fresh(o, now)):
+        return {"ok": False, "why": "receipt-stale"}
+    if len(str(summary or "").split()) < 4:
+        return {"ok": False, "why": "summary-missing"}
+    row = {"id": "rcpt:mismatch-" + hashlib.sha256((documented + observed).encode()).hexdigest()[:8], "kind": "mismatch",
+           "ticket": str(ticket), "minted": now.isoformat(), "documented": documented, "observed": observed,
+           "quote": str(summary), "bound": []}
+    _append(path, row)
+    return {"ok": True, "id": row["id"]}
+
+
+def escalation(draft, ticket, path, now):
+    """None when the draft does not escalate; else the sentence and the mismatch ids that still stand behind it."""
+    said = [u for k, u in units(draft) if k == "sentence" and ESCALATION.search(u)]
+    if not said:
+        return None
+    mine = {r["id"]: r for r in load(path) if r.get("ticket") == str(ticket)}
+    basis = [r["id"] for r in mine.values() if r["kind"] == "mismatch" and _fresh(r, now)
+             and all(mine.get(r[k]) and _fresh(mine[r[k]], now) for k in ("documented", "observed"))]
+    return {"sentence": said[0], "mismatch": basis}
 
 
 # ---------------------------------------------------------------- the check

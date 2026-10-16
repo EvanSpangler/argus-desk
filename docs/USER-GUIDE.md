@@ -223,6 +223,11 @@ The draft's own text:
 |---|---|
 | `dash` | The draft contains an en or em dash. |
 | `timeline-commitment` | It promises a time ("shortly", "by tomorrow", "within 2 days"). |
+| `requester-name-unrecorded` | The draft greets someone by name and no requester name is on record for the ticket. The desk records it when a ticket read shows the requester field; `desk.py requester --ticket N --name "<exact name>"` records it by hand. |
+| `requester-name-mismatch` | The greeted name is not a part of the recorded requester name ("Hi Alvar" to Alba). |
+| `ticket-denied-recently` | You denied a draft on this ticket in the last 72 hours. The drafting has been wrong here, so the decision is yours: a delegated press under the usual bar would be held. A Modify is not a deny. |
+| `sends-held` | The file `<stateDir>/sends-held` exists: every draft holds until you remove it. |
+| `escalation-without-mismatch` | The draft escalates, or says it did, and no fresh mismatch is on record: the drafter records one with `desk_mismatch` (a docs receipt for what the product should do, a material or test receipt for what it did, one line on how they differ). |
 | `voice:<rule>` | A block rule from your voice rules matched ("absolutely right", a template placeholder, AI self-reference, a vendor or model name, a typed sign-off). Warn rules appear as warnings. |
 
 The thread it answers:
@@ -252,7 +257,7 @@ customer's own material for their setup, both legs for a cause.
 | `receipt-stale` | Its only receipts are older than 24 hours. |
 | `receipt-unrelated` | The receipt shares no content words with the sentence. |
 | `quote-does-not-support` | The receipt covers less than half of the sentence's content words. |
-| `partial-binding` | Several of the sentence's words are in neither the quote nor the cited fragment. |
+| `partial-binding` | Three or more of the sentence's content words, a fifth of them or more, are in neither the quote nor the cited fragment. |
 | `element-not-in-evidence` | A setting, path, version or quantity the sentence names is not in the quote. |
 | `instruction-needs-docs-or-test`, `behaviour-needs-docs-or-test` | A step or a product behaviour is backed only by the customer's material. |
 | `cause-needs-product-leg-and-material` | A cause is asserted with only one of its two legs (docs mechanism, customer's own data). |
@@ -263,7 +268,12 @@ customer's own material for their setup, both legs for a cause.
 | `snippet-untested` | A code block has no test receipt recording that it was run. |
 | `echo-only` | Every sentence that would be credited only restates the customer. |
 
-Warnings (shown, never a HOLD): `no-thread-captured`, and `voice:<rule>` for warn-level voice rules.
+Warnings (shown, never a HOLD): `no-thread-captured`, `echo-share` (a quarter or more of the draft's words sit in
+runs of six copied from the customer), and `voice:<rule>` for warn-level voice rules.
+
+These codes are the fleet's usual bar as well as the desk's: since 0.8.2 the requester name, the 72-hour deny
+hold, the kill switch, the escalation basis, the binding thresholds (3 words, 20%), the reversal phrases and the
+six-word echo measure are the fleet's own, so a draft that clears here clears there.
 
 Your voice rules live in `<stateDir>/voice-rules.json` (`{"rules": [{"id", "pattern", "severity":
 "block|warn", "channels": ["all"]}]}`), exported from your own lint; without the file a built-in floor

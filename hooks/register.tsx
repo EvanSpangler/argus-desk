@@ -53,7 +53,7 @@ const opts = (o: Record<string, unknown>): Opts => ({
   writeProxy: String(o.writeProxy ?? 'zendesk-write'),
   searchEndpoint: String(o.searchEndpoint ?? 'zendesk_search_tickets'),
   searchQuery: String(o.searchQuery ?? 'type:ticket status<pending assignee:me'),
-  commentsEndpoint: String(o.commentsEndpoint ?? 'zendesk_get_ticket_comments,zendesk_list_comments'),
+  commentsEndpoint: String(o.commentsEndpoint ?? 'zendesk_get_ticket_comments'),
   ticketEndpoint: String(o.ticketEndpoint ?? 'zendesk_get_ticket'),
   updateEndpoint: String(o.updateEndpoint ?? 'zendesk_update_ticket'),
   sendStatus: STATUSES.includes(String(o.sendStatus)) ? String(o.sendStatus) : 'pending',
@@ -148,6 +148,22 @@ const isComment = (c: unknown): boolean => {
   return ['plain_body', 'body', 'html_body', 'text'].some(k => typeof r[k] === 'string') && ('created_at' in r || 'author_id' in r || 'author' in r || 'author_role' in r)
 }
 
+/** A proxy payload as JSON. 2026-10-16 (#147802 on 0.9.0, the workstation): the proxy wraps every result as
+ * `[TOOL_OUTPUT_BEGIN <hex>]`, a WARNING: UNTRUSTED EXTERNAL DATA banner and a SOURCE line, then the JSON, then
+ * `[TOOL_OUTPUT_END <hex>]`. JSON.parse threw on the 14218-char comments read, so the thread was never recorded and every
+ * customer-quote receipt was refused. The JSON is taken from the first line that opens one, up to the end marker. Throws as
+ * JSON.parse does when no JSON is there. */
+const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch (e) {
+    const body = text.replace(/\[TOOL_OUTPUT_(BEGIN|END)[^\]]*\]/g, '')
+    const at = body.search(/^\s*[{[]/m)
+    if (at < 0) throw e
+    return JSON.parse(body.slice(at))
+  }
+}
+
 /** The comments in a read result. 2026-10-16 (real workstation, #147036): the comments endpoint that answers wraps them
  * as something other than a `comments` key, and every read went unrecorded, so every material receipt was refused.
  * `loose` (a read of a comments endpoint) also takes the first array whose items are comments, under any key or bare. */
@@ -157,7 +173,7 @@ const commentsIn = (v: unknown, depth = 0, loose = false): { comments: Array<Rec
     // a JSON string at the top is a body encoded twice (the proxy's JSON inside the host's JSON): parse it again too
     if (!(loose || /"comments"\s*:\s*\[/.test(v))) return undefined
     try {
-      return commentsIn(JSON.parse(v), depth + 1, loose)
+      return commentsIn(parseJson(v), depth + 1, loose)
     } catch {
       return undefined
     }
@@ -231,7 +247,7 @@ const requesterIn = (v: unknown, depth = 0): string | undefined => {
   if (depth > 6 || !v) return undefined
   if (typeof v === 'string') {
     if (!/requester/.test(v)) return undefined
-    try { return requesterIn(JSON.parse(v), depth + 1) } catch { return undefined }
+    try { return requesterIn(parseJson(v), depth + 1) } catch { return undefined }
   }
   if (Array.isArray(v)) { for (const x of v) { const f = requesterIn(x, depth + 1); if (f) return f } return undefined }
   if (typeof v !== 'object') return undefined
@@ -699,7 +715,7 @@ async function tick($: any, o: Opts, force = false): Promise<{ polled: number; p
 const ticketsIn = (text: string): Array<{ id: string; status?: string; sla?: string | null; subject?: string; updated?: string }> => {
   let parsed: unknown
   try {
-    parsed = JSON.parse(text)
+    parsed = parseJson(text)
   } catch {
     return []
   }
@@ -721,7 +737,7 @@ const ticketsIn = (text: string): Array<{ id: string; status?: string; sla?: str
 /** The ticket's own status and updated_at in a readback, whatever the proxy wraps the ticket in. */
 const ticketFields = (text: string): { status?: string; updated?: string } => {
   try {
-    const p = JSON.parse(text) as Record<string, unknown>
+    const p = parseJson(text) as Record<string, unknown>
     const t = (p.ticket && typeof p.ticket === 'object' ? p.ticket : p) as Record<string, unknown>
     return { status: typeof t.status === 'string' ? t.status : undefined, updated: typeof t.updated_at === 'string' ? t.updated_at : undefined }
   } catch {
@@ -1120,7 +1136,7 @@ export const register: Register = (on, options) => {
         if (forTicket && text && (commentsRead || /\\?"comments\\?"\s*:\s*\[/.test(text))) {
           got = `no comments found in a ${text.length}-char result: ${text.slice(0, 160)}`
           try {
-            const found = commentsIn(JSON.parse(text), 0, commentsRead)
+            const found = commentsIn(parseJson(text), 0, commentsRead)
             if (found) {
               const messages = found.comments.map((c, i) => ({
                 id: String(c.id ?? i),

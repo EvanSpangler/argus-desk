@@ -47,6 +47,11 @@ def _iso_epoch(s):
 # The fleet's voice-lint salutation: a greeting names the requester exactly as the ticket's requester field has it.
 # "Hi Alvar" (09-15) and "Hi Alba" (09-18) went out to people with other names.
 SALUTATION = re.compile(r"^\s*(?:Hi|Hello|Hey|Dear)\s+([A-Za-z][A-Za-z.'-]*)\s*[,!\n]", re.M)
+# The fleet's reply-review codes. A reviewer objection names one in brackets ("[misattributed] ..."); an open one that quotes
+# the draft holds as review:<code>, the way a verified reply-review finding holds a delegated grant in the fleet.
+REVIEW_CODES = ("question-not-answered", "contradicts-customer", "contradicts-earlier-send", "ignores-customer-info", "misattributed",
+                "implied-commitment", "holding-reply", "customer-cannot-act", "quotes-customer-back", "platform-mismatch", "unreceipted")
+CODE = re.compile(r"^\s*\[([a-z-]+)\]")
 # The fleet's history hold: a deny on the ticket in the last 72 h means the drafting has been wrong here, so the
 # operator decides; a delegated press does not.
 HISTORY_S = 72 * 3600
@@ -396,6 +401,30 @@ class Desk:
         return {"ok": True, "md5": md5, "ticket": str(ticket), "verdict": checks["verdict"], "hits": checks["hits"],
                 "warnings": checks["warnings"], "claims": checks["claims"], "thread": checks["thread"]}
 
+    def review_hits(self, md5):
+        """Open reviewer objections against this draft that quote it (a shared run of four words with the draft): review:<code>.
+        Answered objections, NO OBJECTIONS, and the operator's own Deny/Modify notes are not holds."""
+        req = self._requests().get(md5)
+        if not req:
+            return []
+        findings = self._rows(os.path.join(self._run_dir(req["ticket"]), "findings.jsonl"))
+        answered = {f.get("about") for f in findings if f.get("kind") == "answer"}
+        out = []
+        for f in findings:
+            if f.get("kind") != "objection" or f.get("role") == "operator" or f.get("id") in answered:
+                continue
+            if re.search(r"NO OBJECTIONS", f.get("text", ""), re.I):
+                continue
+            if not (f.get("about") == md5 or (f.get("about") in (None, "") and f.get("ts", 0) >= req["ts"])):
+                continue
+            if not DT._shares_run(f.get("text", ""), req["text"]):
+                continue                                  # a quote that is not in the draft is discarded, as in the fleet
+            m = CODE.match(f.get("text", ""))
+            code = "review:" + (m.group(1) if m and m.group(1) in REVIEW_CODES else "objection")
+            if code not in out:
+                out.append(code)
+        return out
+
     def list(self):
         """The drafts waiting for a decision. A request undecided past the ledger's REQUEST_TTL_S (24 h) and
         a grant past its 6 h life are written off first, so the desk shows what the guide says it shows."""
@@ -411,9 +440,13 @@ class Desk:
                 continue
             st = self.ledger.state(md5, events=events)
             if st["state"] in ("pending", "open"):
+                checks = r["checks"]
+                rev = self.review_hits(md5)
+                if rev:
+                    checks = dict(checks, hits=checks["hits"] + [h for h in rev if h not in checks["hits"]], verdict="hold", review=rev)
                 items.append({"md5": md5, "ticket": r["ticket"], "state": st["state"], "source": r.get("source"),
                               "filed": r["ts"], "age_s": int(self.clock() - r["ts"]), "chars": r.get("chars"),
-                              "checks": r["checks"], "text": r["text"], "supersedes": r.get("supersedes")})
+                              "checks": checks, "text": r["text"], "supersedes": r.get("supersedes")})
         items.sort(key=lambda i: i["filed"])
         return {"ok": True, "items": items}
 
@@ -431,6 +464,9 @@ class Desk:
             return {"ok": False, "reason": "superseded by %s, the newer draft on #%s" % (later[-1][:8], req["ticket"])}
         # The press is the operator's own act at the terminal; the harness, not the model, raised it.
         src = CL.DictSource({press_id: {"from_operator": True, "automated": False, "ts": now, "body": "go %s" % md5}})
+        rev = self.review_hits(md5)
+        if rev:   # open reviewer objections are holds at the press too, so the overrule names them
+            req = dict(req, checks=dict(req["checks"], hits=req["checks"]["hits"] + [h for h in rev if h not in req["checks"]["hits"]], verdict="hold"))
         r = self.ledger.grant_by_message(md5, press_id, src, OPERATOR)
         if r.get("ok"):
             self._decide(md5, req, "send", press_id)

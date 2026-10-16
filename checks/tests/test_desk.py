@@ -519,5 +519,32 @@ class FleetParityTests(unittest.TestCase):
         self.assertGreaterEqual(r["claims"]["echo_share"], 0.25)
         self.assertIn("echo-share", r["warnings"])
 
+
+    def test_customer_cannot_act_and_holding_reply(self):
+        d, c = mk()
+        d.capture("49", [{"id": "1", "who": "customer", "at": T0 - 3600, "text": "I'm confused, what do you want me to do?"}], 1)
+        self.assertIn("customer-cannot-act", d.file("49", "Could you confirm which version you run?\n")["hits"])
+        self.assertNotIn("customer-cannot-act", d.file("49", "1. Open Settings > Connectors.\n2. Enable the broker.\n")["hits"])
+        d.capture("50", [{"id": "1", "who": "customer", "at": T0 - 3600, "text": "Which version fixes this?"}], 1)
+        self.assertIn("holding-reply", d.file("50", "We're still checking this.\n")["hits"])
+        self.assertNotIn("holding-reply", d.file("50", "We're still checking this, and I'm reproducing it on our side.\n")["hits"])
+
+    def test_open_objection_that_quotes_the_draft_holds_until_answered(self):
+        d, c = mk()
+        m = d.file("51", "Please send a fresh support package from the sensor host.\n")["md5"]
+        c.t += 5
+        d.finding("51", "revA", "reviewer", "objection", "[misattributed] the draft says send a fresh support package from the sensor host but they sent one", about=m)
+        d.finding("51", "revB", "reviewer", "objection", "[question-not-answered] nothing in this reply is about their question", about=m)   # quotes nothing: discarded
+        d.finding("51", "op", "operator", "objection", "Modify: send a fresh support package from the sensor host", about=m)
+        it = d.list()["items"][0]
+        self.assertEqual(it["checks"]["review"], ["review:misattributed"])
+        self.assertEqual(it["checks"]["verdict"], "hold")
+        oid = [f for f in d._rows(os.path.join(d._run_dir("51"), "findings.jsonl")) if f["agent"] == "revA"][0]["id"]
+        d.finding("51", "drafter", "drafter", "answer", "they sent it for the other host", about=oid)
+        self.assertNotIn("review", d.list()["items"][0]["checks"])
+        d.finding("51", "revA", "reviewer", "objection", "[made-up] send a fresh support package from the sensor host is wrong", about=m)
+        g = d.grant(m, "press-51")
+        self.assertIn("review:objection", g["overruled"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -431,7 +431,8 @@ const prompts: Record<Role, (o: Opts, ticket: string, angle: string, context: st
     (angle ? `${angle}\n` : '') +
     `${readingRules(o, ticket)}\n${context}\n` +
     `You are a checker, not a writer: do not suggest wording, do not grade style. Every quote you give must be copied exactly from the thread or the draft; a quote that is not there is discarded and counted against you. ` +
-    `Record each objection with ${FINDING} kind objection, quoting the draft sentence and the customer's or our earlier words it fails against. ` +
+    `Record each objection with ${FINDING} kind objection, about the draft's md5, quoting the draft sentence and the customer's or our earlier words it fails against. ` +
+    `Begin each objection with its code in brackets, the fleet's reply-review codes: [question-not-answered], [contradicts-customer], [contradicts-earlier-send], [ignores-customer-info], [misattributed], [implied-commitment], [holding-reply], [customer-cannot-act], [quotes-customer-back], [platform-mismatch] or [unreceipted]. An open objection that quotes the draft holds it until it is answered or the operator overrules it. ` +
     `If there is nothing to object to after working the whole checklist, record one objection with the text "NO OBJECTIONS" and, for each checklist item, what you checked and found. Answer with the list.`,
 }
 

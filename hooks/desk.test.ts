@@ -197,6 +197,11 @@ test('fails closed: a write on any proxy, or a call with no endpoint, needs a gr
     expect((await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'p', endpoint, arguments: { ticket_id: 1 } } as any)).deny).toBeUndefined()
   for (const endpoint of ['zendesk_update_ticket', 'tickets_get_and_update', 'support_packages_upload', 'ticket_comment_create'])
     expect((await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy: 'p', endpoint, arguments: { ticket_id: 1 } } as any)).deny).toMatch(/argus-desk/)
+  // 2026-10-16 (#148072): a Kusto query reads, whatever its verb; a control command or a write word on that proxy does not
+  for (const [proxy, endpoint, query] of [['kusto-custom', 'kusto_query', 'Detections | count'], ['kusto-custom', 'run_query', '// noise\nDetections | take 5'], ['kusto-predefined', 'execute_predefined_query', 'tenant_noise']])
+    expect((await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy, endpoint, arguments: { query } } as any)).deny).toBeUndefined()
+  for (const [proxy, endpoint, query] of [['kusto-custom', 'kusto_query', '.drop table Detections'], ['kusto-custom', 'run_query', '// x\n.set-or-append T <| print 1'], ['kusto-custom', 'kusto_ingest_create', 'x'], ['zendesk-write', 'run_query', 'x']])
+    expect((await $.tool.call({ tool: 'mcp__local-argus__invoke_proxy', proxy, endpoint, arguments: { query } } as any)).deny).toMatch(/argus-desk/)
   // the chat post carried a text body and went to the gate; the bare call carried none and never reached it
   expect(calls.filter(c => cmdOf(c) === 'consume').length).toBe(1)
 })

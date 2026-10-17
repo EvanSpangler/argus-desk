@@ -320,6 +320,10 @@ Sonnet, the adversary and drafter to Opus.
   field with the cursor in it (a Modify note, a Deny reason) takes every key until Enter; Tab reaches its
   `cancel` button, which leaves the draft undecided. Esc hands the keyboard back to the prompt. Without the keys, the pane
   commands (`/desk review`, `/desk tickets`, `/desk wall`, `/desk show`) still work.
+- **Kusto queries read (0.9.4).** An investigator's Kusto re-check (proxy `kusto-custom` or `kusto-predefined`) was
+  refused as a customer post, because the endpoint names no read verb. On those two proxies a query is now a read,
+  whatever its run, execute or query verb. A control command (a query starting with `.`) or any other write word still
+  goes to the gate. Every other proxy is unchanged.
 - **q: the draft as QR codes (0.9.3).** On Review, `q` shows the selected draft's exact text as QR codes, one at a time
   (`q` for the next, `b` back to the proof). Each code carries the draft md5 and its place (`ADQ1 <md5> i/n <slice>`). The
   fleet's reader (`scripts/desk-qr-read.py add <snapshot>`) joins them and writes the text only when it hashes to that md5,

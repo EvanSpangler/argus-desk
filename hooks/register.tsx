@@ -132,8 +132,26 @@ const normalize = (args: Record<string, unknown>): Record<string, unknown> => {
  * A call that can write: any endpoint whose name is not plainly a read, on any proxy. Fails closed: no endpoint,
  * or a write method or body in the old path-and-method shape, is outward too.
  */
+// 2026-10-16 (#148072 on J1, Evan approved the narrow form): Argus's two Kusto re-checks were refused as customer posts,
+// so the tenant numbers the fleet route reads never reached the draft. A Kusto proxy reaches no customer and a query only
+// reads, so run, execute and query are not writes there; any other write word, or a control command (a query that
+// starts with "."), still is.
+const QUERY_PROXY = /^kusto-(custom|predefined)$/
+const KUSTO_RUN = /(^|_)(run|execute|exec|query)(_|$)/i
+const controlCommand = (v: unknown, depth = 0): boolean => {
+  if (depth > 4) return false
+  if (typeof v === 'string') return /^\s*(\/\/[^\n]*\n\s*)*\./.test(v)
+  if (Array.isArray(v)) return v.some(x => controlCommand(x, depth + 1))
+  return !!v && typeof v === 'object' && Object.values(v as Record<string, unknown>).some(x => controlCommand(x, depth + 1))
+}
+const isKustoRead = (args: Record<string, unknown>, endpoint: string): boolean =>
+  typeof args.proxy === 'string' && QUERY_PROXY.test(args.proxy) && !!endpoint &&
+  (READ_ENDPOINT.test(endpoint) || KUSTO_RUN.test(endpoint)) &&
+  !WRITE_WORD.test(endpoint.replace(/(^|_)(run|execute)(?=_|$)/gi, '$1')) && !controlCommand(args.arguments)
+
 const isOutward = (args: Record<string, unknown>): boolean => {
   const endpoint = typeof args.endpoint === 'string' ? args.endpoint : ''
+  if (isKustoRead(args, endpoint)) return /"(?:method|verb|http_method)"\s*:\s*"(post|put|patch|delete)"/.test(JSON.stringify(args).toLowerCase())
   if (!endpoint || !READ_ENDPOINT.test(endpoint) || WRITE_WORD.test(endpoint)) return true
   const flat = JSON.stringify(args).toLowerCase()
   return /"(?:method|verb|http_method)"\s*:\s*"(post|put|patch|delete)"/.test(flat)
